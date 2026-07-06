@@ -102,6 +102,7 @@ typedef struct {
     int64_t resident_bytes;
 } Model;
 
+static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/(1024.0*1024.0); }
 static float *falloc(int64_t n){ float *p=malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
@@ -231,6 +232,9 @@ static int g_prefetch=0; /* PREFETCH=1 -> riabilita il WILLNEED cross-layer (met
 static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF: su questo host
                           * (VHDX su NVMe DRAM-less, latenza serializzata ~60ms/req) il buffered
                           * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
+static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/testo,
+                          * 0=greedy in validazione). 0 = greedy puro. */
+static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
@@ -849,6 +853,51 @@ static inline int argmax_v(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
 
+/* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
+ * Il draft (MTP/n-gram) e' DETERMINISTICO (argmax della testa): q = massa puntuale.
+ * Rejection sampling di Leviathan: accetta il draft x_d con prob p(x_d); al rifiuto
+ * ricampiona da p con x_d azzerato e rinormalizzato. La distribuzione risultante e'
+ * ESATTAMENTE p: la speculazione resta invisibile all'output anche col sampling. */
+static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
+static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
+    return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
+static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
+static int cmp_pdesc(const void *a,const void *b){
+    float pa=g_pbuf[*(const int*)a], pb=g_pbuf[*(const int*)b];
+    return pa<pb ? 1 : pa>pb ? -1 : 0; }
+/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc */
+static void dist_build(const float *lo, int V){
+    if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
+    float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
+    double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
+    for(int i=0;i<V;i++){ g_pbuf[i]=expf((lo[i]-mx)*invt); s+=g_pbuf[i]; }
+    for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
+    if(g_nuc>0 && g_nuc<1.f){
+        for(int i=0;i<V;i++) g_pidx[i]=i;
+        qsort(g_pidx,V,sizeof(int),cmp_pdesc);
+        double cum=0; int keep=V;
+        for(int i=0;i<V;i++){ cum+=g_pbuf[g_pidx[i]]; if(cum>=g_nuc){ keep=i+1; break; } }
+        double s2=0; for(int i=keep;i<V;i++) g_pbuf[g_pidx[i]]=0;
+        for(int i=0;i<keep;i++) s2+=g_pbuf[g_pidx[i]];
+        for(int i=0;i<keep;i++) g_pbuf[g_pidx[i]]/=(float)s2;
+    }
+}
+/* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
+static int dist_sample(int V, int ban){
+    double z = 1.0 - (ban>=0 ? g_pbuf[ban] : 0.0); if(z<=1e-12) z=1e-12;
+    double u = rndu()*z, cum=0;
+    for(int i=0;i<V;i++){ if(i==ban) continue; cum+=g_pbuf[i]; if(cum>=u) return i; }
+    for(int i=V-1;i>=0;i--) if(i!=ban && g_pbuf[i]>0) return i;
+    return 0;
+}
+/* prossimo token dai logits: greedy se g_temp<=0, altrimenti sampling.
+ * ban = token escluso perche' rifiutato dalla verifica speculativa precedente. */
+static int pick_tok(const float *lo, int V, int ban){
+    if(g_temp<=0) return argmax_v(lo,V);
+    dist_build(lo,V);
+    return dist_sample(V,ban);
+}
+
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
 static int g_stop[9], g_nstop=0;
@@ -872,8 +921,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                        void (*emit)(int,void*), void *ud, int *kv_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
+    int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
     while(emitted<n_new && !done){
-        int next=argmax_v(logit,V); free(logit); logit=NULL;
+        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
@@ -899,7 +949,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
             fprintf(stderr,"[mtpdbg] draft0=%d verita=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
         while(k<g && emitted<n_new){
-            if(argmax_v(lo+(int64_t)k*V,V)!=draft[k]) break;
+            int accept;
+            if(g_temp<=0) accept = (argmax_v(lo+(int64_t)k*V,V)==draft[k]);
+            else { dist_build(lo+(int64_t)k*V,V);          /* rejection sampling: p(draft) */
+                   accept = (rndu() < g_pbuf[draft[k]]); }
+            if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++; k++;
         }
@@ -1001,6 +1055,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=1.0f;            /* auto: sampling ufficiale (temp 1.0, top-p 0.95) */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
@@ -1026,6 +1081,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("PROFILO: expert-disk %.1fs | expert-matmul %.1fs | attention %.1fs (di cui kvb %.1fs) | lm_head %.1fs | altro %.1fs\n",
         m->t_edisk, m->t_emm, m->t_attn, m->t_kvb, m->t_head, dt-acc);
     free(pids); free(all);
+    usage_save(m);
 }
 
 /* modalita' SERVE (per la CLI 'coli'): carica il modello UNA volta, poi CHAT conversazionale.
@@ -1039,6 +1095,7 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=1.0f;            /* auto: sampling ufficiale (temp 1.0, top-p 0.95) */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
@@ -1095,8 +1152,10 @@ static void run_serve(Model *m, const char *snap){
         printf("\n\x01\x01" "END" "\x01\x01\n");
         printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
         fflush(stdout);
+        usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
     }
     free(line); free(hist); free(buf);
+    usage_save(m);
 }
 
 static int *read_arr(jval*o,const char*k,int*n){ jval*a=json_get(o,k); int*r=malloc(a->len*sizeof(int));
@@ -1125,15 +1184,32 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
     return eb;
 }
 
-/* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN) */
-static void stats_dump(Model *m, const char *path){
-    FILE *f=fopen(path,"w"); if(!f){ perror(path); return; }
+/* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).
+ * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
+ * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
+static void stats_dump_q(Model *m, const char *path, int quiet){
+    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
     Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<c->n_layers;i++){ if(!m->L[i].sparse) continue;
+    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
         for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f);
-    fprintf(stderr,"[STATS] %lld selezioni su %lld expert distinti -> %s\n",(long long)tot,(long long)nz,path);
+    fclose(f); rename(tmp,path);
+    if(!quiet) fprintf(stderr,"[STATS] %lld selezioni su %lld expert distinti -> %s\n",(long long)tot,(long long)nz,path);
 }
+static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
+
+/* CACHE CHE IMPARA: istogramma d'uso PERSISTENTE in <SNAP>/.coli_usage.
+ * Caricato all'avvio (i contatori ripartono dalla storia), salvato a ogni turno:
+ * piu' usi colibri', meglio l'auto-pin conosce i TUOI expert caldi. */
+static char g_usage_path[2100]="";
+static int64_t usage_load(Model *m, const char *path){
+    FILE *f=fopen(path,"r"); if(!f) return 0;
+    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
+    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
+        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
+    fclose(f); return tot;
+}
+static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
 
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
@@ -1141,11 +1217,14 @@ static void stats_dump(Model *m, const char *path){
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
-    Cfg *c=&m->c; int cap=c->n_layers*c->n_experts;
+    Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
     Rec *r=malloc((size_t)cap*sizeof(Rec)); int n=0;
     int l,e; uint32_t cnt;
-    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<c->n_layers&&e>=0&&e<c->n_experts&&m->L[l].sparse) r[n++]=(Rec){l,e,cnt};
+    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
+        int ok = l>=0 && e>=0 && e<c->n_experts &&
+                 ((l<c->n_layers && m->L[l].sparse) || (l==c->n_layers && m->has_mtp));
+        if(ok) r[n++]=(Rec){l,e,cnt};
+    }
     fclose(f);
     for(int a=0;a<n;a++){ int best=a;                       /* selection sort parziale, poi taglio */
         for(int b=a+1;b<n;b++) if(r[b].c>r[best].c) best=b;
@@ -1155,9 +1234,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
     int64_t eb=expert_bytes_probe(m,m->ebits);
     int npin=(int)(gb*1e9/eb); if(npin>n) npin=n; if(npin>4096) npin=4096;
     if(npin<1){ free(r); return; }
-    int *cnt_l=calloc(c->n_layers,sizeof(int));
+    int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
-    for(int i=0;i<c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
     double t0=now_s();
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=0;a<npin;a++){
@@ -1179,6 +1258,16 @@ static double mem_available_gb(void){
     char ln[256]; double kb=0;
     while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
     fclose(f); return kb/1e6;
+}
+
+/* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
+static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
+    Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
+    if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
+    double slack = 1.2e9 + 64.0*(double)eb
+        + (double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0
+        + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
@@ -1228,6 +1317,10 @@ int main(int argc, char **argv){
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
+    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;
+    if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
+    else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
@@ -1245,10 +1338,22 @@ int main(int argc, char **argv){
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")) pin_load(&m, getenv("PIN"), getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
-    /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
-     * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-    { int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      cap_for_ram(&m, getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0, ebits, est_ctx); }
+    /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
+     * all'avvio i piu' usati vengono auto-pinnati in RAM (meta' del budget expert: il pin
+     * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
+    { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
+      int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
+      int64_t hist = usage_load(&m,g_usage_path);
+      if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
+      int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
+      if(!getenv("PIN") && autopin && hist>=5000){
+          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5/1e9;
+          if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
+      }
+      /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
+       * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
+      cap_for_ram(&m, ram_env, ebits, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */

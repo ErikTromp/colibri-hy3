@@ -72,9 +72,14 @@ def layer_idx(name):
         except ValueError: return -1
     return -1
 
-def classify(name, n_layers, keep_mtp=False):
+def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("_scale_inv"): return "consumed"   # gestito col suo peso
     li = layer_idx(name)
+    if keep_idx:
+        # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
+        if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
+        if name.endswith("norm.weight"): return "f32"
+        return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
     if keep_mtp:
         if li != n_layers: return "skip"                 # solo il layer MTP
         if "indexer" in name: return "skip"              # il DSA indexer resta un no-op
@@ -102,11 +107,11 @@ def dequant(f, name):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
-            kind = classify(name, n_layers, keep_mtp)
+            kind = classify(name, n_layers, keep_mtp, keep_idx)
             if kind in ("skip", "consumed"): continue
             w = dequant(f, name)
             if kind == "f32":
@@ -135,6 +140,10 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mtp", action="store_true",
         help="scarica/converte SOLO la testa MTP (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
+    ap.add_argument("--indexer", action="store_true",
+        help="estrae SOLO i pesi del DSA lightning indexer -> out-idx-*.safetensors. ATTENZIONE: "
+             "i tensori indexer sono sparsi su ~tutti gli shard: ri-scarica l'intero repo (~756 GB "
+             "di traffico) per tenerne pochi GB. Resumabile shard per shard. Consigliato --ebits 8.")
     a = ap.parse_args()
     if a.xbits is None: a.xbits = a.ebits
 
@@ -230,6 +239,26 @@ def main():
                 if os.path.isfile(blob): os.remove(blob)
             print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensori)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] FATTO."); return
+    if a.indexer:
+        import urllib.request
+        idx = json.loads(urllib.request.urlopen(
+            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
+        idx_shards = sorted(set(v for k, v in idx.items()
+                                if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
+        tot_gb = len(idx_shards) * 5.4
+        print(f"[IDX] pesi indexer su {len(idx_shards)} shard (~{tot_gb:.0f} GB di download totale, resumabile)")
+        for i, sh in enumerate(idx_shards):
+            outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
+            if os.path.exists(outp): continue             # gia' fatto -> ripartibile
+            print(f"[IDX {i+1}/{len(idx_shards)}] scarico {sh}...", flush=True)
+            p = download_retry(a.repo, sh, tmp)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
+            if out: save_file(out, outp)
+            os.remove(p)
+            for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
+                if os.path.isfile(blob): os.remove(blob)
+            print(f"    -> {os.path.basename(outp)} ({len(out)} tensori)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True); print("[IDX] FATTO."); return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: spazio libero < {a.min_free_gb} GB. Libera spazio e rilancia (riprende)."); break
