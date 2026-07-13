@@ -90,14 +90,20 @@ typedef struct {
     QT embed, lm_head; float *final_norm;
     Layer *L;
     float **K, **V; int max_t;
+    int *kv_start;                               /* prima pos valida nella KV (MTP: parziale) */
     ESlot **ecache; int *ecn; int ecap;
     ESlot **pin; int *npin;
     ESlot ws[64];
     uint64_t eclock, hits, miss, ereq;
     uint32_t **eusage;
     uint32_t **eheat;
+    /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
+    int has_mtp; Layer mtpL; QT eh_proj;
+    float *enorm, *hnorm, *mtp_norm;
+    float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
+    uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
-    uint64_t n_emit;
+    uint64_t n_fw, n_emit;
     int64_t resident_bytes;
     double t_edisk, t_emm, t_attn, t_head;
 } Model;
@@ -147,6 +153,7 @@ static float g_temp=-1;
 static float g_nuc=0.90f;
 static int g_topk=0;
 static float g_topp=0;
+static int g_draft=-1;   /* -1 = auto: 3 se MTP, 0 senza */
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
@@ -559,6 +566,11 @@ static QT qt_load_first(Model *m, const char *a, const char *b, int O, int I, in
     fprintf(stderr,"missing %s (also tried %s)\n",a,b?b:""); exit(1);
     QT z; memset(&z,0,sizeof(z)); return z;
 }
+static int st_has_any(Model *m, const char *a, const char *b){
+    if(st_has(&m->S,a)) return 1;
+    if(b&&st_has(&m->S,b)) return 1;
+    return 0;
+}
 
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
@@ -718,10 +730,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         m->lm_head=m->embed; /* tie_word_embeddings */
     m->final_norm=ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
-    m->ecap=cap; m->ecache=calloc(c->n_layers,sizeof(ESlot*)); m->ecn=calloc(c->n_layers,sizeof(int));
-    m->pin=calloc(c->n_layers,sizeof(ESlot*)); m->npin=calloc(c->n_layers,sizeof(int));
-    m->eusage=calloc(c->n_layers,sizeof(uint32_t*));
-    m->eheat=calloc(c->n_layers,sizeof(uint32_t*));
+    int nrows=c->n_layers+1;
+    m->ecap=cap; m->ecache=calloc(nrows,sizeof(ESlot*)); m->ecn=calloc(nrows,sizeof(int));
+    m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
+    m->eusage=calloc(nrows,sizeof(uint32_t*));
+    m->eheat=calloc(nrows,sizeof(uint32_t*));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -761,6 +774,80 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         }
         #undef P
     }
+    /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
+    {
+        char ex_last[64]; snprintf(ex_last,sizeof(ex_last),"mlp.experts.%d.down_proj.weight",c->n_experts-1);
+        const char *req[]={"eh_proj.weight","enorm.weight","hnorm.weight",
+            "input_layernorm.weight","post_attention_layernorm.weight",
+            "self_attn.q_proj.weight","self_attn.k_proj.weight","self_attn.v_proj.weight",
+            "self_attn.o_proj.weight","self_attn.q_norm.weight","self_attn.k_norm.weight",
+            "mlp.experts.0.gate_proj.weight",ex_last};
+        char mn[256]; m->has_mtp=1;
+        for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
+            snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
+            if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
+        }
+        /* Hy3 source naming: shared_mlp / final_layernorm; Colibri rename: shared_experts / shared_head.norm */
+        if(m->has_mtp){
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.router.gate.weight",c->n_layers);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",c->n_layers);
+            if(!st_has_any(m,nm2,nm)) m->has_mtp=0;
+        }
+        if(m->has_mtp){
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.shared_head.norm.weight",c->n_layers);
+            snprintf(nm,sizeof(nm),"model.layers.%d.final_layernorm.weight",c->n_layers);
+            if(!st_has_any(m,nm2,nm)) m->has_mtp=0;
+        }
+        if(m->has_mtp){
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.gate_proj.weight",c->n_layers);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.gate_proj.weight",c->n_layers);
+            if(!st_has_any(m,nm2,nm)) m->has_mtp=0;
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.down_proj.weight",c->n_layers);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.down_proj.weight",c->n_layers);
+            if(!st_has_any(m,nm2,nm)) m->has_mtp=0;
+        }
+        if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
+        if(m->has_mtp){
+            int i=c->n_layers; Layer *l=&m->mtpL;
+            #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
+            l->in_ln=ld(m,PM("input_layernorm.weight"));
+            l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
+            l->q=qt_load(m,PM("self_attn.q_proj.weight"),qo,D,dbits);
+            l->k=qt_load(m,PM("self_attn.k_proj.weight"),kvo,D,dbits);
+            l->v=qt_load(m,PM("self_attn.v_proj.weight"),kvo,D,dbits);
+            l->o=qt_load(m,PM("self_attn.o_proj.weight"),D,qo,dbits);
+            l->qn=ld(m,PM("self_attn.q_norm.weight"));
+            l->kn=ld(m,PM("self_attn.k_norm.weight"));
+            l->sparse=1;
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.router.gate.weight",i);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",i);
+            l->router=ld_first(m,nm2,nm);
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.expert_bias",i);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
+            l->router_bias=ld_first(m,nm2,nm);
+            int sI=c->moe_inter*c->n_shared;
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.gate_proj.weight",i);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.gate_proj.weight",i);
+            l->sh_gate=qt_load_first(m,nm2,nm,sI,D,dbits);
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.up_proj.weight",i);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.up_proj.weight",i);
+            l->sh_up=qt_load_first(m,nm2,nm,sI,D,dbits);
+            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.down_proj.weight",i);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.down_proj.weight",i);
+            l->sh_down=qt_load_first(m,nm2,nm,D,sI,dbits);
+            m->eh_proj=qt_load(m,PM("eh_proj.weight"),D,2*D,dbits);
+            m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
+            char mtp_na[512], mtp_nb[512];
+            snprintf(mtp_na,sizeof(mtp_na),"model.layers.%d.shared_head.norm.weight",i);
+            snprintf(mtp_nb,sizeof(mtp_nb),"model.layers.%d.final_layernorm.weight",i);
+            m->mtp_norm=ld_first(m,mtp_na,mtp_nb);
+            m->ecache[i]=calloc(cap,sizeof(ESlot));
+            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            #undef PM
+        }
+    }
+    m->hlast=falloc(D); m->h_all=falloc((int64_t)64*D);
     int64_t rb=qt_bytes(&m->embed);
     if(m->lm_head.qf!=m->embed.qf&&m->lm_head.q8!=m->embed.q8&&m->lm_head.q4!=m->embed.q4)
         rb+=qt_bytes(&m->lm_head);
@@ -769,17 +856,27 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         if(!l->sparse) rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
         else rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down);
     }
+    if(m->has_mtp){ Layer *l=&m->mtpL;
+        rb+=qt_bytes(&l->q)+qt_bytes(&l->k)+qt_bytes(&l->v)+qt_bytes(&l->o);
+        rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down)+qt_bytes(&m->eh_proj);
+    }
     m->resident_bytes=rb;
 }
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
-    if(m->K){ for(int i=0;i<c->n_layers;i++){ free(m->K[i]); free(m->V[i]); }
+    int NR=c->n_layers+(m->has_mtp?1:0);
+    if(m->K){ for(int i=0;i<NR;i++){ free(m->K[i]); free(m->V[i]); }
         free(m->K); free(m->V); m->K=m->V=NULL; }
+    free(m->kv_start); m->kv_start=NULL;
     m->max_t=max_t;
-    m->K=calloc(c->n_layers,sizeof(float*)); m->V=calloc(c->n_layers,sizeof(float*));
+    m->K=calloc(NR,sizeof(float*)); m->V=calloc(NR,sizeof(float*));
+    m->kv_start=calloc(NR,sizeof(int));
     int64_t slot=(int64_t)c->n_kv_heads*max_t*c->head_dim;
-    for(int i=0;i<c->n_layers;i++){ m->K[i]=falloc(slot); m->V[i]=falloc(slot); }
+    for(int i=0;i<NR;i++){
+        m->K[i]=falloc(slot); m->V[i]=falloc(slot);
+        m->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+    }
 }
 
 /* GQA attention: per-head QK norm, rotate_half RoPE, repeat_kv for scores */
@@ -811,18 +908,22 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos=pos_base+s, kvh=h/nrep;
         const float *qv=Q+(int64_t)s*H*hd+(int64_t)h*hd;
+        int st0=(m->kv_start && m->kv_start[layer]>=0)?m->kv_start[layer]:0;
+        int nt=pos+1-st0;
         float sc[8192];
-        for(int t=0;t<=pos;t++){
+        for(int jj=0;jj<nt;jj++){
+            int t=st0+jj;
             const float *kv=m->K[layer]+((int64_t)kvh*m->max_t+t)*hd;
             float a=0; for(int d=0;d<hd;d++) a+=qv[d]*kv[d];
-            sc[t]=a*scale;
+            sc[jj]=a*scale;
         }
-        softmax(sc,pos+1);
+        softmax(sc,nt);
         float *cx=ctx+(int64_t)s*H*hd+(int64_t)h*hd;
         for(int d=0;d<hd;d++) cx[d]=0;
-        for(int t=0;t<=pos;t++){
+        for(int jj=0;jj<nt;jj++){
+            int t=st0+jj;
             const float *vv=m->V[layer]+((int64_t)kvh*m->max_t+t)*hd;
-            float w=sc[t]; for(int d=0;d<hd;d++) cx[d]+=w*vv[d];
+            float w=sc[jj]; for(int d=0;d<hd;d++) cx[d]+=w*vv[d];
         }
     }
     matmul_qt(out,ctx,&l->o,S);
@@ -980,12 +1081,15 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     free(x); free(lo);
 }
 
+static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     if(!m->K||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m,ids[s],x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
+    if(m->hlast) memcpy(m->hlast,x+(int64_t)(S-1)*D,D*sizeof(float));
+    if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m,ids+1,x,S-1,pos_base);
     float *last=falloc(D); rmsnorm(last,x+(int64_t)(S-1)*D,m->final_norm,D,c->eps);
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
@@ -993,22 +1097,168 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     free(x); free(last); return logit;
 }
 
+/* come step(), ma ritorna i logits di TUTTE le S posizioni [S,vocab] (per la verifica spec) */
+static float *step_all(Model *m, const int *ids, int S, int pos_base){
+    Cfg *c=&m->c; int D=c->hidden;
+    if(!m->K||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
+    float *x=falloc((int64_t)S*D);
+    for(int s=0;s<S;s++) embed_row(m,ids[s],x+(int64_t)s*D);
+    layers_forward(m,x,S,pos_base);
+    if(m->h_all) memcpy(m->h_all,x,(int64_t)S*D*sizeof(float));
+    if(m->hlast) memcpy(m->hlast,x+(int64_t)(S-1)*D,D*sizeof(float));
+    float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
+    for(int s=0;s<S;s++){ rmsnorm(row,x+(int64_t)s*D,m->final_norm,D,c->eps);
+        matmul_qt(lo+(int64_t)s*c->vocab,row,&m->lm_head,1); }
+    free(x); free(row); return lo;
+}
+
+static int ngram_draft(const int *ids, int len, int G, int *draft){
+    if(len<4||G<1) return 0;
+    int a=ids[len-2], b=ids[len-1];
+    for(int i=len-3;i>=1;i--)
+        if(ids[i-1]==a&&ids[i]==b){
+            int n=0; for(int j=i+1;j<len&&n<G;j++) draft[n++]=ids[j];
+            return n;
+        }
+    return 0;
+}
+
+static int mtp_argmax(const float *lo, int V){
+    int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+}
+static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
+    Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
+    int p=kv-1; if(p<0||G<1) return 0;
+    if(m->kv_start[li]<0||m->kv_start[li]>p) m->kv_start[li]=p;
+    float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
+    float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
+    memcpy(h,m->hlast,D*sizeof(float));
+    int tok=next_tok, n=0;
+    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    for(int g=0;g<G;g++){
+        int pos=p+g; if(pos+2>=m->max_t) break;
+        embed_row(m,tok,x);
+        rmsnorm(x,x,m->enorm,D,c->eps);
+        if(g==0&&!prenorm) rmsnorm(h,h,m->final_norm,D,c->eps);
+        rmsnorm(h,h,m->hnorm,D,c->eps);
+        if(getenv("MTP_SWAP")){ memcpy(cat,h,D*sizeof(float)); memcpy(cat+D,x,D*sizeof(float)); }
+        else { memcpy(cat,x,D*sizeof(float)); memcpy(cat+D,h,D*sizeof(float)); }
+        matmul_qt(hx,cat,&m->eh_proj,1);
+        double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
+        int dbg=getenv("MTP_DEBUG")&&atoi(getenv("MTP_DEBUG"))>=2;
+        int t_pre=-1;
+        if(dbg){ rmsnorm(row,hx,m->mtp_norm,D,c->eps); matmul_qt(logit,row,&m->lm_head,1);
+                 t_pre=mtp_argmax(logit,c->vocab); }
+        layer_forward(m,&m->mtpL,li,hx,1,pos,nrm,tmp);
+        double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
+        rmsnorm(row,hx,m->mtp_norm,D,c->eps);
+        matmul_qt(logit,row,&m->lm_head,1);
+        int t2=mtp_argmax(logit,c->vocab);
+        if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
+                        pos,tok,sqrt(n_eh),sqrt(n_post),t_pre,t2);
+        draft[n++]=t2; tok=t2; memcpy(h,hx,D*sizeof(float));
+    }
+    free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
+    return n;
+}
+static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base){
+    if(!m->has_mtp||S<1) return;
+    Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
+    if(m->kv_start[li]<0||m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
+    float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
+    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    for(int i=0;i<S;i++){
+        embed_row(m,next_ids[i],e);
+        rmsnorm(e,e,m->enorm,D,c->eps);
+        if(prenorm) rmsnorm(hn,x+(int64_t)i*D,m->hnorm,D,c->eps);
+        else { rmsnorm(hf,x+(int64_t)i*D,m->final_norm,D,c->eps);
+               rmsnorm(hn,hf,m->hnorm,D,c->eps); }
+        if(getenv("MTP_SWAP")){ memcpy(cat,hn,D*sizeof(float)); memcpy(cat+D,e,D*sizeof(float)); }
+        else { memcpy(cat,e,D*sizeof(float)); memcpy(cat+D,hn,D*sizeof(float)); }
+        matmul_qt(hx+(int64_t)i*D,cat,&m->eh_proj,1);
+    }
+    float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+    layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
+    free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
+}
+
 static int is_stop(const Cfg *c, int tok){
     for(int i=0;i<c->n_stop;i++) if(c->stop_ids[i]==tok) return 1;
     return 0;
 }
 
+static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
+                       void (*emit)(int,void*), void *ud, int *kv_out);
+
+typedef struct { int *dst; int n; } EmitStore;
+static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
+
+typedef struct { Tok *T; Model *m; double t0; int count; } EmitStream;
+static void emit_stream(int t, void *ud){
+    EmitStream *e=(EmitStream*)ud; char dec[512];
+    int dn=tok_decode(e->T,&t,1,dec,511); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
+    if(++e->count%16==0){ double tt=e->m->hits+e->m->miss;
+        fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n",e->count,
+            rss_gb(),tt?100.0*e->m->hits/tt:0.0,e->count/(now_s()-e->t0),
+            e->m->n_fw?(double)e->count/e->m->n_fw:1.0); }
+}
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
-    kv_alloc(m,np+n_new);
+    kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
     float *logit=step(m,prompt,np,0);
-    int len=np;
-    for(int s=0;s<n_new;s++){
-        int next=pick_tok(logit,m->c.vocab,-1);
-        free(logit); out[len++]=next; m->n_emit++;
-        if(is_stop(&m->c,next)||s==n_new-1) break;
-        logit=step(m,&next,1,len-1);
+    EmitStore es={out+np,0};
+    spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
+}
+
+static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
+                       void (*emit)(int,void*), void *ud, int *kv_out){
+    Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
+    int draft[64]; int gd=g_draft; if(gd>63) gd=63;
+    int carry_ban=-1;
+    while(emitted<n_new&&!done){
+        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
+        if((eos>=0&&next==eos)||is_stop(&m->c,next)) break;
+        emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        if(emitted>=n_new) break;
+        int g=0, gsrc=0;
+        if(gd>0){
+            if(m->has_mtp&&m->mtp_prop>=24&&m->mtp_acc*10<m->mtp_prop){
+                gd=0; g_draft=0;
+                fprintf(stderr,"[MTP] %.0f%% acceptance after %llu proposals: drafts disabled\n",
+                    100.0*m->mtp_acc/m->mtp_prop,(unsigned long long)m->mtp_prop);
+            }
+        }
+        if(!g&&gd>0){
+            if(m->has_mtp){ g=mtp_draft(m,next,kv,gd,draft); m->mtp_prop+=g; if(g)gsrc=2; }
+            else { g=ngram_draft(all,kv+1,gd,draft); if(g)gsrc=2; }
+        }
+        if(g>n_new-emitted) g=n_new-emitted;
+        if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
+        if(g<0) g=0;
+        int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
+        float *lo=step_all(m,batch,S,kv); m->n_fw++;
+        int k=0;
+        if(g>0&&getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
+            fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n",draft[0],veri,draft[0]==veri?"HIT":"miss"); }
+        while(k<g&&emitted<n_new){
+            int accept;
+            if(g_temp<=0) accept=(argmax_v(lo+(int64_t)k*V,V)==draft[k]);
+            else { dist_build(lo+(int64_t)k*V,V); accept=(rndu()<g_pbuf[draft[k]]); }
+            if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
+            if((eos>=0&&draft[k]==eos)||is_stop(&m->c,draft[k])){ done=1; break; }
+            emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            k++;
+        }
+        if(gsrc==2&&m->has_mtp) m->mtp_acc+=k;
+        if(m->has_mtp&&k>=1) mtp_absorb(m,all+kv+1,m->h_all,k,kv);
+        if(m->h_all&&k<S-1) memcpy(m->hlast,m->h_all+(int64_t)k*c->hidden,c->hidden*sizeof(float));
+        kv+=1+k;
+        logit=falloc(V); memcpy(logit,lo+(int64_t)k*V,V*sizeof(float)); free(lo);
     }
+    if(logit) free(logit);
+    if(kv_out) *kv_out=kv;
+    return emitted;
 }
 
 static int *read_arr(jval*o,const char*k,int*n){
@@ -1072,7 +1322,8 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
 
 static double kv_pool_bytes(Model *m, int max_ctx){
     Cfg *c=&m->c;
-    return (double)c->n_layers*max_ctx*c->n_kv_heads*c->head_dim*4.0*2.0;
+    int nl=c->n_layers+(m->has_mtp?1:0);
+    return (double)nl*max_ctx*c->n_kv_heads*c->head_dim*4.0*2.0;
 }
 
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
@@ -1104,11 +1355,14 @@ static void pin_wire(Model *m){
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
-    Cfg *c=&m->c; int cap=c->n_layers*c->n_experts;
+    Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
     Rec *r=malloc((size_t)cap*sizeof(Rec)); int n=0;
     int l,e; uint32_t cnt;
-    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<c->n_layers&&e>=0&&e<c->n_experts&&m->L[l].sparse) r[n++]=(Rec){l,e,cnt};
+    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
+        int ok=l>=0&&e>=0&&e<c->n_experts&&
+            ((l<c->n_layers&&m->L[l].sparse)||(l==c->n_layers&&m->has_mtp));
+        if(ok) r[n++]=(Rec){l,e,cnt};
+    }
     fclose(f);
     for(int a=0;a<n;a++){ int best=a;
         for(int b=a+1;b<n;b++) if(r[b].c>r[best].c) best=b;
@@ -1118,9 +1372,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
     int64_t eb=expert_bytes_probe(m,m->ebits);
     int npin=(int)(gb*1e9/eb); if(npin>n) npin=n; if(npin>4096) npin=4096;
     if(npin<1){ free(r); return; }
-    int *cnt_l=calloc(c->n_layers,sizeof(int));
+    int *cnt_l=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
-    for(int i=0;i<c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
     double t0=now_s();
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=0;a<npin;a++){
@@ -1245,6 +1499,7 @@ static void repin_pass(Model *m){
 
 static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;
     int64_t eb=expert_bytes_probe(m,ebits);
     int auto_b=ram_gb<=0;
     if(auto_b){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
@@ -1264,7 +1519,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
         int raise_on=getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):1;
         int newcap=capmax>c->n_experts?c->n_experts:capmax;
         if(raise_on&&newcap>m->ecap){
-            for(int i=0;i<c->n_layers;i++) if(m->ecache[i]){
+            for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
                 m->ecache[i]=realloc(m->ecache[i],(size_t)newcap*sizeof(ESlot));
                 memset(m->ecache[i]+m->ecap,0,(size_t)(newcap-m->ecap)*sizeof(ESlot));
             }
@@ -1355,19 +1610,8 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 }
 
 static int decode_tokens(Model *m, Tok *T, int *all, int kv, int n_new, int eos, float *logit){
-    int emitted=0;
-    while(emitted<n_new){
-        int next=pick_tok(logit,m->c.vocab,-1);
-        free(logit); logit=NULL;
-        if((eos>=0&&next==eos)||is_stop(&m->c,next)) break;
-        char dec[512]; int dn=tok_decode(T,&next,1,dec,511); dec[dn]=0;
-        fputs(dec,stdout); fflush(stdout);
-        all[kv]=next; kv++; emitted++; m->n_emit++;
-        if(emitted>=n_new) break;
-        logit=step(m,all+kv-1,1,kv-1);
-    }
-    if(logit) free(logit);
-    return emitted;
+    EmitStream es={T,m,now_s(),0};
+    return spec_decode(m,all,kv,n_new,eos,logit,emit_stream,&es,NULL);
 }
 
 static const char *hy3_effort(int think){
@@ -1403,9 +1647,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int cap=bl+16; int *pids=malloc((size_t)cap*sizeof(int));
     int np=tok_encode(&T,wrapped,bl,pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); free(pids); return; }
-    printf("prompt: %d tokens | generating up to %d (temp=%.2f nucleus=%.2f)\n",np,ngen,g_temp,g_nuc);
-    kv_alloc(m,np+ngen+2);
-    int *all=malloc((size_t)(np+ngen+2)*sizeof(int)); memcpy(all,pids,(size_t)np*sizeof(int));
+    printf("prompt: %d tokens | generating up to %d (temp=%.2f nucleus=%.2f) | draft=%d\n",
+        np,ngen,g_temp,g_nuc,g_draft);
+    kv_alloc(m,np+ngen+g_draft+2);
+    int *all=malloc((size_t)(np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,(size_t)np*sizeof(int));
     double t=now_s();
     float *logit=step(m,pids,np,0);
     int produced=decode_tokens(m,&T,all,np,ngen,eos,logit);
@@ -1416,6 +1661,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("experts loaded/token: %.1f (per-layer %.2f across %d; topk=%d) | TOPK=%d TOPP=%.2f\n",
         produced?(double)m->ereq/produced:0.0,(produced&&nsp)?(double)m->ereq/produced/nsp:0.0,
         nsp,m->c.topk,g_topk,g_topp);
+    printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
+        m->n_fw?(double)m->n_emit/m->n_fw:1.0,(unsigned long long)m->n_fw,(unsigned long long)m->n_emit,
+        m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,(unsigned long long)m->mtp_acc,(unsigned long long)m->mtp_prop);
     profile_print(m,dt);
     free(pids); free(all);
     usage_save(m);
@@ -1441,6 +1689,7 @@ static void run_serve(Model *m, const char *snap){
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0&&line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; kv_alloc(m,4096);
+            if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){
             if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout); continue; }
@@ -1489,6 +1738,7 @@ static void run_serve(Model *m, const char *snap){
             else bl=snprintf(buf,1<<16,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len-8); prompt_tokens=len+k;
             if(len+k+req_ngen+2>=maxctx){ len=0; first=1; kv_alloc(m,4096);
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
                 bl=0; if(templ) bl=hy3_wrap(buf,1<<16,input,think);
                 else bl=snprintf(buf,1<<16,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx-8); if(k>maxctx-8) k=maxctx-8;
@@ -1498,7 +1748,7 @@ static void run_serve(Model *m, const char *snap){
         if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n",rss_gb()); fflush(stdout); continue; }
         (void)first; first=0;
-        int cur=req_ngen; if(len+k+cur+2>=maxctx) cur=maxctx-len-k-2;
+        int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
@@ -1545,6 +1795,8 @@ int main(int argc, char **argv){
     g_topk=getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp=getenv("TOPP")?atof(getenv("TOPP")):0;
     g_repin=getenv("REPIN")?atoi(getenv("REPIN")):0;
+    g_draft=getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
+    if(g_draft>63) g_draft=63;
     int cap=argc>1?atoi(argv[1]):64;
     int ebits=argc>2?atoi(argv[2]):8;
     int dbits=argc>3?atoi(argv[3]):ebits;
@@ -1577,8 +1829,12 @@ int main(int argc, char **argv){
     printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit ==\n",cap,ebits,dbits);
     g_mem_avail_boot=mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
-    printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d\n",
-        now_s()-t0,m.resident_bytes/(1024.0*1024.0),m.c.n_layers,m.c.n_experts);
+    if(g_draft<0) g_draft=m.has_mtp?3:0;
+    fprintf(stderr,"[MTP] %s (draft=%d)\n",
+        m.has_mtp?"active: native speculative decoding":"absent",g_draft);
+    printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d%s\n",
+        now_s()-t0,m.resident_bytes/(1024.0*1024.0),m.c.n_layers,m.c.n_experts,
+        m.has_mtp?" | MTP head active":"");
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: model on %s (slow 9p mount). Use ext4 (e.g. /home/ or native /mnt/d/) for speed.\n",snap);
     if(getenv("PIN")) pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);

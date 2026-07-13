@@ -259,11 +259,11 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 - FP8 → int4 conversion (full 80-layer model)
 - `hy3_tiny` oracle **32/32** (committed); `hy3_tiny_i4` oracle **32/32** (regenerate locally)
 - Full-model chat (coherent output with `IDOT=0`, fixed serve KV alloc)
+- MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default)
 - `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
 
 **Not yet**
 
-- MTP speculative decode (weights converted; runtime not wired)
 - KV disk persistence (GQA layout)
 - int8 IDOT fast path (disabled by default until oracle-clean on all shapes)
 
@@ -275,6 +275,10 @@ cd c && make hy3
 make hy3 CUDA=1
 # optional self-test (requires hy3_tiny/ — see Tiny oracle fixtures):
 SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
+# MTP smoke test (full converted weights with out-mtp-*.safetensors):
+# SNAP=/path/to/hy3-int4 TEMP=0 DRAFT=3 PROMPT=1 ./hy3 64 8 4
+# Expect stderr: [MTP] active: native speculative decoding (draft=3)
+# and ~2+ tokens/forward in the speculation stats line
 ```
 
 ## Provenance & license
