@@ -96,7 +96,7 @@ typedef struct {
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
 typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -107,7 +107,10 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
-    return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;
+    if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
+        int ng=(t->I+t->gs-1)/t->gs;
+        return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
+    return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
 typedef struct {
@@ -373,6 +376,46 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
             y[(int64_t)s*O+o]=a*sc; } }
+}
+/* y[S,O] = x[S,I] @ W^T with W int4 packed (2/byte) + per-GROUP scales (fmt=4).
+ * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
+ * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
+ * gs MUST be a multiple of 16 (the AVX2 vector width). */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                a+=hsum256(acc)*sc;
+#endif
+                /* scalar tail for the group remainder */
+                for(; i<base+glen; i+=2){
+                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
 }
 /* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
  * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
@@ -766,6 +809,9 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
+     * since the whole point of grouped scales is better quality). */
+    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
      * PR #9 per il gemello VNNI). Soglia configurabile con I4S.
@@ -1061,9 +1107,22 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
+        /* Detect int4-grouped (fmt=4): packed int4 weight bytes BUT scale array is
+         * larger than O*4 — check if it matches O*ceil(I/gs)*4 for gs=128. */
+        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;
+        int gs=0;
+        if(fmt==2 && ns > (int64_t)O*4){
+            /* could be grouped; try gs=128 */
+            int ng128=(I+127)/128;
+            if(ns==(int64_t)O*ng128*4){ fmt=4; gs=128; }
+            /* future: try other group sizes here */
+        }
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
+        else if(fmt==4){ int ng=(I+gs-1)/gs;
+            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            st_read_raw(&m->S,name,t->q4,drop); }
+        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
@@ -1379,7 +1438,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+                /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
+                int gs=0;
+                if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
+                    int ng128=(II[k]+127)/128;
+                    if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
+                }
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
@@ -1493,7 +1558,12 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        int gs=0;
+        if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
+            int ng128=(II[k]+127)/128;
+            if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
+        }
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; return 0;
