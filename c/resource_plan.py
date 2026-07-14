@@ -7,6 +7,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -76,11 +77,46 @@ def analyze_model(model):
 
 
 def memory_available():
+    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
     try:
         text = Path("/proc/meminfo").read_text()
         return int(re.search(r"MemAvailable:\s+(\d+)", text).group(1)) * 1024
     except (OSError, AttributeError):
-        return 0
+        pass
+    # Windows native CPython: GlobalMemoryStatusEx -> ullAvailPhys.
+    # Same definition the C engine uses (compat_meminfo in compat.h):
+    # standby/free/zero pages, i.e. reclaimable without swapping.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalMemoryStatusEx.restype = ctypes.c_int
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) and stat.ullAvailPhys:
+                return stat.ullAvailPhys
+            # Fallback (e.g. sandboxed callers where GlobalMemoryStatusEx reports
+            # nothing): total installed RAM in KB. Less precise than ullAvailPhys
+            # — it ignores standby/reclaimable pages — but never returns 0 on a
+            # real machine, which keeps the expert cache from being mis-sized.
+            total_kb = ctypes.c_ulonglong(0)
+            kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.c_void_p]
+            kernel32.GetPhysicallyInstalledSystemMemory.restype = ctypes.c_int
+            if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_kb)):
+                return total_kb.value * 1024
+        except OSError:
+            pass
+    return 0
 
 
 def discover_gpus():
@@ -105,9 +141,33 @@ def discover_gpus():
     return devices
 
 
+def physical_cpu_count():
+    try:
+        result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
+                                capture_output=True, check=True, timeout=5)
+        cores = {tuple(map(int, line.split(","))) for line in result.stdout.splitlines()
+                 if line and not line.startswith("#")}
+        if cores:
+            return len(cores)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return os.cpu_count() or 1
+
+
+POLICIES = {
+    "quality": {"preserve_quantization": True, "preserve_router": True},
+    "balanced": {"preserve_quantization": True, "preserve_router": True},
+    "experimental-fast": {"preserve_quantization": False, "preserve_router": False},
+}
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
-               available_memory=None, available_disk=None, gpus=None):
+               available_memory=None, available_disk=None, gpus=None,
+               policy="quality", physical_cpus=None):
+    if policy not in POLICIES:
+        raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
+    physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
@@ -153,8 +213,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
-    vram_budget = min(requested_vram, safe_vram, cache_bytes)
+    # VRAM-resident experts do not need duplicate RAM backing: the checkpoint is
+    # their recovery source. RAM is therefore an independent warm compute tier.
+    vram_budget = min(requested_vram, safe_vram, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
+    hot_bytes = min(info["expert_bytes"], vram_experts * typical)
+    warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
+    cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
 
     warnings = []
     if cap < 1:
@@ -162,21 +227,41 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
-        warnings.append("VRAM tier was clamped by free VRAM or its required RAM backing")
+        warnings.append("VRAM tier was clamped by free VRAM or model expert size")
+    if cold_bytes:
+        warnings.append("cold expert misses may reach disk; normal decode speed depends on hit rate")
+
+    if cold_bytes:
+        bottleneck = "disk expert misses"
+    elif warm_bytes:
+        bottleneck = "CPU expert compute and RAM bandwidth"
+    else:
+        bottleneck = "GPU compute and interconnect"
 
     return {
-        "version": 1,
+        "version": 2,
+        "policy": {"name": policy, **POLICIES[policy],
+                   "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
+        "cpu": {"physical_cores": max(1, int(physical_cpus)),
+                "thread_policy": "physical-cores"},
         "tiers": {
-            "disk": {"role": "backing", "model_bytes": info["model_bytes"],
-                     "available_bytes": available_disk},
-            "ram": {"role": "resident+cache", "available_bytes": available_memory,
+            "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
+                     "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
+            "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
-                    "cache_slots_per_layer": cap},
+                    "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
-                     "budget_bytes": vram_budget, "expert_capacity": vram_experts},
+                     "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
+                     "expert_capacity": vram_experts, "requires_host_backing": False},
         },
+        "expected_bottleneck": bottleneck,
+        "decisions": [
+            {"target": "VRAM", "reason": "profile-ranked hot experts"},
+            {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
+            {"target": "Disk", "reason": "immutable recovery source for cold experts"},
+        ],
         "warnings": warnings,
     }
 
@@ -184,6 +269,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
 def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
+    result.setdefault("COLI_POLICY", plan["policy"]["name"])
+    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
+    result.setdefault("OMP_PROC_BIND", "spread")
+    result.setdefault("OMP_PLACES", "cores")
+    if plan["policy"]["name"] == "balanced":
+        result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 
@@ -210,11 +301,15 @@ def format_bytes(value):
 
 def format_plan(plan):
     model, tiers = plan["model"], plan["tiers"]
-    lines = [f"model  {model['shards']} shards · {format_bytes(model['model_bytes'])}",
-             f"disk   backing store · {format_bytes(tiers['disk']['available_bytes'])} free",
+    policy=plan["policy"]
+    lines = [f"policy {policy['name']} · quality-preserving {'yes' if policy['quality_preserving'] else 'no'}",
+             f"model  {model['shards']} shards · {format_bytes(model['model_bytes'])}",
+             f"disk   {format_bytes(tiers['disk']['cold_expert_bytes'])} cold experts · "
+             f"{format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
              f"{format_bytes(tiers['ram']['dense_bytes'])} dense · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
+             f"{format_bytes(tiers['ram']['warm_expert_bytes'])} warm experts · "
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
@@ -223,5 +318,6 @@ def format_plan(plan):
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
+    lines.append(f"limit  {plan['expected_bottleneck']}")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

@@ -215,30 +215,33 @@ def apply_accel_env(e, a, engine):
     if a.gpu is None and not a.vram:
         return e
     has_cuda = cuda_binary(engine)
+    eng = os.path.basename(engine)
     if a.gpu == "none":
         e["COLI_CUDA"] = "0"
         e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
         e.pop("CUDA_EXPERT_GB", None); e.pop("CUDA_DENSE", None)
         return e
-    if a.gpu is not None and a.gpu != "auto":
-        if not has_cuda:
-            print(f"  {C.yel}!{C.r} --gpu ignored: engine is CPU-only (rebuild with make hy3 CUDA=1)", file=sys.stderr)
-            return e
-        e.setdefault("COLI_CUDA", "1")
+    if a.gpu is not None:
         e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
-        devices = [int(v) for v in a.gpu.split(",")]
-        key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
-        e[key] = a.gpu
+        if a.gpu != "none":
+            if not has_cuda:
+                sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make {eng} CUDA=1 (this binary is CPU-only)")
+            e.setdefault("COLI_CUDA", "1")
+            if a.gpu != "auto":
+                devices = [int(v) for v in a.gpu.split(",")]
+                key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
+                e[key] = a.gpu
+            e.setdefault("CUDA_DENSE", "1")
     if a.vram and a.gpu != "none":
         if not has_cuda:
-            print(f"  {C.yel}!{C.r} --vram ignored: engine is CPU-only (rebuild with make hy3 CUDA=1)", file=sys.stderr)
-            return e
+            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make {eng} CUDA=1 (this binary is CPU-only)")
         e.setdefault("COLI_CUDA", "1")
         e["CUDA_EXPERT_GB"] = str(a.vram)
     return e
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    e["COLI_POLICY"]=a.policy
     if engine_for(a.model) == HY3 and "IDOT" not in e:
         e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
     if a.ram:  e["RAM_GB"]=str(a.ram)
@@ -261,7 +264,7 @@ def env_for(a):
         if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary(engine_for(a.model))
@@ -458,7 +461,7 @@ def cmd_plan(a):
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -505,17 +508,41 @@ def cmd_chat(a):
     verbose=verbose_chat(a)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False) if not verbose else None
     e=env_for(a); e["SERVE"]="1"
+    # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
+    # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
+    # protocol coli reads one byte at a time) never flushes and chat hangs at
+    # ~10 GB resident. A PIPE whose read end nobody drains still works: the
+    # engine emits only ~400 bytes of status to stderr, which fits comfortably
+    # in the OS pipe buffer, so it never blocks. We snapshot stderr into errlog
+    # once the READY sentinel arrives, so the status-line display below works
+    # exactly as before. (Do NOT add a concurrent stderr drain thread: on
+    # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
     p=subprocess.Popen([eng, *engine_argv(a.model, a.cap)], env=e, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE,
-                       stderr=sys.stderr if verbose else errlog, bufsize=0)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE if not verbose else sys.stderr,
+                       bufsize=0)
     sp=Spinner(f"waking the giant ({engine_label(a.model)})…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
         if not verbose:
+            try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+            except (OSError, ValueError): pass
             errlog.seek(0); print(errlog.read()[-1500:])
         sys.exit("the engine exited while loading")
     if not verbose:
+        # READY received. Drain the child's stderr into errlog without blocking:
+        # the engine is still alive (blocked on stdin), so a plain read() would
+        # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
+        # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
+        _drain_box={"done":False}
+        def _drain():
+            try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+            except (OSError, ValueError): pass
+            _drain_box["done"]=True
+        threading.Thread(target=_drain, daemon=True).start()
+        for _ in range(20):           # up to ~1s for the load-status lines
+            if _drain_box["done"]: break
+            time.sleep(0.05)
         errlog.flush()
     try:
         elog=open(errlog.name).read() if not verbose else ""
@@ -671,6 +698,9 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
+    common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
+                        default=os.environ.get("COLI_POLICY","quality"),
+                        help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
