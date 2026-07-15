@@ -1789,8 +1789,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     double ta0=now_s();
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
-     * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims. */
-    if(g_metal_enabled && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+     * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims.
+     * RAGGED GUARD (!kvs): the kernel takes ONE Lc/Rc pair and ONE pos_base — it assumes
+     * row s is token pos_base+s of the SAME sequence. The batched mux decode
+     * (step_decode_batch) passes per-row kvs[]/positions[] with pos_base=0, so the kernel
+     * would rope every row at position 0 and attend over a 1-token window of the wrong
+     * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
+     * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s]. */
+    if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
@@ -2925,8 +2931,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
 #ifdef COLI_METAL
     /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
      * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
-     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto. */
-    if(g_metal_enabled && S<=4 && li<c->n_layers && l->sparse
+     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
+     * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
+     * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
+    if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
