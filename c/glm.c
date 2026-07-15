@@ -36,6 +36,9 @@
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #endif
+#if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
+#endif
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -4453,25 +4456,45 @@ static void ehit_mark(Model *m, int layer, int eid){
 static void hwinfo_emit(Model *m){
     Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
     /* CPU */
-    char cpu[256]=""; FILE *ci=fopen("/proc/cpuinfo","r");
+    char cpu[256]="";
+#ifdef _WIN32
+    /* niente /proc su Windows: brand string via CPUID (0x80000002..4), zero
+     * dipendenze extra. La dashboard mostrava "0 GB RAM / 0 cores" perche'
+     * tutto questo blocco era solo-Linux mentre il ramo CUDA funzionava. */
+#if defined(__x86_64__) || defined(__i386__)
+    { unsigned int r[12]={0}; unsigned int *w=r;
+      for(unsigned int f=0x80000002u; f<=0x80000004u; f++,w+=4)
+          __get_cpuid(f,&w[0],&w[1],&w[2],&w[3]);
+      char *b=(char*)r; b[47]=0; while(*b==' ')b++;
+      snprintf(cpu,sizeof(cpu),"%s",b); }
+#endif
+#else
+    FILE *ci=fopen("/proc/cpuinfo","r");
     if(ci){ char ln[256];
         while(fgets(ln,sizeof(ln),ci)) if(!strncmp(ln,"model name",10)){
             char *p=strchr(ln,':'); if(p){ p++; while(*p==' ')p++;
             int n=(int)strlen(p); if(n>0&&p[n-1]=='\n')p[--n]=0;
             snprintf(cpu,sizeof(cpu),"%s",p); } break; }
         fclose(ci); }
+#endif
     int cores=0;
-#ifdef _SC_NPROCESSORS_ONLN
+#ifdef _WIN32
+    { SYSTEM_INFO si; GetSystemInfo(&si); cores=(int)si.dwNumberOfProcessors; }
+#elif defined(_SC_NPROCESSORS_ONLN)
     cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
 #endif
     /* RAM */
     double ram_total=0,ram_avail=0;
+#ifdef _WIN32
+    compat_meminfo(&ram_total,&ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
+#else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;
         while(fgets(ln,sizeof(ln),mi)){
             if(sscanf(ln,"MemTotal: %lf",&mt)==1) ram_total=mt/1e6;
             if(sscanf(ln,"MemAvailable: %lf",&ma)==1) ram_avail=ma/1e6;
         } fclose(mi); }
+#endif
     /* GPU */
     int ngpu=0; double vram_total=0;
     char gpu_name[128]="";
