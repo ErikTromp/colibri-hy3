@@ -47,7 +47,7 @@ Format: `VAR` — default — effect.
 | `CAP_RAISE` | `1` (on) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. |
 | `PREFETCH` | `0` | Prefetch depth for streamed experts. |
 | `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
-| `PIN` | unset | Path to a `.coli_usage` file; pins the hottest experts into a resident "hot store" at startup. |
+| `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
 | `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
