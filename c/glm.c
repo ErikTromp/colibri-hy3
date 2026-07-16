@@ -5967,8 +5967,27 @@ int main(int argc, char **argv){
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
-        const char *pin_gb=getenv("PIN_GB");
-        pin_load(&m,getenv("PIN"),pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0);   /* PIN_GB=all (#80) */
+        const char *pin=getenv("PIN"); char pauto[2100];
+        if(!strcmp(pin,"auto")){
+            /* PIN=auto: la storia VIVA <SNAP>/.coli_usage (appesa a ogni turno) batte il
+             * profilo congelato stats.txt — il pin di ogni riavvio riflette il carico reale
+             * accumulato, non il prompt di bootstrap. Fallback stats.txt per una dir vergine;
+             * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
+             * EN: prefer the live usage history over the frozen one-shot profile, so each
+             * reload's pin placement follows the accumulated real workload. */
+            snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
+            FILE *pf=fopen(pauto,"rb"); long psz=0;
+            if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); }
+            if(psz<=0){ snprintf(pauto,sizeof(pauto),"%s/stats.txt",snap);
+                pf=fopen(pauto,"rb"); psz=0;
+                if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); } }
+            if(psz>0){ pin=pauto; fprintf(stderr,"[PIN] auto: seeding from %s\n",pauto); }
+            else { pin=NULL; fprintf(stderr,"[PIN] auto: no .coli_usage or stats.txt in %s yet (no pin this run)\n",snap); }
+        }
+        if(pin){
+            const char *pin_gb=getenv("PIN_GB");
+            pin_load(&m,pin,pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0);   /* PIN_GB=all (#80) */
+        }
     }
     if(getenv("COUPLE")&&*getenv("COUPLE")){    /* coupling-scored cross-layer prefetch (#176) */
         g_couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;
