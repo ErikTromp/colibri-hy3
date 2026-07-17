@@ -177,6 +177,35 @@ _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>",
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
 
+# ---- Hy3 tool calling (tencent/Hy3, `:opensource` tokens) ----------------------------------
+# <tool_calls:opensource>
+#   <tool_call:opensource>{name}<tool_sep:opensource><arg_key:opensource>{k}</arg_key:opensource>
+#   <arg_value:opensource>{v}</arg_value:opensource>...</tool_call:opensource>
+# </tool_calls:opensource> ... <tool_responses:opensource><tool_response:opensource>{content}
+# </tool_response:opensource></tool_responses:opensource>
+
+HY3_TOOLCALLS_OPEN,  HY3_TOOLCALLS_CLOSE  = "<tool_calls:opensource>",  "</tool_calls:opensource>"
+HY3_TOOLCALL_OPEN,   HY3_TOOLCALL_CLOSE   = "<tool_call:opensource>",   "</tool_call:opensource>"
+HY3_TOOLSEP = "<tool_sep:opensource>"
+HY3_ARGKEY_OPEN,   HY3_ARGKEY_CLOSE   = "<arg_key:opensource>",   "</arg_key:opensource>"
+HY3_ARGVALUE_OPEN, HY3_ARGVALUE_CLOSE = "<arg_value:opensource>", "</arg_value:opensource>"
+HY3_TOOLRESPS_OPEN, HY3_TOOLRESPS_CLOSE = "<tool_responses:opensource>", "</tool_responses:opensource>"
+HY3_TOOLRESP_OPEN,  HY3_TOOLRESP_CLOSE  = "<tool_response:opensource>",  "</tool_response:opensource>"
+HY3_THINK_OPEN, HY3_THINK_CLOSE = "<think:opensource>", "</think:opensource>"
+HY3_REASONING_MODE = "<｜reasoning_mode:opensource｜>"
+HY3_BOS = "<｜hy_begin_of_sentence:opensource｜>"
+HY3_USER = "<｜hy_User:opensource｜>"
+HY3_ASSISTANT = "<｜hy_Assistant:opensource｜>"
+HY3_EOS = "<｜hy_eos:opensource｜>"
+
+_HY3_CALL_RE = re.compile(re.escape(HY3_TOOLCALL_OPEN) + r"(.*?)" + re.escape(HY3_TOOLCALL_CLOSE),
+                         re.DOTALL)
+_HY3_ARG_RE  = re.compile(re.escape(HY3_ARGKEY_OPEN) + r"([^<]*)" + re.escape(HY3_ARGKEY_CLOSE)
+                         + r"\s*" + re.escape(HY3_ARGVALUE_OPEN) + r"(.*?)" + re.escape(HY3_ARGVALUE_CLOSE),
+                         re.DOTALL)
+_HY3_TAG_RE  = re.compile("|".join(re.escape(t) for t in
+                         (HY3_ARGKEY_OPEN, HY3_ARGKEY_CLOSE, HY3_ARGVALUE_OPEN, HY3_ARGVALUE_CLOSE)))
+
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
@@ -280,15 +309,81 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                tool_choice=None):
-    """Render the text-only subset of the official GLM-5.2 chat template."""
-    if not isinstance(messages, list) or not messages:
-        raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    prompt = ["[gMASK]<sop>"]
-    if enable_thinking:
-        effort = "High" if reasoning_effort == "high" else "Max"
-        prompt.append(f"<|system|>Reasoning Effort: {effort}")
+def parse_tool_calls_hy3(reply, tools=None):
+    """Return (content, tool_calls) for the Hy3 `:opensource` tool-call format. Name is terminated
+    by <tool_sep:opensource> rather than an arg tag; otherwise shares the schema-aware arg coercion
+    and optional COLI_TOOL_SALVAGE de-mangler with the GLM parser above."""
+    param_order = _tool_param_order(tools)
+    param_types = _tool_param_types(tools)
+    calls, salvaged = [], []
+    for match in _HY3_CALL_RE.finditer(reply):
+        inner = match.group(1)
+        name, _, rest = inner.partition(HY3_TOOLSEP)
+        name = name.strip()
+        args = {}
+        types = param_types.get(name, {})
+        for arg in _HY3_ARG_RE.finditer(rest):
+            key, value = arg.group(1).strip(), arg.group(2)
+            args[key] = _coerce_arg(value, types.get(key))
+        if not args and _SALVAGE:
+            payload = _HY3_TAG_RE.sub("", rest).strip()
+            if payload.startswith("(") and payload.endswith(")"):
+                payload = payload[1:-1].strip()
+            if payload:
+                key = (param_order.get(name) or ["input"])[0]
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+                args = {key: payload}
+                salvaged.append(name)
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    text = _HY3_CALL_RE.sub("", reply)
+    text = text.replace(HY3_TOOLCALLS_OPEN, "").replace(HY3_TOOLCALLS_CLOSE, "")
+    if HY3_REASONING_MODE in text:
+        text = text.split(HY3_REASONING_MODE, 1)[0]     # trailing `reasoning_effort:X` marker
+    if HY3_THINK_CLOSE in text:
+        text = text.split(HY3_THINK_CLOSE, 1)[1]
+    text = text.replace(HY3_THINK_OPEN, "").replace(HY3_THINK_CLOSE, "")
+    if calls:
+        dm = len(salvaged)
+        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d de-mangled [%s]%s\n"
+                         % (len(calls), len(calls) - dm, dm, "CLEAN" if dm == 0 else "DE-MANGLED",
+                            (" -> " + ", ".join(salvaged)) if dm else ""))
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+def split_reasoning_hy3(text, enable_thinking):
+    """Split raw Hy3 model output into (reasoning, rest, truncated).
+
+    When `enable_thinking` is True the prompt ends with an unclosed `<think:opensource>`,
+    so the generation starts with reasoning text.  We look for the first
+    `</think:opensource>` marker; everything before it is reasoning, everything after
+    is the visible answer (possibly containing tool-call markers).
+
+    Returns:
+        reasoning  -- the reasoning text (empty if disabled or truncated)
+        rest       -- the visible answer text (the whole input if disabled)
+        truncated  -- True when thinking was enabled but the close marker was never found
+                      (3c: whole text becomes content, flagged but not stored as reasoning)
+    """
+    if not enable_thinking:
+        return "", text, False
+    idx = text.find(HY3_THINK_CLOSE)
+    if idx < 0:
+        # 3c: marker never found — whole text is content, reasoning is empty, flagged
+        return "", text, True
+    reasoning = text[:idx]
+    rest = text[idx + len(HY3_THINK_CLOSE):]
+    return reasoning, rest, False
+
+
+def _resolve_tool_choice(tools, tool_choice):
+    """Apply `tool_choice` forcing/filtering shared by every chat-template renderer: a named
+    function narrows the offered tools to that one function; "none" withholds tools entirely.
+    Returns (tools, forced_name)."""
     forced = None
     if isinstance(tool_choice, dict):
         forced = ((tool_choice.get("function") or {}).get("name")
@@ -298,6 +393,19 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
     elif tool_choice == "none":
         tools = None                              # the client forbade tools: do not offer them
+    return tools, forced
+
+
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                tool_choice=None):
+    """Render the text-only subset of the official GLM-5.2 chat template."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    prompt = ["[gMASK]<sop>"]
+    if enable_thinking:
+        effort = "High" if reasoning_effort == "high" else "Max"
+        prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    tools, forced = _resolve_tool_choice(tools, tool_choice)
     if tools:
         # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
         # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
@@ -372,32 +480,110 @@ def hy3_effort(enable_thinking, reasoning_effort):
     return "reasoning_effort:high"
 
 
-def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None):
-    """Render the Hunyuan Hy3 chat template (tencent/Hy3)."""
+def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                    tool_choice=None):
+    """Render the official Hunyuan Hy3 chat template (tencent/Hy3, `:opensource` tokens),
+    including the <tool_calls:opensource> tool-declaration/tool-call/tool-response format."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    user_parts = []
+    has_user = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        text = content_text(message.get("content"), f"messages.{index}.content")
-        if role in ("system", "developer"):
-            user_parts.append(text)
-        elif role == "user":
-            user_parts.append(text)
-        elif role == "assistant":
-            user_parts.append(text)
-        else:
+        if role == "user":
+            has_user = True
+        elif role not in ("system", "developer", "assistant", "tool"):
             raise APIError(400, f"Unsupported message role: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
-    user = "\n".join(user_parts).strip()
-    if not user:
+    if not has_user:
         raise APIError(400, "Hy3 chat requires at least one user message.", "messages")
-    effort = hy3_effort(enable_thinking, reasoning_effort)
-    think = "<think:opensource>" if enable_thinking else "<think:opensource></think:opensource>"
-    return (f"<｜hy_begin_of_sentence:opensource｜><｜reasoning_mode:opensource｜>{effort}"
-            f"<｜hy_User:opensource｜>{user}<｜hy_Assistant:opensource｜>{think}")
+
+    tools, forced = _resolve_tool_choice(tools, tool_choice)
+    system_prompt = "".join(content_text(m.get("content"), f"messages.{i}.content")
+                            for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
+    effort = hy3_effort(enable_thinking, reasoning_effort)     # e.g. "reasoning_effort:high"
+    if not tools:
+        system_prompt += HY3_REASONING_MODE + effort
+
+    parts = [HY3_BOS, system_prompt]
+
+    if tools:
+        parts.append(("\n\n" if system_prompt else "") +
+                     "# Tools\n\nYou may call one or more functions to assist with the user "
+                     "query.\n\nYou are provided with function signatures within <tools></tools> "
+                     "XML tags:\n<tools>\n")
+        clean_tools = []
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean_tools.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
+        parts.append("\n".join(json.dumps(t, ensure_ascii=False) for t in clean_tools))
+        parts.append("\n</tools>\n\n"
+                     "For function call returns, you should first print " + HY3_TOOLCALLS_OPEN + "\n"
+                     "For each function call, you should return object like:\n"
+                     + HY3_TOOLCALL_OPEN + "{function-name}" + HY3_TOOLSEP + "\n"
+                     + HY3_ARGKEY_OPEN + "{arg-key-1}" + HY3_ARGKEY_CLOSE + "\n"
+                     + HY3_ARGVALUE_OPEN + "{arg-value-1}" + HY3_ARGVALUE_CLOSE + "\n"
+                     + HY3_ARGKEY_OPEN + "{arg-key-2}" + HY3_ARGKEY_CLOSE + "\n"
+                     + HY3_ARGVALUE_OPEN + "{arg-value-2}" + HY3_ARGVALUE_CLOSE + "\n"
+                     "...\n" + HY3_TOOLCALL_CLOSE + "\n"
+                     "At the end of function call returns, you should print "
+                     + HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort)
+        if forced:
+            parts.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
+
+    prev_tool = False
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role in ("system", "developer"):
+            continue                                  # already folded into system_prompt above
+        if role == "user":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            if prev_tool:
+                parts.append(HY3_TOOLRESPS_CLOSE)
+            parts.append(HY3_USER + text)
+            prev_tool = False
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            if prev_tool:
+                parts.append(HY3_TOOLRESPS_CLOSE)
+            parts.append(HY3_ASSISTANT)
+            calls = message.get("tool_calls")
+            if calls:
+                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text)
+                parts.append(HY3_TOOLCALLS_OPEN + "\n")
+                for tc in calls:
+                    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                    parts.append(HY3_TOOLCALL_OPEN + (fn.get("name") or "") + HY3_TOOLSEP + "\n")
+                    for key, value in (args or {}).items():
+                        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                        parts.append(HY3_ARGKEY_OPEN + key + HY3_ARGKEY_CLOSE + "\n"
+                                     + HY3_ARGVALUE_OPEN + value + HY3_ARGVALUE_CLOSE + "\n")
+                    parts.append(HY3_TOOLCALL_CLOSE + "\n")
+                parts.append(HY3_TOOLCALLS_CLOSE + HY3_EOS)
+            else:
+                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text + HY3_EOS)
+            prev_tool = False
+        elif role == "tool":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            if not prev_tool:
+                parts.append(HY3_TOOLRESPS_OPEN + "\n")
+            parts.append(HY3_TOOLRESP_OPEN + "\n" + text + "\n" + HY3_TOOLRESP_CLOSE + "\n")
+            prev_tool = True
+    if prev_tool:
+        parts.append(HY3_TOOLRESPS_CLOSE)
+    parts.append(HY3_ASSISTANT + (HY3_THINK_OPEN if enable_thinking
+                                  else HY3_THINK_OPEN + HY3_THINK_CLOSE))
+    return "".join(parts)
 
 
 def model_family(model_dir):
@@ -512,6 +698,11 @@ class Engine:
             argv = [str(executable), str(cap), "4", "8"]
         else:
             argv = [str(executable), str(cap)]
+        # hy3.c has no run_serve_mux/step_decode_batch (those symbols live only in glm.c) --
+        # it silently ignores SERVE_BATCH and always runs the old single-sequence run_serve(),
+        # which speaks \x02PROMPT/END, not SUBMIT/DATA/DONE. Fall back to that protocol for Hy3
+        # so the SUBMIT header text isn't mistaken for a literal chat message.
+        self.protocol = "single" if fam == "hy_v3" else "mux"
         self.process = subprocess.Popen(
             argv, env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
@@ -523,10 +714,16 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        # run_serve() handles one line of the wire protocol at a time (no request ids to
+        # disambiguate interleaved replies), so single-protocol requests must be fully
+        # serialized -- this lock is unused by the mux protocol.
+        self.serialize_lock = threading.Lock()
         read_engine_turn(self.process.stdout, READY, lambda _: None)
-        self.dispatcher = threading.Thread(target=self._dispatch_stdout,
-                                           name="colibri-stdout", daemon=True)
-        self.dispatcher.start()
+        self.dispatcher = None
+        if self.protocol == "mux":
+            self.dispatcher = threading.Thread(target=self._dispatch_stdout,
+                                               name="colibri-stdout", daemon=True)
+            self.dispatcher.start()
 
     @staticmethod
     def _stats(fields):
@@ -605,6 +802,51 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None):
+        if self.protocol == "single":
+            return self._generate_single(prompt, max_tokens, temperature, top_p, on_text,
+                                         cache_slot, cancelled)
+        return self._generate_mux(prompt, max_tokens, temperature, top_p, on_text,
+                                  cache_slot, cancelled)
+
+    def _generate_single(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
+                         cancelled=None):
+        """Hy3 fallback wire protocol (see the comment in __init__): \\x02PROMPT <bytes>
+        <max_tokens> <temperature> <top_p> <slot>\\n<payload>\\n in, a raw byte stream
+        terminated by \\x01\\x01END\\x01\\x01\\n plus a STAT line out. The engine handles one
+        line/turn at a time -- serialize_lock enforces one in-flight request system-wide.
+        Unlike the mux protocol there is no mid-stream CANCEL: `cancelled` is only honored
+        before submission, not once generation has started."""
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        payload = prompt.encode("utf-8")
+        if b"\0" in payload:
+            raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+        def decode(data):
+            text = decoder.decode(data)
+            if text:
+                on_text(text)
+
+        with self.serialize_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.process.poll() is not None:
+                raise RuntimeError("colibri engine is not running")
+            if cancelled and cancelled():
+                raise ClientCancelled()
+            header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
+                     f"{top_p:.8g} {cache_slot}\n").encode()
+            self.process.stdin.write(header + payload + b"\n")
+            self.process.stdin.flush()
+            stats = read_engine_turn(self.process.stdout, END, decode)
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                on_text(tail)
+            return stats
+
+    def _generate_mux(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
+                      cancelled=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -675,7 +917,7 @@ class Engine:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
-        if self.dispatcher is not threading.current_thread():
+        if self.dispatcher is not None and self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 
 
@@ -812,11 +1054,15 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def generation(self, body, prompt, request_id, chat):
+    def generation(self, body, prompt, request_id, chat, enable_thinking=False):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
         if body.get("tool_choice") == "none":
             tools = None          # client forbade tools: never surface tool_calls
+        hy3 = chat and self.server.model_family == "hy_v3"
+        hy3_thinking = hy3 and enable_thinking  # Hy3-only: Stage-1 reasoning splitter engages
+        box_start = HY3_TOOLCALLS_OPEN if hy3 else BOX_START
+        parse_calls = parse_tool_calls_hy3 if hy3 else parse_tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -845,8 +1091,24 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
-                if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                if hy3_thinking:
+                    reasoning, rest, truncated = split_reasoning_hy3(text, True)
+                    if chat and tools:
+                        content, calls = parse_calls(rest, tools)
+                    else:
+                        content, calls = rest, []
+                    message = {"role": "assistant", "content": content or None, "refusal": None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                        message["reasoning"] = reasoning
+                    if calls:
+                        message["tool_calls"] = calls
+                    if truncated:
+                        message["colibri_reasoning_truncated"] = True
+                    finish = "tool_calls" if calls else length_finish
+                    choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
+                elif chat and tools:
+                    content, calls = parse_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if calls:
                         message["tool_calls"] = calls
@@ -922,12 +1184,61 @@ class APIHandler(BaseHTTPRequestHandler):
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
+
+            # Stage-1 reasoning splitter (Hy3 only, when thinking enabled).
+            # Wraps whatever Stage-2 closure (emit_tools/emit_plain) is chosen below.
+            # When hy3_thinking is True, the prompt ends with an unclosed <think:opensource>,
+            # so the first bytes from the engine are always reasoning text.  We buffer them
+            # and emit as reasoning_content deltas until </think:opensource> is found, then
+            # hand off the remainder to Stage 2 (unchanged tool/plain logic).
+            rs = None
+            reasoning_raw = []
+            if hy3_thinking:
+                rs = {"buf": "", "done": False}
+                THINK_HOLD = len(HY3_THINK_CLOSE) - 1
+
+                def emit_reasoning(text):
+                    reasoning_raw.append(text)
+                    if dbg_echo:
+                        sys.stderr.write(text); sys.stderr.flush()
+                    if not text:
+                        return
+                    choice = [{"index": 0, "delta": {"reasoning_content": text, "reasoning": text},
+                               "logprobs": None, "finish_reason": None}]
+                    event(choice)
+
+            def wrap_stage1(stage2):
+                """If hy3_thinking is on, return a Stage-1 reasoning-split wrapper that feeds
+                post-marker text into stage2.  Otherwise return stage2 unchanged."""
+                if not rs:
+                    return stage2
+                def _fn(chunk):
+                    if rs["done"]:
+                        stage2(chunk)
+                        return
+                    rs["buf"] += chunk
+                    idx = rs["buf"].find(HY3_THINK_CLOSE)
+                    if idx >= 0:
+                        if idx:
+                            emit_reasoning(rs["buf"][:idx])
+                        rs["done"] = True
+                        remainder = rs["buf"][idx + len(HY3_THINK_CLOSE):]
+                        rs["buf"] = ""
+                        if remainder:
+                            stage2(remainder)
+                        return
+                    flush = max(0, len(rs["buf"]) - THINK_HOLD)
+                    if flush:
+                        emit_reasoning(rs["buf"][:flush])
+                        rs["buf"] = rs["buf"][flush:]
+                return _fn
+
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # <tool_call> split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = len(box_start) - 1
                 raw = []
                 def emit_tools(chunk):
                     raw.append(chunk)
@@ -936,7 +1247,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(box_start)
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -947,12 +1258,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
+                emit_target = wrap_stage1(emit_tools)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
+                    prompt, maximum, temperature, top_p, emit_target, cache_slot,
                     lambda: not connected)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = parse_calls("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -964,15 +1276,29 @@ class APIHandler(BaseHTTPRequestHandler):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     emit(chunk)
+                emit_target = wrap_stage1(emit_plain)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
+                    prompt, maximum, temperature, top_p, emit_target, cache_slot,
                     lambda: not connected)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
-            final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
-                            if chat else {"index": 0, "text": "", "logprobs": None,
-                                          "finish_reason": finish})
+            # Streaming final-fixup chunk: for Hy3 thinking, if Stage 1 never saw the close
+            # marker, flag truncation on the final chunk so clients can detect it.
+            if hy3_thinking and rs is not None and not rs["done"]:
+                # Flush any remaining reasoning text still held in the Stage-1 buffer.
+                # (It was never delivered as reasoning_content because the marker never
+                # arrived, so per 3c it's treated as visible content.)
+                if rs["buf"]:
+                    emit(rs["buf"]); rs["buf"] = ""
+                final_choice = {"index": 0, "delta": {}, "logprobs": None,
+                                "finish_reason": finish,
+                                "colibri_reasoning_truncated": True}
+            else:
+                final_choice = ({"index": 0, "delta": {}, "logprobs": None,
+                                 "finish_reason": finish} if chat else
+                                {"index": 0, "text": "", "logprobs": None,
+                                 "finish_reason": finish})
             event([final_choice])
             if include_usage:
                 event([], self.usage(stats))
@@ -1016,23 +1342,20 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
+        tools = body.get("tools") or body.get("functions") or None
         if self.server.model_family == "hy_v3":
-            for name in ("tools", "functions"):
-                if body.get(name):
-                    raise APIError(400, f"`{name}` is not supported for Hy3 yet.", name,
-                                   "unsupported_parameter")
-            prompt = render_chat_hy3(body.get("messages"), enable_thinking, reasoning_effort)
+            prompt = render_chat_hy3(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                                     body.get("tool_choice"))
         else:
-            tools = body.get("tools") or body.get("functions") or None
             prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
                                  body.get("tool_choice"))
-        self.generation(body, prompt, request_id, True)
+        self.generation(body, prompt, request_id, True, enable_thinking)
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
-        self.generation(body, prompt, request_id, False)
+        self.generation(body, prompt, request_id, False, enable_thinking=False)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
