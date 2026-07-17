@@ -320,6 +320,8 @@ def parse_tool_calls_hy3(reply, tools=None):
         inner = match.group(1)
         name, _, rest = inner.partition(HY3_TOOLSEP)
         name = name.strip()
+        if not name:
+            continue                              # skip malformed block with no tool name
         args = {}
         types = param_types.get(name, {})
         for arg in _HY3_ARG_RE.finditer(rest):
@@ -500,11 +502,13 @@ def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tool
         raise APIError(400, "Hy3 chat requires at least one user message.", "messages")
 
     tools, forced = _resolve_tool_choice(tools, tool_choice)
-    system_prompt = "".join(content_text(m.get("content"), f"messages.{i}.content")
-                            for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
+    system_prompt = "\n\n".join(content_text(m.get("content"), f"messages.{i}.content")
+                                for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
     effort = hy3_effort(enable_thinking, reasoning_effort)     # e.g. "reasoning_effort:high"
     if not tools:
-        system_prompt += HY3_REASONING_MODE + effort
+        # Insert a delimiter before the reasoning-mode marker so it never fuses with the
+        # last system/developer message (and multiple system messages stay separated).
+        system_prompt = (system_prompt + "\n\n" if system_prompt else "") + HY3_REASONING_MODE + effort
 
     parts = [HY3_BOS, system_prompt]
 
@@ -569,7 +573,9 @@ def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tool
                         parts.append(HY3_ARGKEY_OPEN + key + HY3_ARGKEY_CLOSE + "\n"
                                      + HY3_ARGVALUE_OPEN + value + HY3_ARGVALUE_CLOSE + "\n")
                     parts.append(HY3_TOOLCALL_CLOSE + "\n")
-                parts.append(HY3_TOOLCALLS_CLOSE + HY3_EOS)
+                # Match the declared tool-call format: the model is told to end its tool calls
+                # with </tool_calls:opensource> followed by the reasoning-mode marker, then EOS.
+                parts.append(HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort + HY3_EOS)
             else:
                 parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text + HY3_EOS)
             prev_tool = False
@@ -1286,11 +1292,16 @@ class APIHandler(BaseHTTPRequestHandler):
             # Streaming final-fixup chunk: for Hy3 thinking, if Stage 1 never saw the close
             # marker, flag truncation on the final chunk so clients can detect it.
             if hy3_thinking and rs is not None and not rs["done"]:
-                # Flush any remaining reasoning text still held in the Stage-1 buffer.
-                # (It was never delivered as reasoning_content because the marker never
-                # arrived, so per 3c it's treated as visible content.)
+                # </think:opensource> never arrived (truncation per 3c): Stage-1 already
+                # delivered the output as reasoning_content deltas. Clients that ignore
+                # reasoning_content would otherwise miss it, so replay the accumulated
+                # reasoning text as visible content too (including the tail held in rs["buf"]).
+                full = "".join(reasoning_raw)
                 if rs["buf"]:
-                    emit(rs["buf"]); rs["buf"] = ""
+                    full += rs["buf"]
+                    rs["buf"] = ""
+                if full:
+                    emit(full)
                 final_choice = {"index": 0, "delta": {}, "logprobs": None,
                                 "finish_reason": finish,
                                 "colibri_reasoning_truncated": True}
