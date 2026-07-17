@@ -2146,6 +2146,22 @@ static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for 
                            * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
+static int g_pipe_block=0;/* COLI_PIPE_BLOCK=1: pipe_wait blocca su una condvar invece dello
+                           * spin sched_yield (default OFF = spin byte-identico). EN: a yield
+                           * storm on the main thread fights the OpenMP team for cycles during
+                           * multi-ms loads; the condvar wake costs ~5us against reads that
+                           * cost 0.5-3ms (#159). Pthread pool only: the URING backend has no
+                           * waiter spin to replace. */
+/* PIPE_WORKERS>0 esplicito nell'env implica PIPE=1: dimensionare il pool
+ * dichiara l'intento di usarlo (una campagna intera l'ha impostato con la
+ * pipe spenta senza accorgersene). EN: fires ONLY when PIPE is unset in the
+ * env AND the platform default left the pipe off (on _WIN32 it already
+ * defaults to 1) AND PIPE_WORKERS parses positive — the internal default of
+ * 8 does not count, PIPE_WORKERS=0/empty does not, and an explicit PIPE=0
+ * always wins. */
+static int pipe_workers_imply_pipe(const char *pipe_env, const char *pw_env, int pipe_now){
+    return !pipe_now && !pipe_env && pw_env && atoi(pw_env)>0;
+}
 typedef struct {
     _Atomic uint64_t cur;                         /* (gen<<8)|index; gen main-only, index 0..njobs (≤64) */
     _Atomic int njobs;                            /* current batch job count */
@@ -2153,6 +2169,7 @@ typedef struct {
     _Atomic int layer;                            /* current batch layer */
     _Atomic int ready[64];                        /* per-slot load-done flag */
     pthread_mutex_t mx; pthread_cond_t cv;        /* ONLY for parking/waking idle workers */
+    pthread_cond_t cv_done;                       /* COLI_PIPE_BLOCK: signals ready[] transitions */
     Model *m;
     pthread_t th[16]; int nw; int started;
 } PipePool;
@@ -2177,6 +2194,11 @@ static void *pipe_worker(void *arg){
                 int eid=atomic_load_explicit(&p->eids[i],memory_order_relaxed); /* AFTER winning CAS */
                 expert_load(p->m,L,eid,&p->m->ws[i],1);  /* needed-now load: fatal on I/O error (matches serial path) */
                 atomic_store_explicit(&p->ready[i],1,memory_order_release);
+                if(g_pipe_block){                     /* wake a main thread parked in pipe_wait */
+                    pthread_mutex_lock(&p->mx);
+                    pthread_cond_broadcast(&p->cv_done);
+                    pthread_mutex_unlock(&p->mx);
+                }
             }
             /* CAS failed → another worker advanced index (or gen advanced): re-loop */
         }
@@ -2194,6 +2216,7 @@ static void pipe_init(Model *m){
     g_pp.m=m; g_pp.nw=g_pipe_nw; if(g_pp.nw>16) g_pp.nw=16; if(g_pp.nw<1) g_pp.nw=1;
     atomic_store(&g_pp.cur,0); atomic_store(&g_pp.njobs,0);
     pthread_mutex_init(&g_pp.mx,NULL); pthread_cond_init(&g_pp.cv,NULL);
+    pthread_cond_init(&g_pp.cv_done,NULL);
     for(int i=0;i<g_pp.nw;i++) pthread_create(&g_pp.th[i],NULL,pipe_worker,NULL);
     g_pp.started=1;
 }
@@ -2228,6 +2251,17 @@ static inline void pipe_wait(int q){
         return;
     }
 #endif
+    if(g_pipe_block){
+        /* Fast path senza lock; poi ri-verifica SOTTO il lock prima di ogni
+         * wait. EN: the worker stores ready (release) BEFORE it takes mx to
+         * broadcast, so a set flag can never be missed (no lost wakeup). */
+        if(atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) return;
+        pthread_mutex_lock(&g_pp.mx);
+        while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire))
+            pthread_cond_wait(&g_pp.cv_done,&g_pp.mx);
+        pthread_mutex_unlock(&g_pp.mx);
+        return;
+    }
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
 }
 
@@ -6108,8 +6142,13 @@ int main(int argc, char **argv){
         0
 #endif
         ;
+    if(pipe_workers_imply_pipe(getenv("PIPE"),getenv("PIPE_WORKERS"),g_pipe)){
+        g_pipe=1;
+        fprintf(stderr,"[PIPE] PIPE_WORKERS is set — enabling the async pipe (PIPE=1 implied; set PIPE=0 to override)\n");
+    }
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
+    g_pipe_block = getenv("COLI_PIPE_BLOCK")?atoi(getenv("COLI_PIPE_BLOCK")):0; /* blocking pipe_wait (default: spin) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
     if(g_uring){
