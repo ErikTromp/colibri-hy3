@@ -744,12 +744,65 @@ def cmd_chat(a):
         except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
+def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+
 def cmd_serve(a):
     need_model(a.model)
+    # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
+    # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    try:
+        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+    except OSError: pass
     from openai_server import serve
-    serve(a.model, a.host, a.port, a.model_id, a.api_key,
-          a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
-          a.max_queue,a.queue_timeout,a.kv_slots)
+    try:
+        serve(a.model, a.host, a.port, a.model_id, a.api_key,
+              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots)
+    finally:
+        try: os.unlink(serve_pidfile(a.port))
+        except OSError: pass
+
+def cmd_stop(a):
+    """Shut down a running `coli serve` AND its engine — one command, no pkill.
+    The engine re-execs itself for OMP tuning, so its process is named `exe`,
+    not `glm`: every `pkill -x glm` in history silently killed nothing (that is
+    how two 17+5 GB ghost engines OOM'd this box on 2026-07-16). This finds the
+    real processes: the pidfile first, then /proc by cmdline/environ — only
+    processes that are demonstrably ours (SERVE=1 + our SNAP, or `coli serve`
+    in the command line)."""
+    banner("stop")
+    targets=[]  # (pid, descrizione)
+    pf=serve_pidfile(a.port)
+    try:
+        pid=int(open(pf).read().split()[0])
+        os.kill(pid,0); targets.append((pid,f"coli serve (pidfile, port {a.port})"))
+    except (OSError,ValueError,IndexError): pass
+    for pd in os.listdir("/proc"):
+        if not pd.isdigit(): continue
+        pid=int(pd)
+        try:
+            cmd=open(f"/proc/{pd}/cmdline","rb").read().replace(b"\0",b" ").decode("utf-8","replace")
+            if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
+                if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
+            comm=open(f"/proc/{pd}/comm").read().strip()
+            if comm in ("glm","exe","olmoe"):
+                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
+                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
+        except (OSError,PermissionError): continue
+    if not targets:
+        print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
+    for pid,desc in targets: print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
+    if a.dry_run: return
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    time.sleep(2.0)
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        except OSError: pass       # gia' morto: bene
+    try: os.unlink(pf)
+    except OSError: pass
+    print(f"  {C.grn}✓ stopped{C.r} — RAM released")
 
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
@@ -860,6 +913,8 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
+    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
@@ -883,7 +938,7 @@ def main():
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
+             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
