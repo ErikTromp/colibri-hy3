@@ -335,7 +335,7 @@ tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_logit_nan$(EXE): tests/test_logit_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
