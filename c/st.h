@@ -200,7 +200,19 @@ static void st_init(shards *S, const char *snap_dir) {
             if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+            /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard
+             * di overflow, uno shape tipo [65535,65535,65535,...] fa avvolgere
+             * numel a un valore piccolo/negativo che poi passerebbe il cross-check
+             * numel*esz==nbytes in st_read_f32, riaprendo l'OOB. */
+            int64_t numel = 1; int bad_shape = 0;
+            for (int k = 0; k < shp->len; k++) {
+                int64_t d = (int64_t)shp->kids[k]->num;
+                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) { bad_shape = 1; break; }
+                numel *= d;
+            }
+            if (bad_shape) {
+                fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
+                        files[fi], name); exit(1); }
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
@@ -249,6 +261,15 @@ static void st_prefetch(shards *S, const char *name) {
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
+     * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
+     * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
+     * che e' dimensionato sul config, non sul file. Il chiamante che alloca su
+     * st_numel resta coerente; questo blocca l'ingresso ostile a monte. */
+    int esz = (t->dtype == 2) ? 4 : 2;
+    if (t->numel < 0 || t->numel > t->nbytes / esz || t->numel * (int64_t)esz != t->nbytes) {
+        fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
+                name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");

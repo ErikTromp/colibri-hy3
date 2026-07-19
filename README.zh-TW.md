@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · 繁體中文
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
 </p>
 
 **小巧引擎，龐大模型。**只要約 25 GB 記憶體，就能在消費級電腦上執行 **GLM-5.2（744B 參數的 MoE）**——以零相依套件的純 C 實作，從硬碟串流載入專家。
@@ -60,7 +60,7 @@ VRAM／RAM／硬碟層級長條，以及角落的即時迷你大腦。</em></p>
   **存放在硬碟**（約 370 GB），並**隨需串流載入**，搭配逐層 LRU 快取、
   會學習的熱門專家固定儲存區，以及選用的 VRAM 層級。
 
-引擎由單一 C 檔（`c/glm.c`）與少量標頭檔組成。不需要 BLAS，
+引擎由主 C 檔（`c/colibri.c`）與多個標頭檔模組組成。不需要 BLAS，
 執行階段不需要 Python，也不需要 GPU。
 
 ## 運作方式
@@ -203,7 +203,11 @@ colibrì 最初是由一人使用 12 核心、25 GB RAM 的筆電開發；
 ```
 Makefile                  根目錄建置／檢查入口
 c/
-├── glm.c                 單檔 GLM 引擎
+├── colibri.c                 GLM 引擎主檔
+├── quant.h                量化 matmul kernel
+├── sample.h               取樣與 stop-set
+├── kv_persist.h           .coli_kv 磁碟持久化
+├── telemetry.h            儀表板協定、統計
 ├── st.h, tok.h, json.h   執行階段標頭檔
 ├── backend_cuda.*        選用的 CUDA 層級
 ├── Makefile              建置與本機檢查
@@ -218,7 +222,7 @@ desktop/                  包裝網頁 UI 的 Tauri v2 桌面 shell
 docs/                     參考文件、實驗與媒體檔
 ```
 
-執行階段路徑刻意維持扁平、易讀：`glm.c` 加上少量標頭檔。
+執行階段路徑刻意維持扁平、易讀：`colibri.c` 加上模組化標頭檔。
 在儲存庫根目錄執行 `make`、`make check` 與 `make clean`，
 都會轉交給引擎的 Makefile。
 

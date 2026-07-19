@@ -56,7 +56,7 @@ OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
-# which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
 ifneq ($(ARCH),)
 CFLAGS += -mcpu=$(ARCH)
@@ -70,7 +70,7 @@ else ifneq ($(IS_WIN),)
 # ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
 # machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
 # it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
-# which the x86-64-v3 baseline does not define. The #ifdef guards in glm.c mean
+# which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
@@ -207,17 +207,18 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE)
+all: colibri$(EXE)
 
-# phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
-glm: glm$(EXE)
+# phony targets — 'glm' kept for backward compatibility
+colibri: colibri$(EXE)
+glm: colibri$(EXE)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
-# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
-# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
-# worked but isn't. We record the build-affecting flags in .build-config and rewrite
-# it ONLY when they change (evaluated here at parse time, so the file's timestamp
-# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
+# and silently keeps the CPU-only binary (no CUDA loader) — a build that looks like
+# it worked but isn't. We record the build-affecting flags in .build-config and
+# rewrite it ONLY when they change (evaluated here at parse time, so the file's
+# timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
 BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
@@ -226,8 +227,8 @@ $(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
 endif
 .build-config: ;
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -285,7 +286,7 @@ PORTABLE_ARCH = native
 endif
 
 portable:
-	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
+	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
@@ -311,30 +312,30 @@ tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h j
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_topp$(EXE): tests/test_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_sample_nan$(EXE): tests/test_sample_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_logit_nan$(EXE): tests/test_logit_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
@@ -343,15 +344,15 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_dsa_select$(EXE): tests/test_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
@@ -368,12 +369,12 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
-	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
+	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
@@ -387,4 +388,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

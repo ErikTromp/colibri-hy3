@@ -73,21 +73,6 @@ static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a mat
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
 static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
 #endif
-#ifdef __AVX2__
-#include <immintrin.h>
-static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
-    __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
-    lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
-    sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
-}
-#elif defined(__ARM_NEON)
-#include <arm_neon.h>                             /* Apple Silicon / aarch64: kernel NEON */
-#elif defined(__VSX__)
-#include <altivec.h>                              /* POWER8+ (ppc64le): kernel VSX */
-#undef vector                                     /* igiene: si usano __vector/__bool espliciti */
-#undef pixel
-#undef bool
-#endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
@@ -218,13 +203,21 @@ typedef struct {
     uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
 
-static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
-static void tiers_emit(Model *m);
-static void ehit_mark(Model *m, int layer, int eid);
-static void emap_emit(Model *m);
-static void hits_emit(Model *m);
-static void hwinfo_emit(Model *m);
-static int64_t expert_bytes_probe(Model *m, int ebits);   /* PROF: tier sizes in the report */
+#include "quant.h"
+static int g_no_fused_pair=0;
+static int g_spec_pin=1;
+static int g_spec_live=0;
+static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
+
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
+static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
+
+static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
+    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+        matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
+    else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
+
 static int g_repin;
 static uint64_t g_last_repin;
 #ifdef COLI_CUDA
@@ -332,713 +325,15 @@ static float *falloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
-/* ---- Accumulatore int4->float a 512 bit / 512-bit int4->float accumulator ----
- * Stessa matematica lossless di matmul_i4 (nibble->f32, FMA), ma 32 pesi/iter su
- * due catene FMA indipendenti. NON bit-identico al vecchio ordine: la riduzione
- * ad albero accumula MENO errore della somma sequenziale (misurato 2-4x più
- * vicino all'oracolo double sulle forme reali; perplexity invariata, +4-7% sul
- * decode con routing CPU-heavy — vedi docs/experiments/glm52-6x5090-2026-07-12.md).
- * EN: same lossless math as matmul_i4, 32 weights/iter on two independent FMA
- * chains. Not bit-identical to the old order: tree reduction accumulates LESS
- * rounding than sequential summation. I4_ACC512=0 restores the old order (A/B). */
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-static int g_i4_acc512=1;
-static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
-    __m512 acc0=_mm512_setzero_ps(),acc1=_mm512_setzero_ps(); int i=0;
-    for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
-        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
-        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
-        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
-        acc0=_mm512_fmadd_ps(_mm512_loadu_ps(x+i),w0,acc0);
-        acc1=_mm512_fmadd_ps(_mm512_loadu_ps(x+i+16),w1,acc1);
-    }
-    return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
-}
-/* selftest contro il riferimento scalare (I4_ACC512_TEST=1): copre l'ordine dei
- * nibble e ogni multiplo di 32. / selftest vs the scalar reference. */
-static int i4_acc512_selftest(void){
-    enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
-    for(int i=0;i<N;i++){
-        int q=((i*13+5)&15)-8;
-        if(!(i&1)) w[i>>1]=(uint8_t)(q+8);
-        else w[i>>1]|=(uint8_t)((q+8)<<4);
-        x[i]=(float)(((i*29+7)%101)-50)/37.f;
-    }
-    for(int n=32;n<=N;n+=32){
-        float ref=0; for(int i=0;i<n;i++) ref+=x[i]*(float)(((w[i>>1]>>((i&1)*4))&15)-8);
-        float got=dot_i4f_avx512(w,x,n),tol=2e-5f*(1.f+fabsf(ref));
-        if(fabsf(got-ref)>tol){ fprintf(stderr,"AVX512 i4 selftest n=%d: %.9g != %.9g\n",n,got,ref); return 0; }
-    }
-    return 1;
-}
-#endif
 
-/* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
-}
-/* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
-#ifdef __AVX2__
-            __m256 acc=_mm256_setzero_ps();
-            for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
-                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
-            a=hsum256(acc);
-#elif defined(__ARM_NEON)
-            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
-            for(;i+8<=I;i+=8){ int16x8_t w16=vmovl_s8(vld1_s8(w+i));
-                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),   vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))));
-                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)))); }
-            a=vaddvq_f32(vaddq_f32(ac0,ac1));
-#endif
-            for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
-}
-/* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
-static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
-    int rb=(I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-            if(g_i4_acc512){ a=dot_i4f_avx512(w,xs,I); i=I&~31; }
-            else {
-#endif
-#ifdef __AVX2__
-            const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
-            __m256 acc=_mm256_setzero_ps();
-            for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));   /* 8 byte=16 nibble */
-                __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                __m128i nib=_mm_unpacklo_epi8(lo,hi);                                       /* nibble in ordine */
-                __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
-                __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
-                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
-                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-            a=hsum256(acc);
-#elif defined(__ARM_NEON)
-            const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
-            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
-            for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 byte=16 nibble */
-                uint8x8x2_t z=vzip_u8(vand_u8(by,m4), vshr_n_u8(by,4));        /* nibble in ordine */
-                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[0]),b8));
-                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[1]),b8));
-                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
-                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
-                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
-                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
-            a=vaddvq_f32(vaddq_f32(ac0,ac1));
-#endif
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-            }
-#endif
-            for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
-                a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
-            if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
-            y[(int64_t)s*O+o]=a*sc; } }
-}
-/* y[S,O] = x[S,I] @ W^T with W int4 packed (2/byte) + per-GROUP scales (fmt=4).
- * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
- * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
- * gs MUST be a multiple of 16 (the AVX2 vector width). */
-static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
-                              int S, int I, int O, int gs){
-    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w=q4+(int64_t)o*rb;
-        const float *scl=scale+(int64_t)o*ng;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a=0;
-            for(int g=0; g*gs<I; g++){
-                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
-                float sc=scl[g];
-                int i=base;
-#ifdef __AVX2__
-                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
-                __m256 acc=_mm256_setzero_ps();
-                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
-                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
-                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
-                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
-                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
-                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-                a+=hsum256(acc)*sc;
-#endif
-                /* scalar tail for the group remainder */
-                for(; i<base+glen; i+=2){
-                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
-                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
-                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
-                }
-            }
-            y[(int64_t)s*O+o]=a;
-        }
-    }
-}
-/* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
- * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
- * this keeps colibri dependency-free while removing one team launch/expert. */
-static void matmul_i4_pair(float *yg, float *yu, const float *x,
-                           const uint8_t *qg, const float *sg,
-                           const uint8_t *qu, const float *su, int I, int O){
-    int rb=(I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for(int z=0;z<2*O;z++){
-        int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
-        float a=0; int i=0;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-        if(g_i4_acc512){ a=dot_i4f_avx512(w,x,I); i=I&~31; }
-        else {
-#endif
-#ifdef __AVX2__
-        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
-        __m256 acc=_mm256_setzero_ps();
-        for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
-            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-            __m128i nib=_mm_unpacklo_epi8(lo,hi);
-            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
-            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
-            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),w0,acc);
-            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),w1,acc); }
-        a=hsum256(acc);
-#elif defined(__ARM_NEON)
-        const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
-        float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0);
-        for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));
-            uint8x8x2_t n=vzip_u8(vand_u8(by,m4),vshr_n_u8(by,4));
-            int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[0]),b8));
-            int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[1]),b8));
-            ac0=vfmaq_f32(ac0,vld1q_f32(x+i),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
-            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+4),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
-            ac0=vfmaq_f32(ac0,vld1q_f32(x+i+8),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
-            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+12),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
-        a=vaddvq_f32(vaddq_f32(ac0,ac1));
-#endif
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-        }
-#endif
-        for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; a+=x[i]*(float)((b&15)-8)+x[i+1]*(float)((b>>4)-8); }
-        if(i<I) a+=x[i]*(float)((w[i>>1]&15)-8);
-        (z<O?yg:yu)[o]=a*(z<O?sg:su)[o];
-    }
-}
-
-static void matmul_qt(float *y,const float *x,QT *w,int S);
-static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
- * that changes OMP scheduling vs separate matmul_qt calls — this
- * shifts floating-point accumulation order and can collapse MTP
- * draft acceptance by flipping near-ties (#163). */
-/* #163: l'acceptance MTP crolla quando il forward di draft (S=1) e quello di verifica
- * (S>=2) non calcolano la STESSA funzione. Tre interruttori dipendono da S: il gate
- * int4-IDOT (S>=g_i4s — asimmetrico proprio dove g_i4s>1), la fusione gate+up solo-S==1,
- * e la soglia righe del GEMM Metal. Con SPEC_PIN=1 (default) ogni forward emesso mentre
- * i draft del modello sono attivi resta sulla famiglia di kernel di S=1: draft e verifica
- * coincidono per costruzione. Prefill e decode non speculativo sono intoccati.
- * EN: MTP acceptance collapses when the draft (S=1) and verify (S>=2) forwards do not
- * compute the SAME function. Three switches are S-dependent: the int4 IDOT gate
- * (S>=g_i4s — asymmetric exactly on ISAs where g_i4s>1), the S==1-only gate+up fusion,
- * and the Metal GEMM row threshold. SPEC_PIN=1 (default) pins every forward issued
- * while model drafts are live to the platform's S=1 kernel family, so draft and verify
- * agree by construction; prefill and non-speculative decode are untouched.
- * SPEC_PIN=0 restores the S-dependent gates (A/B). */
-static int g_spec_pin=1;
-static int g_spec_live=0;                    /* set by spec_decode while drafts are live */
-static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
-static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
-    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
-        matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
-    else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
-}
-/* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
-static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
-    int rb=(I+3)/4;
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o];
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
-#ifdef __AVX2__
-            const __m128i m2=_mm_set1_epi8(0x03); const __m256i b2=_mm256_set1_epi32(2);
-            __m256 acc=_mm256_setzero_ps();
-            for(;i+16<=I;i+=16){ __m128i by=_mm_cvtsi32_si128(*(const int*)(w+(i>>2)));    /* 4 byte=16 valori */
-                __m128i p0=_mm_and_si128(by,m2), p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
-                __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
-                __m128i lo=_mm_unpacklo_epi8(p0,p1), hi=_mm_unpacklo_epi8(p2,p3);
-                __m128i nib=_mm_unpacklo_epi16(lo,hi);                                      /* 16 valori in ordine */
-                __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b2));
-                __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b2));
-                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
-                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-            a=hsum256(acc);
-#elif defined(__ARM_NEON)
-            const uint8x8_t m2v=vdup_n_u8(3); const int8x8_t b2v=vdup_n_s8(2);
-            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
-            for(;i+16<=I;i+=16){ uint32_t wd; memcpy(&wd, w+(i>>2), 4);        /* 4 byte=16 valori */
-                uint8x8_t by=vreinterpret_u8_u32(vdup_n_u32(wd));
-                uint8x8x2_t z01=vzip_u8(vand_u8(by,m2v),              vand_u8(vshr_n_u8(by,2),m2v));
-                uint8x8x2_t z23=vzip_u8(vand_u8(vshr_n_u8(by,4),m2v), vshr_n_u8(by,6));
-                uint16x4x2_t zz=vzip_u16(vreinterpret_u16_u8(z01.val[0]), vreinterpret_u16_u8(z23.val[0]));
-                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[0]),b2v));  /* 16 valori in ordine */
-                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[1]),b2v));
-                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
-                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
-                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
-                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
-            a=vaddvq_f32(vaddq_f32(ac0,ac1));
-#endif
-            for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
-            y[(int64_t)s*O+o]=a*sc; } }
-}
-/* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
- * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
- * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
- * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-#define IDOT_KERNEL "avx512-vnni"
-#elif defined(__AVXVNNI__) && defined(__AVX2__)
-#define IDOT_KERNEL "avx-vnni"
-#elif defined(__AVX2__)
-#define IDOT_KERNEL "avx2"
-#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-#define IDOT_KERNEL "neon-i8mm"
-#elif defined(__ARM_NEON)
-#define IDOT_KERNEL "neon"
-#elif defined(__VSX__)
-#define IDOT_KERNEL "vsx"
-#else
-#define IDOT_KERNEL "scalar"
-#endif
-static int g_idot=1;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
-                       * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
-                       * IDOT pays even at S=1 (decode); measured on Apple M-series. */
-#elif defined(__VSX__)
-static int g_i4s=1;   /* POWER8 vec_msum: qui il fallback f32 e' SCALARE, quindi l'IDOT
-                       * int4 conviene anche a S=1. Misurato su POWER8 S824 (vedi PR).
-                       * EN: on VSX the f32 fallback is plain scalar C, so int4 IDOT
-                       * pays even at S=1. Measured on a POWER8 S824 (see PR). */
-#else
-static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
-                       * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
-#endif
-static inline float qrow_i8(const float *x, int8_t *q, int I){
-    float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
-    float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
-    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
-    return s;
-}
-#ifdef __AVX2__
-static inline int hsum256_i32(__m256i v){
-    __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
-    lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
-    return _mm_cvtsi128_si32(lo);
-}
-#endif
-#if defined(__AVXVNNI__) && defined(__AVX2__)
-/* hsum di un __m128i a 4 lane s32 (l'AVX-VNNI 128-bit accumula su 4 lane). */
-static inline int hsum128_i32(__m128i v){
-    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
-}
-#endif
-/* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
- * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
-static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
-    int32_t sum=0; int i=0;
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    /* VNNI: vpdpbusd u8*s8 -> s32 directly, 64 bytes/iter, no 16-bit intermediate.
-     * AVX-512 has no vpsignb: |w| via abs, sign folded into x with a mask-negate
-     * (w==0 -> product 0 either way). |x|<=127 (qrow_i8), |w|<=128 as u8: each
-     * s32 lane adds <= 4*128*127, safe up to I=16384 like the AVX2 bound. */
-    __m512i acc=_mm512_setzero_si512();
-    for(;i+64<=I;i+=64){
-        __m512i wv=_mm512_loadu_si512((const void*)(w+i));
-        __m512i xv=_mm512_loadu_si512((const void*)(x+i));
-        __mmask64 neg=_mm512_movepi8_mask(wv);
-        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
-        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
-    }
-    sum=_mm512_reduce_add_epi32(acc);
-#elif defined(__AVXVNNI__) && defined(__AVX2__)
-    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 byte/iter. Stesso trucco del
-     * segno della variante 512-bit: |w| via abs, segno piegato in x con maschera
-     * (w==0 -> product 0). __AVX2__ serve per _mm_sign_epi8 / abs. */
-    __m128i acc=_mm_setzero_si128();
-    for(;i+16<=I;i+=16){
-        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
-        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign zona __AVX2__ */
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
-    }
-    sum=hsum128_i32(acc);
-#elif defined(__AVX2__)
-    __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
-    for(;i+32<=I;i+=32){
-        __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
-        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
-        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
-        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
-    }
-    sum=hsum256_i32(acc);
-#elif defined(__ARM_NEON)
-    /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
-     * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
-#if defined(__ARM_FEATURE_DOTPROD)
-    /* 4 accumulatori indipendenti: SDOT ha latenza ~3-4 cicli, con un solo acc la
-     * catena seriale strozza il core a ~26 GB/s di pesi; con 4 lane indipendenti il
-     * dot diventa memory-bound (misurato su M4: 26 -> 63 GB/s per core, 2.4x). */
-    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
-    for(;i+64<=I;i+=64){
-        a0=vdotq_s32(a0,vld1q_s8(w+i),   vld1q_s8(x+i));
-        a1=vdotq_s32(a1,vld1q_s8(w+i+16),vld1q_s8(x+i+16));
-        a2=vdotq_s32(a2,vld1q_s8(w+i+32),vld1q_s8(x+i+32));
-        a3=vdotq_s32(a3,vld1q_s8(w+i+48),vld1q_s8(x+i+48));
-    }
-    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
-    for(;i+16<=I;i+=16) acc=vdotq_s32(acc,vld1q_s8(w+i),vld1q_s8(x+i));
-    sum=vaddvq_s32(acc);
-#else
-    int32x4_t acc=vdupq_n_s32(0);
-    for(;i+16<=I;i+=16){
-        int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
-        int16x8_t p=vmull_s8(vget_low_s8(wv),vget_low_s8(xv));
-        p=vmlal_s8(p,vget_high_s8(wv),vget_high_s8(xv));
-        acc=vpadalq_s16(acc,p);
-    }
-    sum=vaddvq_s32(acc);
-#endif
-#elif defined(__VSX__)
-    /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
-     * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
-     * Stesso trucco del segno (|w| u8 per x*sign(w) s8), ma |w| via select+sub MODULO
-     * e non vec_abs: -128 deve diventare 128 u8, non saturare a 127.
-     * EN: vec_msum accumulates byte products straight into s32 lanes; |w| is built
-     * with a modulo subtract select instead of vec_abs so w=-128 wraps to 128 (u8)
-     * rather than saturating to 127. |x|<=127 from qrow_i8, so x negation is safe. */
-    __vector signed int acc=vec_splats(0);
-    const __vector signed char vz=vec_splats((signed char)0);
-    for(;i+16<=I;i+=16){
-        __vector signed char wv=vec_xl(0,(const signed char*)(w+i));
-        __vector signed char xv=vec_xl(0,(const signed char*)(x+i));
-        __vector __bool char neg=vec_cmplt(wv,vz);
-        __vector signed char xs=vec_sel(xv,vec_sub(vz,xv),neg);
-        __vector unsigned char wa=(__vector unsigned char)vec_sel(wv,vec_sub(vz,wv),neg);
-        acc=vec_msum(xs,wa,acc);
-    }
-    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
-#endif
-    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
-    return sum;
-}
-/* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
-    int32_t sum=0; int i=0;
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
-     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
-     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
-     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
-    const __m256i m4v=_mm256_set1_epi8(0x0F);
-    const __m512i b8v=_mm512_set1_epi8(8);
-    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
-    __m512i acc=_mm512_setzero_si512();
-    for(;i+64<=I;i+=64){
-        __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
-        __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
-        __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
-        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
-        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
-        __mmask64 neg=_mm512_movepi8_mask(wv);
-        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
-        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
-    }
-    sum=_mm512_reduce_add_epi32(acc);
-#elif defined(__AVXVNNI__) && defined(__AVX2__)
-    /* AVX-VNNI 128-bit, int4: 16 byte = 32 nibble -> int8 [-8,7] in due half
-     * (n0/n1), ciascuno alimentato a un vpdpbusd da 16 byte. Stesso unpack
-     * 128-bit del ramo AVX2 sotto; 32 elementi/iter come li. */
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
-    __m128i acc=_mm_setzero_si128();
-    for(;i+32<=I;i+=32){
-        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
-        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibble in ordine */
-        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
-        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
-    }
-    sum=hsum128_i32(acc);
-#elif defined(__AVX2__)
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
-    const __m256i ones=_mm256_set1_epi16(1);
-    __m256i acc=_mm256_setzero_si256();
-    for(;i+32<=I;i+=32){
-        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
-        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in ordine */
-        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
-        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
-        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
-        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
-    }
-    sum=hsum256_i32(acc);
-#elif defined(__ARM_NEON)
-    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
-#if defined(__ARM_FEATURE_DOTPROD)
-    /* 4 accumulatori indipendenti (vedi dot_i8i8): spezza la catena seriale su acc.
-     * Misurato su M4: 12.4 -> 29.9 GB/s di pesi per core (2.4x). */
-    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
-    for(;i+64<=I;i+=64){
-        uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
-        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4)); /* nibble in ordine */
-        uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q), vshrq_n_u8(byB,4));
-        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q),vld1q_s8(x+i));
-        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q),vld1q_s8(x+i+16));
-        a2=vdotq_s32(a2,vsubq_s8(vreinterpretq_s8_u8(zB.val[0]),b8q),vld1q_s8(x+i+32));
-        a3=vdotq_s32(a3,vsubq_s8(vreinterpretq_s8_u8(zB.val[1]),b8q),vld1q_s8(x+i+48));
-    }
-    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
-    for(;i+32<=I;i+=32){
-        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
-        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
-        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
-        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
-    }
-    sum=vaddvq_s32(acc);
-#else
-    int32x4_t acc=vdupq_n_s32(0);
-    for(;i+32<=I;i+=32){
-        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
-        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
-        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
-        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
-        int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
-        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
-        p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
-        acc=vpadalq_s16(acc,p);
-        p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
-        p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
-        acc=vpadalq_s16(acc,p);
-    }
-    sum=vaddvq_s32(acc);
-#endif
-#elif defined(__VSX__)
-    /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
-     * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
-     * ordine di memoria. |w|<=8 dopo il -8, quindi stesso trucco del segno di dot_i8i8.
-     * EN: vec_mergeh/l on ppc64le interleave like x86 unpacklo/hi (verified on POWER8),
-     * so nibbles come out in memory order; then the same sign trick as dot_i8i8. */
-    const __vector unsigned char m4v=vec_splats((unsigned char)0x0F);
-    const __vector unsigned char sh4=vec_splats((unsigned char)4);
-    const __vector signed char b8v=vec_splats((signed char)8);
-    const __vector signed char vz=vec_splats((signed char)0);
-    __vector signed int acc=vec_splats(0);
-    for(;i+32<=I;i+=32){
-        __vector unsigned char by=vec_xl(0,w4+(i>>1));               /* 16 byte = 32 nibble */
-        __vector unsigned char lo=vec_and(by,m4v), hi=vec_sr(by,sh4);
-        __vector signed char w0=vec_sub((__vector signed char)vec_mergeh(lo,hi),b8v);
-        __vector signed char w1=vec_sub((__vector signed char)vec_mergel(lo,hi),b8v);
-        __vector signed char x0=vec_xl(0,(const signed char*)(x+i));
-        __vector signed char x1=vec_xl(0,(const signed char*)(x+i+16));
-        __vector __bool char n0=vec_cmplt(w0,vz), n1=vec_cmplt(w1,vz);
-        acc=vec_msum(vec_sel(x0,vec_sub(vz,x0),n0),
-                     (__vector unsigned char)vec_sel(w0,vec_sub(vz,w0),n0),acc);
-        acc=vec_msum(vec_sel(x1,vec_sub(vz,x1),n1),
-                     (__vector unsigned char)vec_sel(w1,vec_sub(vz,w1),n1),acc);
-    }
-    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
-#endif
-    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
-    return sum;
-}
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-/* SMMLA (i8mm): vmmlaq_s32 vede ogni int8x16_t come matrice 2x8 row-major (byte 0-7 =
- * riga 0, byte 8-15 = riga 1) e accumula C += A*B^T nel 2x2 int32: lane0=a0.b0,
- * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine di due mezze-righe costruisce la
- * matrice: A = due righe di peso (o,o+1), B = due righe di attivazione (s,s+1), quindi
- * meta' traffico pesi e doppio lavoro per istruzione a S>=2. EN: vmmlaq_s32 treats each
- * int8x16_t as a 2x8 row-major matrix and does C += A*B^T on a 2x2 int32 tile; vcombine
- * of vget_low/high halves builds the 2-row register from two weight/activation rows. */
-static inline int32x4_t mm_tile16(int32x4_t acc, int8x16_t wo, int8x16_t wo1,
-                                  int8x16_t xs, int8x16_t xs1){
-    acc=vmmlaq_s32(acc, vcombine_s8(vget_low_s8(wo), vget_low_s8(wo1)),
-                        vcombine_s8(vget_low_s8(xs), vget_low_s8(xs1)));
-    return vmmlaq_s32(acc, vcombine_s8(vget_high_s8(wo), vget_high_s8(wo1)),
-                           vcombine_s8(vget_high_s8(xs), vget_high_s8(xs1)));
-}
-static void matmul_q_idot_mm(float *y, const int8_t *xq, const float *sx, const int8_t *q,
-                             const float *scale, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<(O&~1);o+=2){
-        const int8_t *wo=q+(int64_t)o*I, *wo1=q+(int64_t)(o+1)*I;
-        float sc0=scale[o], sc1=scale[o+1];
-        for(int s=0;s<(S&~1);s+=2){
-            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
-            /* 4 accumulatori indipendenti: una sola catena vmmla e' latency-bound.
-             * EN: 4 independent accumulators; a single vmmla chain is latency-bound. */
-            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
-            for(;i+64<=I;i+=64){
-                a0=mm_tile16(a0,vld1q_s8(wo+i),   vld1q_s8(wo1+i),   vld1q_s8(xs+i),   vld1q_s8(xs1+i));
-                a1=mm_tile16(a1,vld1q_s8(wo+i+16),vld1q_s8(wo1+i+16),vld1q_s8(xs+i+16),vld1q_s8(xs1+i+16));
-                a2=mm_tile16(a2,vld1q_s8(wo+i+32),vld1q_s8(wo1+i+32),vld1q_s8(xs+i+32),vld1q_s8(xs1+i+32));
-                a3=mm_tile16(a3,vld1q_s8(wo+i+48),vld1q_s8(wo1+i+48),vld1q_s8(xs+i+48),vld1q_s8(xs1+i+48));
-            }
-            for(;i+16<=I;i+=16)
-                a0=mm_tile16(a0,vld1q_s8(wo+i),vld1q_s8(wo1+i),vld1q_s8(xs+i),vld1q_s8(xs1+i));
-            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
-            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
-            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
-            for(;i<I;i++){ int a=wo[i],b=wo1[i],u=xs[i],v=xs1[i];
-                d00+=a*u; d01+=a*v; d10+=b*u; d11+=b*v; }
-            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
-            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
-            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
-            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
-        }
-        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
-            y[(int64_t)s*O+o]    =(float)dot_i8i8(wo, xs,I)*sc0*sx[s];
-            y[(int64_t)s*O+(o+1)]=(float)dot_i8i8(wo1,xs,I)*sc1*sx[s]; }
-    }
-    if(O&1){ int o=O-1; const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        #pragma omp parallel for schedule(static)
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
-}
-static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
-                              const float *scale, int S, int I, int O){
-    int rb=(I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<(O&~1);o+=2){
-        const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
-        const uint8_t *wo=q4+(int64_t)o*rb, *wo1=q4+(int64_t)(o+1)*rb;
-        float sc0=scale[o], sc1=scale[o+1];
-        for(int s=0;s<(S&~1);s+=2){
-            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
-            /* 4 accumulatori indipendenti (vedi matmul_q_idot_mm).
-             * EN: 4 independent accumulators, see matmul_q_idot_mm. */
-            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
-            for(;i+64<=I;i+=64){
-                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
-                uint8x16_t cyo=vld1q_u8(wo+(i>>1)+16), cyo1=vld1q_u8(wo1+(i>>1)+16);
-                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
-                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
-                uint8x16x2_t ko =vzipq_u8(vandq_u8(cyo, m4q), vshrq_n_u8(cyo, 4));
-                uint8x16x2_t ko1=vzipq_u8(vandq_u8(cyo1,m4q), vshrq_n_u8(cyo1,4));
-                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
-                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
-                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
-                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
-                a2=mm_tile16(a2, vsubq_s8(vreinterpretq_s8_u8(ko.val[0]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[0]),b8q),
-                                 vld1q_s8(xs+i+32), vld1q_s8(xs1+i+32));
-                a3=mm_tile16(a3, vsubq_s8(vreinterpretq_s8_u8(ko.val[1]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[1]),b8q),
-                                 vld1q_s8(xs+i+48), vld1q_s8(xs1+i+48));
-            }
-            for(;i+32<=I;i+=32){
-                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
-                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
-                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
-                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
-                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
-                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
-                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
-                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
-            }
-            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
-            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
-            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
-            for(;i+1<I;i+=2){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
-                int a0=(int)(bo&0xF)-8, a1=(int)(bo>>4)-8, b0=(int)(bo1&0xF)-8, b1=(int)(bo1>>4)-8;
-                int u0=xs[i],u1=xs[i+1],v0=xs1[i],v1=xs1[i+1];
-                d00+=a0*u0+a1*u1; d01+=a0*v0+a1*v1; d10+=b0*u0+b1*u1; d11+=b0*v0+b1*v1; }
-            if(i<I){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
-                int a0=(int)(bo&0xF)-8, b0=(int)(bo1&0xF)-8;
-                d00+=a0*xs[i]; d01+=a0*xs1[i]; d10+=b0*xs[i]; d11+=b0*xs1[i]; }
-            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
-            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
-            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
-            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
-        }
-        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
-            y[(int64_t)s*O+o]    =(float)dot_i4i8(wo, xs,I)*sc0*sx[s];
-            y[(int64_t)s*O+(o+1)]=(float)dot_i4i8(wo1,xs,I)*sc1*sx[s]; }
-    }
-    if(O&1){ int o=O-1; const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
-        #pragma omp parallel for schedule(static)
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
-}
-#endif
-static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
-                          const float *scale, int S, int I, int O){
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }
-#endif
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
-}
-static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
-                           const float *scale, int S, int I, int O){
-    int rb=(I+1)/2;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    if(S>=2){ matmul_i4_idot_mm(y,xq,sx,q4,scale,S,I,O); return; }
-#endif
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
-}
-
-typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
-static _Thread_local QScratch g_qscratch;
-static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
-    if(xn>g_qscratch.xq_cap){
-        int8_t *p=realloc(g_qscratch.xq,xn);
-        if(!p){ fprintf(stderr,"OOM quant scratch\n"); exit(1); }
-        g_qscratch.xq=p; g_qscratch.xq_cap=xn;
-    }
-    if(sn>g_qscratch.sx_cap){
-        float *p=realloc(g_qscratch.sx,sn*sizeof(float));
-        if(!p){ fprintf(stderr,"OOM quant scales\n"); exit(1); }
-        g_qscratch.sx=p; g_qscratch.sx_cap=sn;
-    }
-    *xq=g_qscratch.xq; *sx=g_qscratch.sx;
-}
-
-/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
- * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
- * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
- * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
- * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
- * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
- * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
-static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
-static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
-    /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
-     * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
-     * Weights must be registered (all dense QT allocs are, via qalloc). */
     if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
     }
 #endif
 #ifdef COLI_CUDA
-    /* The CUDA backend owns persistent copies only for model-resident tensors.
-     * Streaming expert slots are reused for different IDs and must never enter
-     * this cache. Nested OpenMP calls stay on CPU because each device context
-     * intentionally owns one synchronous scratch stream in this stage. */
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
@@ -1049,21 +344,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
-     * since the whole point of grouped scales is better quality). */
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
-    /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
-     * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
-     * PR #9 per il gemello VNNI). Soglia configurabile con I4S.
-     * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
-     * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
-     * twin). Threshold configurable via I4S. */
-    /* #163: sotto SPEC_PIN il gate int4-IDOT usa la decisione di S=1 per OGNI S, cosi'
-     * draft e verifica restano sulla stessa famiglia. (CUDA non e' toccato: la sua
-     * condizione non dipende da S, quindi e' gia' coerente tra draft e verifica.)
-     * EN: under SPEC_PIN the int4 IDOT gate uses the S=1 decision for EVERY S, so draft
-     * and verify stay in one family. (CUDA untouched: its condition is S-independent,
-     * hence already draft/verify-consistent.) */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
@@ -1076,49 +357,6 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
-}
-
-/* quantizza w[O,I] f32 -> int8 q[O,I] + scala[O] simmetrica per riga */
-static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits){
-    int qmax=(1<<(bits-1))-1;
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
-        for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
-        float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
-        int8_t *qr=q+(int64_t)o*I;
-        for(int i=0;i<I;i++){ int v=(int)lrintf(wr[i]/s); if(v>qmax)v=qmax; if(v<-qmax-1)v=-qmax-1; qr[i]=(int8_t)v; }
-    }
-}
-/* quantizza w[O,I] f32 -> int4 impacchettato (2/byte) + scala[O].
- * bits<=4: valori in [-qmax-1,qmax] stanno in un nibble [-8,7]; memorizzati come v+8 (0..15). */
-static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, int bits){
-    int qmax=(1<<(bits-1))-1, rb=(I+1)/2;
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
-        for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
-        float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
-        uint8_t *qr=q4+(int64_t)o*rb;
-        for(int i=0;i<I;i+=2){
-            int v0=(int)lrintf(wr[i]/s); if(v0>qmax)v0=qmax; if(v0<-8)v0=-8;
-            int v1=0; if(i+1<I){ v1=(int)lrintf(wr[i+1]/s); if(v1>qmax)v1=qmax; if(v1<-8)v1=-8; }
-            qr[i>>1] = (uint8_t)((v0+8) | ((v1+8)<<4));
-        }
-    }
-}
-
-/* quantizza w[O,I] f32 -> int2 impacchettato (4/byte) + scala[O]. valori nibble 2-bit in [-2,1]. */
-static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits){
-    int qmax=(1<<(bits-1))-1, rb=(I+3)/4;
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I; float amax=0;
-        for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
-        float s=amax/qmax; if(s<1e-8f)s=1e-8f; scale[o]=s;
-        uint8_t *qr=q2+(int64_t)o*rb;
-        for(int i=0;i<I;i+=4){ uint8_t byte=0;
-            for(int k=0;k<4 && i+k<I;k++){ int v=(int)lrintf(wr[i+k]/s); if(v>qmax)v=qmax; if(v<-2)v=-2; byte|=(uint8_t)((v+2)<<(k*2)); }
-            qr[i>>2]=byte;
-        }
-    }
 }
 
 static int g_nopack=0;   /* NOPACK=1 -> tiene i valori <=4bit in contenitore int8 (per validare il packing) */
@@ -1206,6 +444,11 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
                           * (int4), con i byte letti. Default OFF: a flag spento gli atomic
                           * non vengono MAI toccati (zero overhead), le righe extra di stats
                           * non vengono stampate. Solo misura: nessun effetto sull'output. */
+
+#include "sample.h"
+#include "kv_persist.h"
+#include "telemetry.h"
+
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
  * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
 /* ---- COLI_NUMA=1 (#82): interleave the expert slabs across NUMA nodes ----
@@ -1336,7 +579,12 @@ static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
+    /* SEC: config.json arriva dalla dir modello non fidata. Limita la dimensione
+     * (un file ostile enorme = OOM al load) e controlla la malloc: senza il NULL
+     * check, b[got]=0 su malloc fallita era un NULL-deref. */
+    if(n<0 || n>(256L<<20)){ fprintf(stderr,"%s: size %ld out of range (0..256 MB)\n",p,n); exit(1); }
+    char *b=malloc((size_t)n+1); if(!b){ fprintf(stderr,"OOM reading %s (%ld bytes)\n",p,n); exit(1); }
+    size_t got=fread(b,1,(size_t)n,f); b[got]=0; fclose(f);
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
     return json_parse(b,arena);
 }
@@ -1375,8 +623,9 @@ static void load_cfg(Cfg *c, const char *snap){
       FILE *gf=fopen(gp,"rb");                  /* assente = nessun problema: e' opzionale */
       if(gf){
         fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
-        if(gn>0){
-            char *gb=malloc(gn+1); size_t gg=fread(gb,1,gn,gf); gb[gg]=0;
+        char *gb = (gn>0 && gn<=(256L<<20)) ? malloc((size_t)gn+1) : NULL;   /* SEC: cap + NULL check */
+        if(gb){
+            size_t gg=fread(gb,1,(size_t)gn,gf); gb[gg]=0;
             char *ga=NULL; jval *gr=json_parse(gb,&ga);
             jval *ge=gr?json_get(gr,"eos_token_id"):NULL;
             if(ge){
@@ -1445,6 +694,27 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* SEC: risolve e VALIDA il formato quantizzato di un tensore [O,I] letto da un
+ * container non fidato (mirror). L'inferenza precedente (`?1:?2:3`) cadeva su
+ * int2 per QUALSIASI conteggio byte non riconosciuto: un peso troppo corto
+ * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
+ * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
+ * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4) e scrive *gs. */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+    int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
+    int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : 0;
+    if(!fmt){
+        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2 layout for [%d,%d], refusing (untrusted container)\n",
+                name,(long long)nb,O,I); exit(1); }
+    *gs=0;
+    if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
+    int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs)) : (int64_t)O;   /* in FLOAT */
+    if(ns != exp_scale*4){
+        fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
+                name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
+    return fmt;
+}
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1454,12 +724,11 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
-        /* Detect int4-grouped (fmt=4): packed int4 weight bytes BUT scale array is
-         * larger than O*4 — the group size is derived from the scale-array size. */
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;
+        /* fmt=4 int4-grouped: byte int4 ma scala > O*4 — gs deriva dalla scala.
+         * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
+         * non fidati (SEC). */
         int gs=0;
-        if(fmt==2) gs=detect_group_size(O,I,ns);
-        if(gs>0) fmt=4;
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1802,11 +1071,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
             QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
-                int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-                /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
                 int gs=0;
-                if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
-                if(gs>0) fmt=4;
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1931,10 +1197,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
-        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         int gs=0;
-        if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
-        if(gs>0) fmt=4;
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -2910,6 +2174,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
                 ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
                 if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
+                /* #417: la scorciatoia GPU-prerouted deve far avanzare l'orologio di recency
+                 * come il percorso router completo (riga ~3055), altrimenti elast/eaccess_clock
+                 * si congelano a fine prefill e il tie-breaker LFRU di REPIN gira su punteggi
+                 * stantii durante il decode su Metal. */
+                m->elast[layer][idxs[(int64_t)s*K+kk]]=++m->eaccess_clock;
             }
             for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
         }
@@ -4212,13 +3481,9 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
 
-static inline int argmax_v(const float *lo, int V){
-    /* skip NaN (x==x is false for NaN) so a poisoned logit can't pin the argmax
-     * to index 0 — pick the max finite/+Inf entry instead. */
-    int b=-1; float bv=-INFINITY;
-    for(int i=0;i<V;i++){ float x=lo[i]; if(x==x && x>bv){ bv=x; b=i; } }
-    return b<0?0:b;
-}
+
+static void repin_pass_limit(Model *m,int limit);
+static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 
 /* ---- METODO F: draft grammaticale (#48) ----
  * gr_feed consuma i byte di ogni token EMESSO e tiene il walker in sync con l'output;
@@ -4300,113 +3565,6 @@ static int grammar_draft(int *draft, int cap){
  * Rejection sampling di Leviathan: accetta il draft x_d con prob p(x_d); al rifiuto
  * ricampiona da p con x_d azzerato e rinormalizzato. La distribuzione risultante e'
  * ESATTAMENTE p: la speculazione resta invisibile all'output anche col sampling. */
-static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
-static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
-    return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
-static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
-/* sift-down su max-heap in h[0..n), chiave = g_pbuf[h[i]] (#335: partial top-p select).
- * Versione "a buco": porta il valore di radice e lo deposita solo alla fine, cosi'
- * heapify e' O(V) e ogni pop e' O(log n) senza qsort sull'intero vocabolario. */
-static void topp_siftdown(int *h, int n, int i){
-    int iv=h[i]; float kv=g_pbuf[iv];
-    for(;;){ int l=2*i+1;
-        if(l>=n) break;                      /* foglia */
-        int b=l; if(l+1<n && g_pbuf[h[l+1]]>g_pbuf[h[l]]) b=l+1;  /* figlio maggiore */
-        if(g_pbuf[h[b]]<=kv) break;          /* nessun figlio supera la radice -> ferma */
-        h[i]=h[b]; i=b; }
-    h[i]=iv;
-}
-/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc.
- * Invariante per dist_sample: g_pbuf resta INDICIZZATO per token-id (mai riordinato);
- * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
-static void dist_build(const float *lo, int V){
-    if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
-    /* Un solo logit NaN/+Inf avvelenava tutto (#369): +Inf diventava mx, NaN/Inf-mx
-     * -> expf NaN -> s NaN -> ogni prob NaN -> dist_sample cade sul fallback
-     * `g_pbuf[i]>0` (NaN>0 e' falso ovunque) e ritorna 0 PER SEMPRE, in silenzio.
-     * Difesa: mx solo sui finiti; un logit non finito contribuisce prob 0;
-     * se la distribuzione degenera (tutti non finiti / somma non valida) si
-     * ripiega sull'argmax dei finiti e si avvisa UNA volta, mai in silenzio. */
-    int mxi=-1; float mx=0;
-    for(int i=0;i<V;i++) if(isfinite(lo[i]) && (mxi<0 || lo[i]>mx)){ mx=lo[i]; mxi=i; }
-    double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
-    if(mxi>=0){
-        for(int i=0;i<V;i++){ g_pbuf[i]=isfinite(lo[i])?expf((lo[i]-mx)*invt):0.f; s+=g_pbuf[i]; }
-    }
-    if(mxi<0 || !isfinite(s) || s<=0.0){          /* distribuzione inutilizzabile */
-        static int warned=0;
-        if(!warned){ warned=1; fprintf(stderr,
-            "[SAMPLE] warning: non-finite logits (NaN/Inf) — falling back to argmax; "
-            "output may be degraded. This usually means a numerical blow-up upstream.\n"); }
-        int a=(mxi>=0)?mxi:0;                       /* mxi = argmax dei logit FINITI (robusto
-                                                     * anche se lo[0] e' NaN, dove argmax_v fallirebbe) */
-        for(int i=0;i<V;i++) g_pbuf[i]=0.f; g_pbuf[a]=1.f;
-        return;                                    /* delta su un token valido, niente top-p su NaN */
-    }
-    for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
-    if(g_nuc>0 && g_nuc<1.f){
-        for(int i=0;i<V;i++) g_pidx[i]=i;
-        for(int i=V/2-1;i>=0;i--) topp_siftdown(g_pidx,V,i);   /* heapify O(V) */
-        /* pop verso la coda: i vincitori (testa top-p) cadono in g_pidx[out..V-1] in ordine
-         * DECRESCENTE, come il vecchio qsort, quindi s2 accumula nello stesso ordine ->
-         * head bit-identical sui casi senza pareggi (i pareggi erano gia' non specificati
-         * sotto il qsort instabile e restano tali). Il prefisso g_pidx[0..out-1) e' la coda. */
-        double s2=0, cum=0; int out=V;
-        do{ int root=g_pidx[0];                  /* massimo corrente */
-            g_pidx[0]=g_pidx[--out]; g_pidx[out]=root;          /* sposta il max in coda */
-            s2+=g_pbuf[root]; cum+=g_pbuf[root];
-            if(out>0) topp_siftdown(g_pidx,out,0);
-        } while(cum<g_nuc && out>0);
-        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;            /* azzera la coda (invariante) */
-        float s2f=(float)s2; for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=s2f;  /* rinormalizza */
-    }
-}
-/* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
-static int dist_sample(int V, int ban){
-    double z = 1.0 - (ban>=0 ? g_pbuf[ban] : 0.0); if(z<=1e-12) z=1e-12;
-    double u = rndu()*z, cum=0;
-    for(int i=0;i<V;i++){ if(i==ban) continue; cum+=g_pbuf[i]; if(cum>=u) return i; }
-    for(int i=V-1;i>=0;i--) if(i!=ban && g_pbuf[i]>0) return i;
-    return 0;
-}
-/* prossimo token dai logits: greedy se g_temp<=0, altrimenti sampling.
- * ban = token escluso perche' rifiutato dalla verifica speculativa precedente. */
-static int pick_tok(const float *lo, int V, int ban){
-    if(g_temp<=0) return argmax_v(lo,V);
-    dist_build(lo,V);
-    return dist_sample(V,ban);
-}
-
-/* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
- * dove si genera un numero fisso di token da confrontare con l'oracolo) */
-static int g_stop[64], g_nstop=0;   /* config eos + ogni added-token "special" del tokenizer */
-static void repin_pass_limit(Model *m,int limit);
-static void repin_pass(Model *m){ repin_pass_limit(m,16); }
-static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
-/* T=NULL -> solo gli stop del config (validazione/oracolo, dove il tokenizer non serve). */
-static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
-    g_nstop=0;
-    for(int i=0;i<c->n_stop && g_nstop<64;i++) g_stop[g_nstop++]=c->stop_ids[i];
-    if(tok_eos>=0 && !is_stop(tok_eos) && g_nstop<64) g_stop[g_nstop++]=tok_eos;
-    int nsp=0;
-    /* DIFESA IN PROFONDITA' (woolcoxm, #298): il tokenizer marca "special":true i token di
-     * CONTROLLO -- <|user|>, <|assistant|>, <|observation|>, <sop>, [gMASK], i marker
-     * image/video/audio. Nessuno di questi e' contenuto legittimo di una risposta: se il
-     * modello ne emette uno, il turno e' finito (infatti GLM ne elenca tre fra gli eos
-     * ufficiali). Senza questo, uno di quei token non elencato nel config veniva
-     * DETOKENIZZATO E STAMPATO IN CHAT come testo, e la generazione proseguiva oltre la
-     * fine reale -- l'"added stuff on the end" riportato su un checkpoint convertito.
-     * Fidarsi del config di pesi convertiti da terzi e' precisamente cio' che non
-     * possiamo controllare; il flag del tokenizer lo possiamo leggere.
-     * NB: <think>/<tool_call>/<arg_key> hanno "special":false e restano contenuto vero. */
-    if(T) for(int id=0; id<T->n_ids && g_nstop<64; id++)
-        if(T->id_special[id] && !is_stop(id)){ g_stop[g_nstop++]=id; nsp++; }
-    fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
-    for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
-    if(nsp) fprintf(stderr," (%d from the tokenizer's special set)",nsp);
-    fprintf(stderr,"\n");
-}
-static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c,tok_eos,NULL); }
 
 /* decode greedy con SELF-SPECULATION n-gram: LOSSLESS (output identico al greedy puro).
  * Ogni forward verifica fino a g_draft token proposti dal contesto: i token accettati
@@ -4558,18 +3716,6 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
-static double logprob_target(const float *lo, int V, int target, int *am){
-    float mx=lo[0]; int best=0; for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];best=i;} }
-    double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
-    if(am)*am=(best==target);
-    return (double)(lo[target]-mx) - log(se);
-}
-/* "glm" contenuto in model_type, case-insensitive — stessa regola di detect_prefix
- * in tools/eval_glm.py (#194). Niente strcasestr: non esiste su MinGW/MSVC. */
-static int mt_is_glm(const char *s){
-    if(s) for(;*s;s++) if((s[0]|32)=='g'&&(s[1]|32)=='l'&&(s[2]|32)=='m') return 1;
-    return 0;
-}
 /* modalita' SCORING per i benchmark (stile lm-eval, log-likelihood):
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
@@ -5075,117 +4221,6 @@ static void repin_pass_limit(Model *m,int limit){
  * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
-static int g_kvsave=1;
-#define KV_MAGIC "COLIKV1\0"
-static void kv_hdr(Model *m, int32_t *h, int nrec){
-    Cfg *c=&m->c; int nic=0;
-    for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
-    h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
-    h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
-}
-/* Bytes of one on-disk record: [tok i32][Lc+Rc per layer][Ic per DSA layer].
- * Layout matches what kv_disk_append writes and kv_disk_load reads. */
-static int64_t kv_rec_bytes(Model *m){
-    Cfg *c=&m->c;
-    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
-    return rec;
-}
-/* Open the persistent handle lazily; write the header if the file is new. After
- * this returns successfully, k->disk_fp is valid for the engine's lifetime and
- * positioned at end-of-header (nrec==0 case) or wherever the caller seeks. */
-static int kv_disk_open(Model *m){
-    KVState *k=m->kv;
-    if(k->disk_fp) return 1;
-    k->disk_fp=fopen(k->disk_path,"r+b");
-    if(!k->disk_fp){                       /* not there yet -> create + header */
-        k->disk_fp=fopen(k->disk_path,"wb");
-        if(!k->disk_fp) return 0;
-        int32_t h[8]; kv_hdr(m,h,0);
-        fwrite(KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
-        fflush(k->disk_fp);
-        fclose(k->disk_fp);
-        k->disk_fp=fopen(k->disk_path,"r+b");   /* reopen r+b for append */
-        if(!k->disk_fp) return 0;
-    }
-    return 1;
-}
-static void kv_disk_truncate(Model *m, int nrec){
-    if(!g_kvsave) return;
-    KVState *k=m->kv;
-    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop to shrink on disc */
-    FILE *f=fopen(k->disk_path,"r+b");
-    if(!f){ k->disk_nrec=0; return; }
-    k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f); fclose(f);
-}
-static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
-static void kv_disk_append(Model *m, const int *hist, int len){
-    KVState *k=m->kv;
-    if(!g_kvsave || len<=k->disk_nrec) return;
-    Cfg *c=&m->c;
-    if(!kv_disk_open(m)) return;
-    FILE *f=k->disk_fp;
-    int64_t rec = kv_rec_bytes(m);
-    /* grow the contiguous staging buffer if the record is larger (#1 batching) */
-    if(rec > k->disk_buf_cap){
-        uint8_t *nb=realloc(k->disk_buf, rec);
-        if(!nb) return;                    /* OOM: skip this turn, retry next */
-        k->disk_buf=nb; k->disk_buf_cap=rec;
-    }
-    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
-    for(int p=k->disk_nrec;p<len;p++){
-        uint8_t *b=k->disk_buf;            /* pack token + every layer into one record */
-        *(int32_t*)b = hist[p]; b+=4;
-        for(int i=0;i<c->n_layers;i++){
-            memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
-            memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
-        }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
-            memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
-        }
-        fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
-    }
-    fflush(f);                                   /* dati prima, contatore poi */
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f);                                   /* persist the counter too */
-    k->disk_nrec=len;
-}
-static int kv_disk_load(Model *m, int *hist, int maxctx){
-    if(!g_kvsave) return 0;
-    KVState *k=m->kv;
-    Cfg *c=&m->c;
-    FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;
-    char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
-    if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
-       h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
-        fprintf(stderr,"[KV] ignoring .coli_kv from a different model or version\n"); fclose(f); return 0; }
-    int nrec=h[6];
-    if(nrec<1){ fclose(f); return 0; }
-    if(nrec>=maxctx-8-g_draft){
-        fprintf(stderr,"[KV] saved conversation (%d tokens) exceeds the context: starting over\n",nrec);
-        fclose(f); return 0; }
-    double t0=now_s();
-    for(int p=0;p<nrec;p++){
-        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
-        for(int i=0;i<c->n_layers;i++){
-            if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
-               fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
-        }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
-            if(fread(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f)!=(size_t)c->index_hd){ nrec=p; goto out; }
-    }
-out:
-    fclose(f);
-    if(nrec>0){
-        if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
-        fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
-            nrec, now_s()-t0);
-    }
-    k->disk_nrec=nrec;
-    return nrec;
-}
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
@@ -5596,212 +4631,7 @@ static int *read_arr(jval*o,const char*k,int*n){
     if(!r){ fprintf(stderr,"OOM read_arr\n"); exit(1); }
     for(int i=0;i<a->len;i++) r[i]=(int)a->kids[i]->num; *n=a->len; return r; }
 
-/* byte residenti di un tensore [O,I] al numero di bit dato (specchio di qt_bytes) */
-static int64_t tbytes(int O,int I,int bits){
-    if(bits>=16) return (int64_t)O*I*4;
-    if(bits>=5)  return (int64_t)O*I + (int64_t)O*4;
-    return (int64_t)O*((I+1)/2) + (int64_t)O*4;
-}
-/* byte VERI di un expert: dal container se pre-quantizzato, altrimenti stima da ebits */
-static int64_t expert_bytes_probe(Model *m, int ebits){
-    Cfg *c=&m->c; int64_t eb=0; char nm[256];
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",c->first_dense);
-    if(st_nbytes(&m->S,nm)>0){
-        const char *suf[3]={"gate_proj","up_proj","down_proj"};
-        for(int k=0;k<3;k++){
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
-            eb+=st_nbytes(&m->S,nm);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
-        }
-    }
-    if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);
-    return eb;
-}
-
-/* TIERS: fotografia della piramide expert per la dashboard web —
- * "TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>" sul canale di protocollo.
- * ram = pinnati non-VRAM + LRU corrente; disk = tutto il resto. */
-/* BRAIN MAP (dashboard): per-turn expert hit bitmap + full residency/heat map.
- * g_ehit[layer][eid]=1 quando l'expert viene instradato in questo turno;
- * hits_emit lo serializza e lo azzera. emap_emit fotografa tier+heat di TUTTI. */
-static uint8_t **g_ehit;
-static void ehit_mark(Model *m, int layer, int eid){
-    if(!g_ehit){ Cfg *c=&m->c;
-        g_ehit=calloc(c->n_layers+1,sizeof(uint8_t*));
-        for(int i=0;i<=c->n_layers;i++) g_ehit[i]=calloc(c->n_experts,1);
-    }
-    g_ehit[layer][eid]=1;
-}
-
-/* HWINFO: hardware snapshot for the web dashboard — emitted once at READY. */
-/* CPU model + cores + RAM (GB); empty/zero where unavailable.
- * Shared by the dashboard HWINFO line and the PROF=1 header. */
-static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double *ram_avail){
-    cpu[0]=0;
-#ifdef _WIN32
-    /* niente /proc su Windows: brand string via CPUID (0x80000002..4), zero
-     * dipendenze extra. La dashboard mostrava "0 GB RAM / 0 cores" perche'
-     * tutto questo blocco era solo-Linux mentre il ramo CUDA funzionava. */
-#if defined(__x86_64__) || defined(__i386__)
-    { unsigned int r[12]={0}; unsigned int *w=r;
-      for(unsigned int f=0x80000002u; f<=0x80000004u; f++,w+=4)
-          __get_cpuid(f,&w[0],&w[1],&w[2],&w[3]);
-      char *b=(char*)r; b[47]=0; while(*b==' ')b++;
-      snprintf(cpu,cn,"%s",b); }
-#endif
-#else
-    FILE *ci=fopen("/proc/cpuinfo","r");
-    if(ci){ char ln[256];
-        while(fgets(ln,sizeof(ln),ci)) if(!strncmp(ln,"model name",10)){
-            char *p=strchr(ln,':'); if(p){ p++; while(*p==' ')p++;
-            int n=(int)strlen(p); if(n>0&&p[n-1]=='\n')p[--n]=0;
-            snprintf(cpu,cn,"%s",p); } break; }
-        fclose(ci); }
-#endif
-    *cores=0;
-#ifdef _WIN32
-    { SYSTEM_INFO si; GetSystemInfo(&si); *cores=(int)si.dwNumberOfProcessors; }
-#elif defined(_SC_NPROCESSORS_ONLN)
-    *cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-    *ram_total=*ram_avail=0;
-#ifdef _WIN32
-    compat_meminfo(ram_total,ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
-#else
-    FILE *mi=fopen("/proc/meminfo","r");
-    if(mi){ char ln[256]; double mt=0,ma=0;
-        while(fgets(ln,sizeof(ln),mi)){
-            if(sscanf(ln,"MemTotal: %lf",&mt)==1) *ram_total=mt/1e6;
-            if(sscanf(ln,"MemAvailable: %lf",&ma)==1) *ram_avail=ma/1e6;
-        } fclose(mi); }
-#endif
-}
-
-static void hwinfo_emit(Model *m){
-    Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
-    char cpu[256]; int cores; double ram_total,ram_avail;
-    hw_probe(cpu,sizeof(cpu),&cores,&ram_total,&ram_avail);
-    /* GPU */
-    int ngpu=0; double vram_total=0;
-    char gpu_name[128]="";
-#ifdef COLI_CUDA
-    ngpu=g_cuda_ndev; vram_total=m->gpu_expert_bytes/1e9;
-    for(int i=0;i<g_cuda_ndev;i++){
-        size_t fr=0,to=0; coli_cuda_mem_info(g_cuda_devices[i],&fr,&to);
-        if(!i) vram_total=(double)to*g_cuda_ndev/1e9;
-    }
-    /* GPU name from the first device — already printed at init */
-    if(g_cuda_ndev>0){
-        /* We don't have a device-name API; parse from the init log line stored in stderr.
-         * Simpler: just read the nvidia driver sysfs or use a fixed label. */
-        snprintf(gpu_name,sizeof(gpu_name),"CUDA device x%d",g_cuda_ndev);
-    }
-#endif
-    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n",
-        cores,ram_total,ram_avail,ngpu,vram_total,cpu,gpu_name);
-    fflush(stdout);
-}
-
-static void tiers_emit(Model *m){
-    Cfg *c=&m->c; int nsp=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    int total=(nsp+(m->has_mtp?1:0))*c->n_experts;
-    int pinned=0,lru=0;
-    for(int i=0;i<=c->n_layers;i++){ pinned+=m->npin?m->npin[i]:0; lru+=m->ecn?m->ecn[i]:0; }
-    int vram=0; double vram_gb=0;
-#ifdef COLI_CUDA
-    vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
-#endif
-    int ram=pinned-vram+lru; if(ram<0) ram=0;
-    int disk=total-vram-ram; if(disk<0) disk=0;
-    double eb=(double)expert_bytes_probe(m,m->ebits);
-    printf("TIERS %d %d %d %.2f %.2f\n",vram,ram,disk,vram_gb,ram*eb/1e9);
-    fflush(stdout);
-}
-
-/* EMAP: 1 byte/expert (2bit tier: 0=disk 1=RAM 2=VRAM | 6bit heat log2-bucket),
- * righe = layer sparsi in ordine (+MTP se presente), colonne = n_experts. Hex. */
-static void emap_emit(Model *m){
-    Cfg *c=&m->c;
-    int rows=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
-    if(has_mtp) rows++;
-    int cols=c->n_experts;
-    char *hex=malloc((size_t)rows*cols*2+1); int w=0;
-    for(int i=0;i<=c->n_layers;i++){
-        int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
-        if(!is_row) continue;
-        for(int e=0;e<cols;e++){
-            int tier=0;
-            ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
-#ifdef COLI_CUDA
-                tier = P[z].g.cuda?2:1;
-#else
-                tier = 1;
-#endif
-                break; }
-            if(!tier && m->ecache && m->ecache[i])
-                for(int z=0;z<m->ecn[i];z++) if(m->ecache[i][z].eid==e){ tier=1; break; }
-            uint32_t u = m->eusage[i]?m->eusage[i][e]:0;
-            int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;
-            int b=(tier<<6)|heat;
-            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
-        }
-    }
-    hex[w]=0;
-    printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex);
-}
-
-/* HITS: bitmap 1bit/expert (stesso ordine di EMAP), poi azzera per il turno dopo. */
-static void hits_emit(Model *m){
-    Cfg *c=&m->c; if(!g_ehit) return;
-    int rows=0;
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
-    if(has_mtp) rows++;
-    int cols=c->n_experts, nb=(rows*cols+7)/8;
-    uint8_t *bm=calloc(nb,1); int bit=0;
-    for(int i=0;i<=c->n_layers;i++){
-        int is_row = (i<c->n_layers && m->L[i].sparse) || (i==c->n_layers && has_mtp);
-        if(!is_row) continue;
-        for(int e=0;e<cols;e++,bit++)
-            if(g_ehit[i][e]){ bm[bit>>3]|=1<<(bit&7); g_ehit[i][e]=0; }
-    }
-    char *hex=malloc((size_t)nb*2+1); int w=0;
-    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
-    hex[w]=0;
-    printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
-}
-
-/* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).
- * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
- * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
-static void stats_dump_q(Model *m, const char *path, int quiet){
-    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
-    Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
-        for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
-}
-static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
-
-/* CACHE CHE IMPARA: istogramma d'uso PERSISTENTE in <SNAP>/.coli_usage.
- * Caricato all'avvio (i contatori ripartono dalla storia), salvato a ogni turno:
- * piu' usi colibri', meglio l'auto-pin conosce i TUOI expert caldi. */
-static char g_usage_path[2100]="";
-static int64_t usage_load(Model *m, const char *path){
-    FILE *f=fopen(path,"r"); if(!f) return 0;
-    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
-    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
-    fclose(f); return tot;
-}
-static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
+/* telemetry, stats, usage persistence — moved to telemetry.h */
 
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.

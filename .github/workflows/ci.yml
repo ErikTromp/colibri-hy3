@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build glm
-        run: cd c && make glm
+      - name: Build colibri
+        run: cd c && make colibri
       - name: C test suite
         run: cd c && make test-c
 
@@ -105,13 +105,13 @@ jobs:
           make cuda-dll CUDA_ARCH=sm_80
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
           echo "coli_cuda.dll built (MSVC host)"
-      - name: make glm CUDA_DLL=1 (host links backend_loader, not cudart)
+      - name: make colibri CUDA_DLL=1 (host links backend_loader, not cudart)
         shell: msys2 {0}
         run: |
           cd c
-          make glm CUDA_DLL=1
-          test -f glm.exe || { echo "glm CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "glm.exe built against the DLL loader"
+          make colibri CUDA_DLL=1
+          test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "colibri.exe built against the DLL loader"
 
   web:
     name: Web UI

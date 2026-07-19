@@ -15,7 +15,7 @@
 #include <assert.h>
 #include <math.h>
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static int approx1(double x){ return x > 0.999 && x < 1.001; }
