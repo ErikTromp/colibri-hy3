@@ -271,6 +271,14 @@ def parse_tool_calls(reply, tools=None):
                 salvaged.append(name)
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
+        # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
+        # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
+        # EN: #401 field diagnosis: tools were declared and the model attempted the syntax,
+        # EN: but the strict parse matched nothing (typically quantization-mangled output).
+        sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
+                         "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
+        sys.stderr.flush()
     text = _BOX_RE.sub("", reply)
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
