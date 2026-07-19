@@ -314,12 +314,27 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    __m128i acc=_mm_setzero_si128();
+    /* 4 accumulatori indipendenti (64 byte/iter): un solo acc incatena i vpdpbusd
+     * (latenza-bound ~5c). Somme intere associative -> bit-identico. Stessa struttura
+     * dei 4 accumulatori del ramo NEON piu' sotto.
+     * EN: four independent accumulators break the serial vpdpbusd->acc chain; integer
+     * adds are associative, so the result is bit-identical (mirrors the NEON path). */
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i w0=_mm_loadu_si128((const __m128i*)(w+i)),    x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i w1=_mm_loadu_si128((const __m128i*)(w+i+16)), x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i w2=_mm_loadu_si128((const __m128i*)(w+i+32)), x2=_mm_loadu_si128((const __m128i*)(x+i+32));
+        __m128i w3=_mm_loadu_si128((const __m128i*)(w+i+48)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
     for(;i+16<=I;i+=16){
         __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
         __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i xs=_mm_sign_epi8(xv,wv);
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),_mm_sign_epi8(xv,wv));
     }
     sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
@@ -390,13 +405,32 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* 4 accumulatori indipendenti (64 elementi = 32 byte packed/iter): un solo acc
+     * incatena i vpdpbusd (latenza-bound ~5c). Somme intere associative -> bit-identico.
+     * Stessa struttura dei 4 accumulatori del ramo NEON piu' sotto.
+     * EN: four independent accumulators break the serial vpdpbusd->acc chain; integer
+     * adds are associative, so the result is bit-identical (mirrors the NEON path). */
     const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
-    __m128i acc=_mm_setzero_si128();
-    for(;i+32<=I;i+=32){
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i by0=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));       /* elem i..i+31  */
+        __m128i by1=_mm_loadu_si128((const __m128i*)(w4+(i>>1)+16));    /* elem i+32..i+63 */
+        __m128i lo0=_mm_and_si128(by0,m4), hi0=_mm_and_si128(_mm_srli_epi16(by0,4),m4);
+        __m128i lo1=_mm_and_si128(by1,m4), hi1=_mm_and_si128(_mm_srli_epi16(by1,4),m4);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo0,hi0),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo0,hi0),b8);
+        __m128i w2=_mm_sub_epi8(_mm_unpacklo_epi8(lo1,hi1),b8), w3=_mm_sub_epi8(_mm_unpackhi_epi8(lo1,hi1),b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i)),    x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i x2=_mm_loadu_si128((const __m128i*)(x+i+32)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
+    for(;i+32<=I;i+=32){   /* 32-nibble remainder: 2 dpbusd, same unpack */
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
-        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo,hi),b8);
         __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
         __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
         acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
