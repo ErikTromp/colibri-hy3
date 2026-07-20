@@ -210,6 +210,74 @@ Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to t
 
 **Throughput numbers:** mid-stream `[t=N] … tok/s` and the chat footer’s **decode** rate measure generation only (from first emitted token). The footer’s **total** rate includes prefill for that turn (full prompt on turn 1, incremental new tokens on follow-ups). Example: `└─ 38 tok · 0.10 tok/s total · 0.24 tok/s decode · …`.
 
+### ROCm / AMD GPU (optional)
+
+ROCm builds use the HIP runtime and keep the existing accelerator ABI and
+`--gpu` / `--vram` interface. On Linux/WSL, keep the model on a native
+ext4/NVMe path. On Windows, use the AMD HIP SDK and make sure `hipcc` is on
+`PATH` (or set `ROCM_HOME`/`HIP_PATH`). `gfx1101` is the default target for an
+RX 7800 XT; override `ROCM_ARCH` for another AMD GPU.
+
+    cd c
+    make hy3 ROCM=1 ROCM_ARCH=gfx1101
+    make rocm-test ROCM=1 ROCM_ARCH=gfx1101
+
+    COLI_MODEL=/home/me/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14 --auto-tier --verbose
+
+Windows HIP SDK example (PowerShell; native builds also need GNU make and
+MinGW gcc for the C host objects):
+
+    $env:HIP_PATH = 'C:\Program Files\AMD\ROCm\7.1'
+    $env:ROCM_PATH = $env:HIP_PATH
+    $env:ROCM_HOME = $env:HIP_PATH
+    make hy3 ROCM=1 ROCM_ARCH=gfx1101
+    make rocm-test ROCM=1 ROCM_ARCH=gfx1101
+
+The ROCm path disables the NVIDIA-only WMMA kernel and uses the generic packed
+int4 path, preserving correctness while leaving room for an AMD-specific
+MFMA/rocWMMA optimization later. `coli doctor` and the resource planner also
+recognize `libamdhip64`; Linux GPU discovery uses `rocm-smi`, while the
+Windows HIP SDK fallback uses `hipInfo`.
+
+For the 295B `hy_v3` GGUF distribution, keep the GGUF under the LM Studio model
+directory, but use a current upstream `llama.cpp` ROCm build for inference.
+The bundled LM Studio AMD runtime may index `hy_v3` while still reporting
+`unknown model architecture: 'hy_v3'` at load time. `c/rocm_tune.py` reads the
+GGUF tensor table and calculates whole-layer offload after reserving the KV
+cache, compute buffers, and a safety margin. This avoids the frequent
+host/device transfers produced by fractional MoE-layer fitting:
+
+    python c/rocm_tune.py `
+      --model "$env:USERPROFILE\.lmstudio\models\AngelSlim\Hy3-GGUF\Hy3-IQ1_M.gguf" `
+      --vram-gib 15.98 --context 2048 --target-mib 512 --compute-mib 256 `
+      --cache-type-k q8_0 --cache-type-v q8_0
+
+The printed command uses the recommended integer `-ngl`, `--fit off`, and
+q8_0 K/V cache. The output separates the total KV cache from its VRAM and RAM
+parts. The same plan is available as `coli rocm-plan --model ...`.
+The standalone tool's `--vram-gib` is binary GiB; the existing `coli --vram`
+flag is decimal GB, so pass the value appropriate to the tool you use.
+The speed-oriented default reserves 512 MiB of free VRAM; use
+`--target-mib 1024` when a larger desktop/allocator margin is preferred.
+The upstream `llama.cpp --fit on` mode remains useful as a safe fallback, but
+it may select partial MoE layers for maximum occupancy rather than maximum
+decode speed. KV offload is enabled by default in llama.cpp; q8_0 K/V is a
+practical RX 7800 XT starting point at 2K context (Hy3's measured cache is
+about 340 MiB for one sequence).
+
+For this RX 7800 XT / 96 GB RAM machine, the context trade-off is:
+
+| Context | KV type | Recommended `-ngl` | KV total | Note |
+|---:|---|---:|---:|---|
+| 2K | q8_0 | 14 | 340 MiB | fastest measured: 2.21 decode tok/s |
+| 64K | q8_0 | 12 | 10.6 GiB | tested successfully: 1.83 decode tok/s |
+| 128K | q8_0 | 11 | 21.25 GiB | tested successfully, but 1.23 decode tok/s |
+| 128K | q4_0 | 12 | 11.25 GiB | lower KV precision; more VRAM/RAM headroom |
+
+For 64K or 128K, pass the desired context to `rocm_tune.py`; do not reuse the
+2K `-ngl 14` setting. A large context can fit in capacity while making prefill
+very slow, especially when q8_0 KV keeps most of the cache in host RAM.
+
 ### CUDA expert tier (optional)
 
 Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts can run GPU matmul during **token generation** (not during `[prefill] layer …` progress, which is mostly CPU attention + disk I/O).

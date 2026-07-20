@@ -195,19 +195,19 @@ static int qt_cuda_upload(QT *t){
 }
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
-    fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    fprintf(stderr,COLI_ACCEL_TAG " resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
-        fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+        fprintf(stderr,COLI_ACCEL_TAG "   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
     }
     uint64_t calls=0,experts=0,rows=0; double h2d=0,kernel=0,d2h=0;
     coli_cuda_group_stats(&calls,&experts,&rows,&h2d,&kernel,&d2h);
-    if(calls) fprintf(stderr,"[CUDA] expert groups: %llu call, %llu expert, %llu righe "
+    if(calls) fprintf(stderr,COLI_ACCEL_TAG " expert groups: %llu call, %llu expert, %llu righe "
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
-        "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+        COLI_ACCEL_TAG " expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -717,7 +717,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+        fprintf(stderr,COLI_ACCEL_TAG " tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
     }
 #endif
@@ -3524,9 +3524,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 }
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
+        fprintf(stderr,COLI_ACCEL_TAG " hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
+        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,COLI_ACCEL_TAG "   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
@@ -3743,7 +3743,7 @@ int main(int argc, char **argv){
         else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
-        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        if(!g_cuda_enabled){ fprintf(stderr,COLI_ACCEL_TAG " requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
@@ -3751,7 +3751,7 @@ int main(int argc, char **argv){
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
+    if(g_cuda_enabled) fprintf(stderr,COLI_ACCEL_TAG " mode: routed experts%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"");
 #else
