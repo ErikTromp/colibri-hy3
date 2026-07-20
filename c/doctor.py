@@ -16,16 +16,47 @@ def _check(identifier, status, summary, **details):
     return item
 
 
+def is_executable_file(path):
+    """Return whether *path* can be launched on the current platform."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if os.name != "nt":
+        return os.access(path, os.X_OK)
+
+    # Windows ignores POSIX mode bits, so os.access(..., X_OK) reports true for
+    # ordinary readable files.  colibri's native build emits .exe; retain the
+    # script extensions accepted by CreateProcess and allow extensionless PE
+    # binaries as a useful cross-toolchain fallback.
+    if path.suffix.lower() in {".exe", ".com", ".bat", ".cmd"}:
+        return True
+    try:
+        with path.open("rb") as stream:
+            return stream.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
-    if not Path(engine_path).is_file() or os.name != "posix":
+    """Return CUDA/ROCm linkage state without loading the runtime."""
+    engine = Path(engine_path)
+    if not engine.is_file():
+        return {"linked": False, "missing": False}
+    if os.name == "nt":
+        try:
+            linked = b"amdhip64.dll" in engine.read_bytes().lower()
+        except OSError:
+            linked = False
+        return {"linked": linked, "missing": False}
+    if os.name != "posix":
         return {"linked": False, "missing": False}
     try:
         result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
                                 timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
         return {"linked": False, "missing": False}
-    lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
+    lines = [line for line in result.stdout.splitlines()
+             if "libcudart" in line or "libamdhip64" in line]
     return {"linked": any("not found" not in line for line in lines),
             "missing": any("not found" in line for line in lines)}
 
@@ -63,7 +94,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("storage.persistence", "skip", "persistence requires a model directory"))
 
     engine = Path(engine_path)
-    if engine.is_file() and os.access(engine, os.X_OK):
+    if is_executable_file(engine):
         checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
     elif engine.is_file():
         checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))

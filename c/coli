@@ -8,6 +8,7 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
   coli run "prompt"         one-shot generation
   coli info                 model, RAM, disk, and configuration status
   coli plan                 Disk / RAM / VRAM resource plan
+  coli rocm-plan            GGUF KV-aware whole-layer ROCm plan
   coli doctor               installation and execution-plan diagnostics
   coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
   coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
@@ -192,23 +193,52 @@ def need_model(model):
 
 def cuda_binary(engine=None):
     engine=engine or GLM
-    if not os.path.exists(engine) or sys.platform != "linux": return False
+    if not os.path.exists(engine): return False
+    if sys.platform == "win32":
+        try:
+            with open(engine,"rb") as stream:
+                return b"amdhip64.dll" in stream.read().lower()
+        except OSError:
+            return False
+    if sys.platform != "linux": return False
     try:
         linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
+        return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                    for line in linked.stdout.splitlines())
     except (OSError,subprocess.SubprocessError): return False
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
     ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("CUDA_EXPERT_GB",0))
+    vram=a.vram or float(env.get("ROCM_EXPERT_GB",env.get("CUDA_EXPERT_GB",0)))
     gpu=a.gpu
     if gpu is None:
-        gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
+        gpu=env.get("ROCM_GPUS",env.get("ROCM_GPU",
+            env.get("COLI_GPUS",env.get("COLI_GPU","auto"))))
     devices=None if gpu=="auto" else ([] if gpu=="none" else
         [int(value) for value in gpu.split(",")])
     return ram,ctx,devices,vram
+
+def normalize_rocm_env(e):
+    """Accept ROCm-native names while keeping the engine ABI backward compatible."""
+    gpu=e.get("ROCM_GPU")
+    gpus=e.get("ROCM_GPUS")
+    if gpu is not None and "COLI_GPU" not in e and "COLI_GPUS" not in e:
+        e["COLI_CUDA"] = "0" if gpu == "none" else "1"
+        if gpu not in ("none", "auto"): e["COLI_GPU"] = gpu
+    elif gpus is not None and "COLI_GPU" not in e and "COLI_GPUS" not in e:
+        e["COLI_CUDA"] = "1"
+        e["COLI_GPUS"] = gpus
+    if "ROCM_EXPERT_GB" in e:
+        e.setdefault("COLI_CUDA", "1")
+        e.setdefault("CUDA_EXPERT_GB", e["ROCM_EXPERT_GB"])
+    if "ROCM_DENSE" in e:
+        e.setdefault("COLI_CUDA", "1")
+        e.setdefault("CUDA_DENSE", e["ROCM_DENSE"])
+    if "ROCM_ATTN" in e:
+        e.setdefault("COLI_CUDA", "1")
+        e.setdefault("CUDA_ATTN", e["ROCM_ATTN"])
+    return e
 
 def apply_accel_env(e, a, engine):
     """Pass --gpu/--vram to the engine without requiring --auto-tier."""
@@ -225,7 +255,7 @@ def apply_accel_env(e, a, engine):
         e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
         if a.gpu != "none":
             if not has_cuda:
-                sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make {eng} CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make {eng} CUDA=1 or ROCM=1 (this binary is CPU-only)")
             e.setdefault("COLI_CUDA", "1")
             if a.gpu != "auto":
                 devices = [int(v) for v in a.gpu.split(",")]
@@ -234,13 +264,14 @@ def apply_accel_env(e, a, engine):
             e.setdefault("CUDA_DENSE", "1")
     if a.vram and a.gpu != "none":
         if not has_cuda:
-            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make {eng} CUDA=1 (this binary is CPU-only)")
+            sys.exit(f"{C.yel}--vram needs a GPU build:{C.r} make {eng} CUDA=1 or ROCM=1 (this binary is CPU-only)")
         e.setdefault("COLI_CUDA", "1")
         e["CUDA_EXPERT_GB"] = str(a.vram)
     return e
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    normalize_rocm_env(e)
     e["COLI_POLICY"]=a.policy
     if engine_for(a.model) == HY3 and "IDOT" not in e:
         e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
@@ -422,7 +453,10 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm","hy3"]))
+    command=["make","-C",HERE,"glm","hy3"]
+    if os.environ.get("COLI_BACKEND","").lower() in ("rocm","hip"):
+        command.append("ROCM=1")
+    sys.exit(subprocess.call(command))
 
 def cmd_info(a):
     banner("info")
@@ -472,6 +506,42 @@ def cmd_plan(a):
         return
     banner("plan · Disk / RAM / VRAM")
     print(textwrap.indent(format_plan(plan),"  "))
+
+def cmd_rocm_plan(a):
+    """Print a whole-layer GGUF plan for llama.cpp on one ROCm GPU."""
+    from rocm_tune import llama_server_args, read_gguf_header, recommend_layers
+    from resource_plan import discover_gpus, GB
+
+    header = read_gguf_header(a.model)
+    if a.vram > 0:
+        vram = int(a.vram * GB)
+    else:
+        gpus = discover_gpus()
+        if not gpus:
+            sys.exit(f"{C.yel}no ROCm GPU detected:{C.r} pass --vram N")
+        vram = int(gpus[0]["free_bytes"])
+    plan = recommend_layers(
+        header, vram, context=a.ctx or 2048, target_mib=a.target_mib,
+        compute_mib=a.compute_mib, cache_type_k=a.cache_type_k,
+        cache_type_v=a.cache_type_v, sequences=a.sequences,
+    )
+    plan["architecture"] = header["architecture"]
+    plan["model"] = header["path"]
+    plan["command"] = llama_server_args(a.model, plan, a.host, a.port)
+    if a.json:
+        print(json.dumps(plan, indent=2))
+        return
+    print(f"architecture  {plan['architecture']}")
+    print(f"VRAM          {plan['vram_bytes'] / GB:.2f} GB")
+    print(f"KV cache      {plan['kv_cache_bytes'] / (1024 * 1024):.1f} MiB total, "
+          f"{plan['gpu_kv_cache_bytes'] / (1024 * 1024):.1f} MiB VRAM, "
+          f"{plan['host_kv_cache_bytes'] / (1024 * 1024):.1f} MiB RAM "
+          f"({plan['cache_type_k']} K / {plan['cache_type_v']} V, "
+          f"context {plan['context']})")
+    print(f"whole layers  {plan['gpu_layers']}/{plan['total_layers']}")
+    print(f"headroom      {plan['target_margin_bytes'] / (1024 * 1024):.0f} MiB target + "
+          f"{plan['compute_reserve_bytes'] / (1024 * 1024):.0f} MiB compute")
+    print("llama-server  " + subprocess.list2cmdline(plan["command"]))
     print()
 
 def cmd_doctor(a):
@@ -552,7 +622,7 @@ def cmd_chat(a):
         mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
         if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[CUDA]","[MTP]","[USAGE]","[DSA]","[KV]")):
+            if l.startswith(("[RAM_GB","[PIN]","[CUDA]","[ROCm]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
@@ -718,6 +788,15 @@ def main():
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
+    rp=sub.add_parser("rocm-plan",parents=[common])
+    rp.add_argument("--target-mib",type=int,default=512)
+    rp.add_argument("--compute-mib",type=int,default=256)
+    rp.add_argument("--cache-type-k",default="q8_0")
+    rp.add_argument("--cache-type-v",default="q8_0")
+    rp.add_argument("--sequences",type=int,default=1)
+    rp.add_argument("--host",default="127.0.0.1")
+    rp.add_argument("--port",type=int,default=8088)
+    rp.add_argument("--json",action="store_true")
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
@@ -736,7 +815,7 @@ def main():
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
-    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
+    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"rocm-plan":cmd_rocm_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
              "convert":cmd_convert}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)

@@ -20,6 +20,12 @@ extern "C" {
 
 #define COLI_CUDA_MAX_DEVICES 16
 
+#if defined(COLI_ROCM)
+#define COLI_ACCEL_TAG "[ROCm]"
+#else
+#define COLI_ACCEL_TAG "[CUDA]"
+#endif
+
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 

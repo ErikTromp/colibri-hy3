@@ -125,20 +125,73 @@ def discover_gpus():
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return []
-    devices = []
-    for line in result.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
-        if len(fields) != 4:
-            continue
+        result = None
+    if result is not None:
+        devices = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",", 3)]
+            if len(fields) != 4:
+                continue
+            try:
+                index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
+            except ValueError:
+                continue
+            devices.append({"index": index, "name": fields[1],
+                            "total_bytes": total * 1024 * 1024,
+                            "free_bytes": free * 1024 * 1024})
+        if devices:
+            return devices
+
+    # ROCm fallback. rocm-smi's text format is stable across the supported
+    # releases, but its optional product-name fields are not; keep the name
+    # generic and only trust explicitly reported VRAM totals/usage.
+    try:
+        result = subprocess.run(["rocm-smi", "--showmeminfo", "vram"],
+                                text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is None:
+        # HIP SDK for Windows ships hipInfo instead of rocm-smi. It reports
+        # totalGlobalMem but not a reliable process-wide free value, so use the
+        # total as an upper bound; the engine still clamps uploads at runtime.
         try:
-            index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
-        except ValueError:
+            result = subprocess.run(["hipInfo"], text=True, capture_output=True,
+                                    check=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        devices = []
+        blocks = re.split(r"(?=^\s*Name:\s*)", result.stdout, flags=re.MULTILINE)
+        for block in blocks:
+            name = re.search(r"^\s*Name:\s*(.+)$", block, flags=re.MULTILINE)
+            memory = re.search(r"totalGlobalMem:\s*([0-9.]+)\s*GB", block)
+            if not memory:
+                continue
+            total = int(float(memory.group(1)) * GB)
+            devices.append({"index": len(devices),
+                            "name": name.group(1).strip() if name else "AMD GPU",
+                            "total_bytes": total, "free_bytes": total})
+        return devices
+    devices = {}
+    current = None
+    for line in result.stdout.splitlines():
+        match = re.search(r"GPU\[(\d+)\]", line)
+        if match:
+            current = int(match.group(1))
+            devices.setdefault(current, {})
+        if current is None:
             continue
-        devices.append({"index": index, "name": fields[1],
-                        "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024})
-    return devices
+        number = re.search(r"(\d+)\s*$", line)
+        if not number:
+            continue
+        value = int(number.group(1))
+        if "VRAM Total Memory" in line:
+            devices[current]["total_bytes"] = value
+        elif "VRAM Total Used Memory" in line:
+            devices[current]["used_bytes"] = value
+    return [{"index": index, "name": f"AMD GPU {index}",
+             "total_bytes": item["total_bytes"],
+             "free_bytes": max(0, item["total_bytes"] - item.get("used_bytes", 0))}
+            for index, item in sorted(devices.items()) if "total_bytes" in item]
 
 
 def physical_cpu_count():

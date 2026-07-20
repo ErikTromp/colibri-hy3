@@ -1,7 +1,42 @@
 #include "backend_cuda.h"
 
+#ifdef COLI_ROCM
+/* HIP mirrors the CUDA runtime API closely. Keep the backend ABI and the
+ * tested kernel body shared, while mapping runtime calls to ROCm here. */
+#include <hip/hip_runtime.h>
+using cudaError_t = hipError_t;
+using cudaStream_t = hipStream_t;
+using cudaEvent_t = hipEvent_t;
+using cudaDeviceProp = hipDeviceProp_t;
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaSetDevice hipSetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaMalloc(ptr, bytes) hipMalloc(reinterpret_cast<void **>(ptr), bytes)
+#define cudaFree hipFree
+#define cudaMallocHost(ptr, bytes) hipHostMalloc(reinterpret_cast<void **>(ptr), bytes, hipHostMallocDefault)
+#define cudaFreeHost hipHostFree
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemGetInfo hipMemGetInfo
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaGetLastError hipGetLastError
+#define cudaEventCreate hipEventCreate
+#define cudaEventDestroy hipEventDestroy
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaEventRecord hipEventRecord
+#define cudaEventSynchronize hipEventSynchronize
+#else
 #include <cuda_runtime.h>
 #include <mma.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -43,7 +78,7 @@ static std::mutex g_group_stats_mu;
 
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
-    std::fprintf(stderr, "[CUDA] %s: %s\n", what, cudaGetErrorString(err));
+    std::fprintf(stderr, COLI_ACCEL_TAG " %s: %s\n", what, cudaGetErrorString(err));
     return 0;
 }
 
@@ -126,7 +161,7 @@ __global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,i
 
 __global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xscale,
                                         const GroupDesc *desc,int K,int O,int which){
-#if __CUDA_ARCH__ >= 750
+#if !defined(COLI_ROCM) && __CUDA_ARCH__ >= 750
     using namespace nvcuda;
     int warp=threadIdx.x/32,lane=threadIdx.x%32,tile=blockIdx.x*8+warp,c=blockIdx.y;
     if(tile*8>=O)return; GroupDesc d=desc[c];
@@ -296,12 +331,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     for (int i = 0; i < count; i++) {
         int device = devices[i];
         if (device < 0 || device >= available) {
-            std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n", device, available - 1);
+            std::fprintf(stderr, COLI_ACCEL_TAG " invalid device %d (available: 0..%d)\n", device, available - 1);
             g_nctx = 0;
             return 0;
         }
         if (find_ctx(device)) {
-            std::fprintf(stderr, "[CUDA] duplicate device %d\n", device);
+            std::fprintf(stderr, COLI_ACCEL_TAG " duplicate device %d\n", device);
             g_nctx = 0;
             return 0;
         }
@@ -315,7 +350,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
             g_nctx=0;return 0;
         }
         g_nctx++;
-        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
+        std::fprintf(stderr, COLI_ACCEL_TAG " device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     }
     return 1;
@@ -504,6 +539,11 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
+#ifdef COLI_ROCM
+    /* The CUDA WMMA kernel has no AMD equivalent here. The generic packed
+     * int4 path below remains correct and is preferable to a silent no-op. */
+    tc=0;
+#endif
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
