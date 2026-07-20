@@ -263,6 +263,11 @@ static void qt_cuda_reset(QT *t){
 static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
+                     * upload would truncate them to O floats and the group kernels
+                     * would read garbage. An old DLL without the _g symbol returns 0
+                     * and the tensor simply stays CPU-side. */
+        return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static int qt_cuda_update(QT *t){

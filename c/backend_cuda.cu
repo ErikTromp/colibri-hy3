@@ -20,6 +20,8 @@ struct ColiCudaTensor {
     float *scales;
     size_t weight_bytes;
     int fmt, I, O, device;
+    int gs;                    /* quant group size; 0 = per-row scales (#334) */
+    size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
     int tracked;
     RaggedKVEntry ragged[512];
     int ragged_count;
@@ -43,6 +45,7 @@ typedef struct {
 typedef struct {
     const void *g,*u,*d; const float *gs,*us,*ds;
     int gf,uf,df,rows,offset;
+    int ggs,ugs,dgs;      /* per-tensor quant group size; 0 = per-row scales (#334 fmt=4) */
 } GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -81,6 +84,7 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 1) return (size_t)I;
     if (fmt == 2) return (size_t)(I + 1) / 2;
     if (fmt == 3) return (size_t)(I + 3) / 4;
+    if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
     return 0;
 }
 
@@ -296,6 +300,42 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0]*d.ds[o];
 }
 
+/* fmt=4 grouped-int4 variants (#334): identical structure to the w4 kernels,
+ * but the scale varies along the input dimension — sc[o*ng + i/gs], applied
+ * per element inside the accumulation (gs is even, so a packed byte never
+ * straddles a group). gs<=0 degrades to per-row (ng=1), so mixed fmt2/fmt4
+ * groups run correctly through this one kernel family. */
+__global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float *x,
+                                              const GroupDesc *desc,int I,int D){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
+    int ggs=d.ggs>0?d.ggs:D, ugs=d.ugs>0?d.ugs:D;
+    const float *gsc=d.gs+(size_t)o*(size_t)((D+ggs-1)/ggs);
+    const float *usc=d.us+(size_t)o*(size_t)((D+ugs-1)/ugs);
+    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
+        int i=b*2;float gv=gsc[i/ggs],uv=usc[i/ugs];
+        ga+=xs[i]*g0*gv;ua+=xs[i]*u0*uv;
+        if(i+1<D){ga+=xs[i+1]*g1*gv;ua+=xs[i+1]*u1*uv;}}
+    __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0];up[z]=upv[0];}
+}
+__global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2);
+    int dgs=d.dgs>0?d.dgs:I;
+    const float *dsc=d.ds+(size_t)o*(size_t)((I+dgs-1)/dgs);
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum=0;
+    for(int b=threadIdx.x;b<(I+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
+        int i=b*2;float sv=dsc[i/dgs];
+        sum+=xs[i]*a*sv;if(i+1<I)sum+=xs[i+1]*z*sv;}
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale){
@@ -503,6 +543,13 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+/* group size for the NEXT upload on this thread (fmt=4): routed through a
+ * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
+ * stays untouched. pin_load uploads in parallel, hence thread_local. */
+static thread_local int g_upload_gs = 0;
+extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
+                                         const void *weights, const float *scales,
+                                         int fmt, int I, int O, int device, int gs);
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -517,25 +564,36 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
+    t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
+    t->scale_count = t->gs ? (size_t)O * (size_t)((I + t->gs - 1) / t->gs) : (size_t)O;
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
         !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
-    if(fmt==2){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+    if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt) {
-        if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
-            !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
+        if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
+            !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
         }
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (fmt ? t->scale_count * sizeof(float) : 0);
     *tensor = t;
     return 1;
+}
+extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
+                                         const void *weights, const float *scales,
+                                         int fmt, int I, int O, int device, int gs){
+    g_upload_gs = gs>0 ? gs : 0;
+    int r = coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device);
+    g_upload_gs = 0;
+    return r;
 }
 
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
@@ -546,13 +604,14 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
                             cudaMemcpyHostToDevice),"tensor refresh")) return 0;
-    if(tensor->fmt==2){
+    if(tensor->fmt==2||tensor->fmt==4){
         offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
     return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
-        (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
+        (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
+        cudaMemcpyHostToDevice),"scale refresh");
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
@@ -641,14 +700,18 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1;
+    int all_s4=1,all_q4=1,any_g4=0;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total};
+                 g->fmt,u->fmt,d->fmt,rows[c],total,
+                 g->gs,u->gs,d->gs};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
+                !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
+        any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -738,7 +801,18 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         }
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_q4&&any_g4){
+        /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
+         * ride along as the ng=1 special case. */
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
+        /* generic path decodes fmt 0/1/2/3 only — a fmt=4 group that slipped the
+         * gates above (odd gs) must NOT be silently decoded as int2 (#334). */
+        for(int c=0;c<count;c++)
+            if(host[c].gf==4||host[c].uf==4||host[c].df==4) return 0;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);

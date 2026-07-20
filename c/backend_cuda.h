@@ -36,6 +36,9 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
 /* Upload without executing, so capacity failures happen during model startup. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
+        const void *weights, const float *scales,
+        int fmt, int I, int O, int device, int gs);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
