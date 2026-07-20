@@ -374,6 +374,27 @@ def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
+    # Validate tools/functions structure early so malformed input fails with a clear error.
+    tools_raw = body.get("tools") or body.get("functions")
+    if tools_raw is not None:
+        if not isinstance(tools_raw, list):
+            raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
+        if not tools_raw:
+            raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
+        for idx, tool in enumerate(tools_raw):
+            if not isinstance(tool, dict):
+                raise APIError(400, f"Each tool must be an object, got {type(tool).__name__} at index {idx}.",
+                               f"tools.{idx}", "invalid_value")
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            if not isinstance(fn, dict):
+                raise APIError(400, f"Tool function must be an object at index {idx}.",
+                               f"tools.{idx}.function", "invalid_value")
+            if not fn.get("name"):
+                raise APIError(400, f"Each tool must have a `name` at index {idx}.",
+                               f"tools.{idx}.function.name", "invalid_value")
+            if not isinstance(fn["name"], str):
+                raise APIError(400, f"Tool `name` must be a string at index {idx}.",
+                               f"tools.{idx}.function.name", "invalid_value")
     choice = body.get("tool_choice")
     if choice is not None:
         if isinstance(choice, str):
@@ -863,7 +884,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def generation(self, body, prompt, request_id, chat):
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -875,8 +896,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
-        tools = (body.get("tools") or body.get("functions") or None) if chat else None
-        if body.get("tool_choice") == "none":
+        # tools and tool_choice come from chat_completion() already processed/filtered
+        if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -1078,9 +1099,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
+        tool_choice = body.get("tool_choice")
         prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                             body.get("tool_choice"))
-        self.generation(body, prompt, request_id, True)
+                             tool_choice)
+        self.generation(body, prompt, request_id, True, tools, tool_choice)
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
