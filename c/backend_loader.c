@@ -76,6 +76,7 @@ typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,in
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
 typedef int (*fn_pipe_rmsnorm)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps);
 typedef int (*fn_pipe_rmsnorm_s)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride);
+typedef int (*fn_pipe_router)(int device,const float *x_dev,const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,float topp,int norm_topk,float routed_scale,int *idx_host,float *w_host,int *keff_host);
 typedef int (*fn_pipe_rope)(int device,float *v_dev,const int *pos_dev,int rows, int stride,int offset,int R,int heads,float theta);
 typedef int (*fn_pipe_rope_base)(int device,float *v_dev,int pos_base,int rows, int stride,int offset,int R,int heads,float theta);
 typedef int (*fn_pipe_rows_add)(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D);
@@ -123,6 +124,7 @@ static struct {
     fn_pipe_peer_copy pipe_peer_copy;
     fn_pipe_rmsnorm pipe_rmsnorm;
     fn_pipe_rmsnorm_s pipe_rmsnorm_s;
+    fn_pipe_router pipe_router;
     fn_pipe_rope pipe_rope;
     fn_pipe_rope_base pipe_rope_base;
     fn_pipe_rows_add pipe_rows_add;
@@ -217,6 +219,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
     RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
     RESOLVE(pipe_rmsnorm_s, fn_pipe_rmsnorm_s)
+    RESOLVE(pipe_router, fn_pipe_router)
     RESOLVE(pipe_rope, fn_pipe_rope)
     RESOLVE(pipe_rope_base, fn_pipe_rope_base)
     RESOLVE(pipe_rows_add, fn_pipe_rows_add)
@@ -405,6 +408,11 @@ int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev, const float *sr
 int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_rmsnorm(device, y_dev, x_dev, w_dev, S, D, eps);
+}
+
+int coli_cuda_pipe_router(int device,const float *x_dev,const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,float topp,int norm_topk,float routed_scale,int *idx_host,float *w_host,int *keff_host){
+    if(!g_cuda.available || !g_cuda.pipe_router){ return 0; }
+    return g_cuda.pipe_router(device, x_dev, rw_dev, rb_dev, D, E, Ksel, topp, norm_topk, routed_scale, idx_host, w_host, keff_host);
 }
 
 int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride){

@@ -126,6 +126,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const f
                              int xstride,int ystride);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                              int stride,int offset,int R,int heads,float theta);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_router(int device,const float *x_dev,
+        const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,
+        float topp,int norm_topk,float routed_scale,
+        int *idx_host,float *w_host,int *keff_host);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                           int spitch,int width,int height);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,

@@ -34,7 +34,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
-    float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
+    float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -455,7 +455,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
-        for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
@@ -994,7 +994,7 @@ __global__ static void pipe_rows_add(float *x,const float *partial,const int *ro
  * per layer (78 x ~10 alloc/richiesta erano puro churn). */
 extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     DeviceContext *ctx=find_ctx(device);
-    if(slot<0||slot>=24||!select_ctx(ctx)) return NULL;
+    if(slot<0||slot>=27||!select_ctx(ctx)) return NULL;
     if(!reserve(&ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
     return ctx->pipe_buf[slot];
 }
@@ -1045,6 +1045,82 @@ extern "C" int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
     pipe_rope_rows<<<rows,128>>>(v_dev,NULL,pos_base,stride,offset,R,heads,theta);
     return cuda_ok(cudaGetLastError(),"pipe rope base");
+}
+/* ---- device router (#431 PR-A) -------------------------------------------
+ * Router for one decode row, entirely on the layer's home device: logits GEMV
+ * (E x D, tiny) + sigmoid, bias-augmented top-K selection, route-level TOPP
+ * truncation, norm_topk and routed_scale — a float-faithful clone of moe()'s
+ * plain routing path (colibri.c FASE A). Selection runs single-thread so the
+ * argmax order, tie-breaking (strict >, lowest index wins) and weight math
+ * match the CPU reference exactly; only the dot/expf rounding can differ,
+ * which is the documented kernel-family divergence class (#100/#163).
+ * Results are packed [idx[K] | w[K] | keff] in one scratch buffer and read
+ * back with a single tiny D2H. */
+__global__ void pipe_router_logits(const float *__restrict__ x,
+                                   const float *__restrict__ W,
+                                   const float *__restrict__ bias,
+                                   int D, float *logit, float *choice){
+    int e = blockIdx.x;
+    const float *w = W + (size_t)e*D;
+    float acc = 0.f;
+    for(int i=threadIdx.x; i<D; i+=blockDim.x) acc += x[i]*w[i];
+    __shared__ float sh[128];
+    sh[threadIdx.x]=acc; __syncthreads();
+    for(int s=blockDim.x>>1; s>0; s>>=1){
+        if(threadIdx.x<s) sh[threadIdx.x]+=sh[threadIdx.x+s];
+        __syncthreads();
+    }
+    if(!threadIdx.x){
+        float lg = 1.f/(1.f+expf(-sh[0]));
+        logit[e]=lg; choice[e]=lg+bias[e];
+    }
+}
+__global__ void pipe_router_select(const float *__restrict__ logit,
+                                   const float *__restrict__ choice, int E,
+                                   int Ksel, float topp, int norm_topk,
+                                   float routed_scale, char *out){
+    if(threadIdx.x||blockIdx.x) return;
+    int   *idx = (int*)out;
+    float *w   = (float*)(out + Ksel*sizeof(int));
+    int   *keff= (int*)(out + Ksel*(sizeof(int)+sizeof(float)));
+    for(int kk=0;kk<Ksel;kk++){
+        int best=-1; float bv=-1e30f;
+        for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+            if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+        idx[kk]=best; w[kk]=logit[best];
+    }
+    int Ke=Ksel;
+    if(topp>0.f && topp<1.f){
+        for(int a=1;a<Ksel;a++){ int ii=idx[a]; float ww=w[a]; int b=a-1;
+            while(b>=0 && w[b]<ww){ w[b+1]=w[b]; idx[b+1]=idx[b]; b--; } w[b+1]=ww; idx[b+1]=ii; }
+        float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=w[kk];
+        float cum=0.f; for(int kk=0;kk<Ksel;kk++){ cum+=w[kk]; if(cum>=topp*tot){ Ke=kk+1; break; } }
+    }
+    if(norm_topk){ float sm=0.f; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f;
+                   for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
+    for(int kk=0;kk<Ke;kk++) w[kk]*=routed_scale;
+    *keff=Ke;
+}
+extern "C" int coli_cuda_pipe_router(int device,const float *x_dev,
+        const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,
+        float topp,int norm_topk,float routed_scale,
+        int *idx_host,float *w_host,int *keff_host){
+    DeviceContext *ctx=find_ctx(device);
+    if(!x_dev||!rw_dev||!rb_dev||D<1||E<1||E>4096||Ksel<1||Ksel>64||!select_ctx(ctx)) return 0;
+    size_t pack=(size_t)Ksel*(sizeof(int)+sizeof(float))+sizeof(int);
+    float *logit=coli_cuda_pipe_scratch(device,22,(size_t)E*sizeof(float));
+    float *chc  =coli_cuda_pipe_scratch(device,23,(size_t)E*sizeof(float));
+    char  *out  =(char*)coli_cuda_pipe_scratch(device,24,pack);
+    if(!logit||!chc||!out) return 0;
+    pipe_router_logits<<<E,128>>>(x_dev,(const float*)rw_dev,(const float*)rb_dev,D,logit,chc);
+    pipe_router_select<<<1,1>>>(logit,chc,E,Ksel,topp,norm_topk,routed_scale,out);
+    if(!cuda_ok(cudaGetLastError(),"pipe router launch")) return 0;
+    char buf[64*(sizeof(int)+sizeof(float))+sizeof(int)];
+    if(!cuda_ok(cudaMemcpy(buf,out,pack,cudaMemcpyDeviceToHost),"pipe router readback")) return 0;
+    memcpy(idx_host,buf,(size_t)Ksel*sizeof(int));
+    memcpy(w_host,buf+Ksel*sizeof(int),(size_t)Ksel*sizeof(float));
+    memcpy(keff_host,buf+Ksel*(sizeof(int)+sizeof(float)),sizeof(int));
+    return 1;
 }
 extern "C" int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                                      int spitch,int width,int height){

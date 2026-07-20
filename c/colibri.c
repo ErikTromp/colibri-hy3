@@ -69,10 +69,12 @@ static inline int omp_get_thread_num(void){ return 0; }
 #include <omp.h>
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
-/* routing precalcolata dalla GPU (layer CB): moe() la usa e salta la FASE A */
-static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
-static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
+/* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
+static const float *g_pre_sh;
 #endif
+/* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
+ * moe() la usa e salta la FASE A. NULL = router su CPU. */
+static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
@@ -125,6 +127,10 @@ typedef struct {
     QT gate_proj, up_proj, down_proj;
     /* moe (sparse==1) */
     float *router, *router_bias;                 /* router f32 (sensibile) */
+#ifdef COLI_CUDA
+    void *router_cuda, *router_bias_cuda;        /* device router (#431 PR-A), lazy-uploaded */
+    int router_cuda_bad;                         /* upload failed once: stay on the CPU router */
+#endif
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
 } Layer;
 
@@ -1795,6 +1801,7 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
 static int g_absorb=-1;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
+static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
@@ -2366,7 +2373,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
     float *logits_all=falloc((int64_t)S*E);
     int pre_routed=0; (void)pre_routed;
-#ifdef COLI_METAL
+    /* pre-routed shortcut: Metal layer-CB o device router CUDA (#431) — stessa
+     * contabilita' (#417: recency clock incluso), la selezione arriva dalla GPU */
     if(g_pre_idx){                               /* routing gia' calcolata dal layer CB (GPU) */
         memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
         memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
@@ -2396,7 +2404,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         pre_routed=1;
     }
-#endif
     if(!pre_routed) matmul(logits_all, x, l->router, S, D, E);
     if(!pre_routed)
     for(int s=0;s<S;s++){
@@ -3305,6 +3312,36 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!attn_pipe_prefill(m,l,li,nrm_d,1,S,pos_base,NULL,y_d)) return 0;
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;         /* prima mutazione */
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
+    /* device router (#431 PR-A): route THIS row on the home device while the
+     * stream is still hot, then hand the selection to moe() through the same
+     * pre-routed shortcut the Metal layer-CB uses. Any failure (upload, launch,
+     * feature gate) falls back to the CPU router inside moe() — byte-identical
+     * behaviour, just slower. Gated to the plain routing path: CACHE_ROUTE /
+     * ROUTE_P / ROUTE_TRACE keep the CPU ranking they need. */
+    static int lr_idx[64]; static float lr_w[64]; static int lr_keff[1];
+    int dev_routed=0;
+    if(g_cuda_router && S==1 && !g_cache_route && g_route_p<=0.f && !g_route_fp
+       && c->n_experts<=4096 && c->topk<=64 && !l->router_cuda_bad){
+        int E=c->n_experts, K=c->topk;
+        int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
+        float tp = (g_topp>0 && g_topp<1.f) ? g_topp : 0.f;
+        if(!l->router_cuda){
+            void *rw=coli_cuda_pipe_alloc(dev,(size_t)E*D*4);
+            void *rb=coli_cuda_pipe_alloc(dev,(size_t)E*4);
+            if(rw&&rb&&coli_cuda_pipe_upload(dev,rw,l->router,(size_t)E*D*4)
+                    &&coli_cuda_pipe_upload(dev,rb,l->router_bias,(size_t)E*4)){
+                l->router_cuda=rw; l->router_bias_cuda=rb;
+            } else {
+                if(rw)coli_cuda_pipe_free(dev,rw); if(rb)coli_cuda_pipe_free(dev,rb);
+                l->router_cuda_bad=1;
+            }
+        }
+        if(l->router_cuda &&
+           coli_cuda_pipe_router(dev,nrm_d,l->router_cuda,l->router_bias_cuda,
+                                 D,E,Ksel,tp,c->norm_topk,c->routed_scale,
+                                 lr_idx,lr_w,lr_keff))
+            dev_routed=1;
+    }
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
     /* OVERLAP: issue the shared expert on the GPU BEFORE moe() runs on the CPU.
@@ -3335,7 +3372,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
+    if(dev_routed){ g_pre_idx=lr_idx; g_pre_w=lr_w; g_pre_keff=lr_keff; }
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
+    if(dev_routed){ g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; }
     te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
@@ -5522,6 +5561,7 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
+    g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
