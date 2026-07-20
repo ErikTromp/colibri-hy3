@@ -325,9 +325,9 @@ int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
 }
 
 int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
-                            const float *scales, int fmt, int I, int O, int device, int gs){
+                            const float *scales, int fmt, int I, int O, int device){
     if(!g_cuda.available) return 0;
-    return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device, gs);
+    return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
 }
 
 int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs){

@@ -592,7 +592,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
          * on such a slot failed here — the GPU tier silently never computed
          * for host-released slab experts. */
         ColiCudaTensor *t = *tensor;
-        return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == gs;
+        int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
+        return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
@@ -649,7 +650,6 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
     }
     int ng = tensor->ng > 0 ? tensor->ng : 1;
     return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
-<<<<<<< HEAD
         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
         cudaMemcpyHostToDevice),"scale refresh");
 }
@@ -662,22 +662,16 @@ static long g_gpu_calls;
 static int fault_injected(void) {
     const char *fa = std::getenv("COLI_GPU_FAIL_AFTER");
     return fa && g_gpu_calls++ >= std::atol(fa);
-=======
-        (size_t)tensor->O*ng*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
->>>>>>> 1a69113 (cuda+engine: full fmt=4 (grouped int4 gs=64) support + diagnostic harness)
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
-<<<<<<< HEAD
-                                 int fmt, int S, int I, int O, int device) {
-    if (fault_injected()) return 0;
-    if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
-=======
                                  int fmt, int S, int I, int O, int device, int gs) {
-    if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device, gs)) return 0;
->>>>>>> 1a69113 (cuda+engine: full fmt=4 (grouped int4 gs=64) support + diagnostic harness)
+    if (fault_injected()) return 0;
+    if (S < 1) return 0;
+    if (gs > 0) { if (!coli_cuda_tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs)) return 0; }
+    else        { if (!coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0; }
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
@@ -771,16 +765,9 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
                  g->gs,u->gs,d->gs};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
-<<<<<<< HEAD
         all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
                 !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
-=======
-        /* fmt=4 (grouped int4) experts have per-group scales that the grouped_hidden/
-         * grouped_down kernels don't handle. Fall back to the per-expert path
-         * (coli_cuda_expert_mlp), which uses quant_matmul with correct gs/ng. */
-        if(g->fmt==4||u->fmt==4||d->fmt==4) return 0;
->>>>>>> 1a69113 (cuda+engine: full fmt=4 (grouped int4 gs=64) support + diagnostic harness)
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -951,12 +938,12 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
+            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),0,1);
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
+            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),0,1);
         silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
+            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
     }
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
