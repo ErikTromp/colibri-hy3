@@ -2209,6 +2209,14 @@ static void run_prompt_ids(Model *m, int ngen){
 }
 
 int main(int argc, char **argv){
+/* Windows: stdin/stdout default to text mode, which mangles the \x02RESET / \x02MORE
+ * binary control sequences and the STAT protocol. Force binary + unbuffered. */
+#ifdef _WIN32
+#include <fcntl.h>
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif    
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack=getenv("NOPACK")?1:0;
     g_drop=getenv("DROP")?1:0;
