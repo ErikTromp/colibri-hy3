@@ -9,23 +9,23 @@ A simple guide to running **Colibrì**, a local inference engine based on GLM 5.
 
 ## 📋 Table of Contents
 
-* [What is Colibrì?](https://www.google.com/search?q=#what-is-colibr%C3%AC)
-* [Requirements](https://www.google.com/search?q=#requirements)
-    * [Hardware](https://www.google.com/search?q=#hardware)
-    * [Software](https://www.google.com/search?q=#software)
-* [How to get started](https://www.google.com/search?q=#how-to-get-started)
-    * [Step 1: Download the model](https://www.google.com/search?q=#step-1-download-the-model)
-    * [Step 2: Download the Colibrì Dockerfile](https://www.google.com/search?q=#step-2-download-the-colibr%C3%AC-dockerfile)
-    * [Step 3: Build the Docker image](https://www.google.com/search?q=#step-3-build-the-docker-image)
-    * [Step 4: Start Colibrì](https://www.google.com/search?q=#step-4-start-colibr%C3%AC)
-    * [What does that command mean?](https://www.google.com/search?q=#what-does-that-command-mean)
-    * [Using Colibrì](https://www.google.com/search?q=#using-colibr%C3%AC)
-* [Entering a Linux console inside the container](https://www.google.com/search?q=#entering-a-linux-console-inside-the-container)
-* [Troubleshooting](https://www.google.com/search?q=#troubleshooting)
-* [Technical notes](https://www.google.com/search?q=#technical-notes)
-* [Frequently Asked Questions](https://www.google.com/search?q=#frequently-asked-questions)
-* [Support and contributions](https://www.google.com/search?q=#support-and-contributions)
-* [Tests on my PC](https://www.google.com/search?q=#tests-on-my-pc)
+* [What is Colibrì?](https://github.com/JustVugg/colibri/blob/main/docker/README.md#what-is-colibr%C3%AC)
+* [Requirements](https://github.com/JustVugg/colibri/blob/main/docker/README.md#requirements)
+    * [Hardware](https://github.com/JustVugg/colibri/blob/main/docker/README.md#hardware)
+    * [Software](https://github.com/JustVugg/colibri/blob/main/docker/README.md#software)
+* [How to get started](https://github.com/JustVugg/colibri/blob/main/docker/README.md#how-to-get-started)
+    * [Step 1: Download the model](https://github.com/JustVugg/colibri/blob/main/docker/README.md#step-2-download-the-colibr%C3%AC-dockerfile)
+    * [Step 2: Download the Colibrì Dockerfile](https://github.com/JustVugg/colibri/blob/main/docker/README.md#step-2-download-the-colibr%C3%AC-dockerfile)
+    * [Step 3: Build the Docker image](https://github.com/JustVugg/colibri/blob/main/docker/README.md#step-3-build-the-docker-image)
+    * [Step 4: Start Colibrì](https://github.com/JustVugg/colibri/blob/main/docker/README.md#step-4-start-colibr%C3%AC)
+    * [What does that command mean?](https://github.com/JustVugg/colibri/blob/main/docker/README.md#what-does-that-command-mean)
+    * [Using Colibrì](https://github.com/JustVugg/colibri/blob/main/docker/README.md#using-colibr%C3%AC)
+* [Enter the container](https://github.com/JustVugg/colibri/blob/main/docker/README.md#entering-a-linux-console-inside-the-container)
+* [Troubleshooting](https://github.com/JustVugg/colibri/blob/main/docker/README.md#troubleshooting)
+* [Technical notes](https://github.com/JustVugg/colibri/blob/main/docker/README.md#technical-notes)
+* [Frequently Asked Questions](https://github.com/JustVugg/colibri/blob/main/docker/README.md#frequently-asked-questions)
+* [Support and contributions](https://github.com/JustVugg/colibri/blob/main/docker/README.md#support-and-contributions)
+* [Testing on a low resource PC](https://github.com/JustVugg/colibri/blob/main/docker/README.md#testing-on-a-low-resource-pc)
 
 ---
 
@@ -206,7 +206,7 @@ The model understands **Italian, English, Chinese, and other languages**, althou
 
 ---
 
-## Entering a Linux console inside the container
+## Enter the container
 
 If you want to explore the container as if it were a normal Linux machine:
 
@@ -439,7 +439,7 @@ Have fun! 🐦
 
 ---
 
-## Tests on my PC
+## Testing on a low resource PC
 
 In the first case, I asked a question in Italian; in the second, in Japanese; and in the third, I repeated the question in Japanese but requested an answer in Italian.
 
