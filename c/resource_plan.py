@@ -39,7 +39,7 @@ def analyze_model(model):
     config_path = model / "config.json"
     if not config_path.is_file():
         raise ValueError(f"missing config.json: {model}")
-    config = json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
@@ -115,6 +115,30 @@ def memory_available():
             if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_kb)):
                 return total_kb.value * 1024
         except OSError:
+            pass
+    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
+    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
+    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
+            page_match = re.search(r"page size of (\d+) bytes", out)
+            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                match = re.search(rf"{key}:\s+(\d+)\.", out)
+                if match:
+                    pages += int(match.group(1))
+            if pages:
+                return pages * page
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        try:
+            total = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True,
+                                   capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
     return 0
 
@@ -195,6 +219,30 @@ def discover_gpus():
 
 
 def physical_cpu_count():
+    if sys.platform == "win32":
+        # os.cpu_count() conta i processori logici (SMT): 2 thread/core saturano
+        # le unita' AVX-512 e peggiorano il matmul. Contiamo i core fisici veri
+        # con GetLogicalProcessorInformationEx(RelationProcessorCore).
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            need = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+            buf = (ctypes.c_char * need.value)()
+            if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                raw, cores, off = bytes(buf), 0, 0
+                while off + 8 <= need.value:
+                    relationship = int.from_bytes(raw[off:off + 4], "little")
+                    size = int.from_bytes(raw[off + 4:off + 8], "little")
+                    if size <= 0:
+                        break
+                    if relationship == 0:  # RelationProcessorCore
+                        cores += 1
+                    off += size
+                if cores:
+                    return cores
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
         result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
@@ -207,6 +255,22 @@ def physical_cpu_count():
     return os.cpu_count() or 1
 
 
+def cpu_socket_count():
+    """Return the number of physical CPU sockets visible to this process."""
+    if not sys.platform.startswith("linux"):
+        return 1
+    try:
+        result = subprocess.run(["lscpu", "-p=socket"], text=True,
+                                capture_output=True, check=True, timeout=5)
+        sockets = {int(line) for line in result.stdout.splitlines()
+                   if line and not line.startswith("#")}
+        if sockets:
+            return len(sockets)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 1
+
+
 POLICIES = {
     "quality": {"preserve_quantization": True, "preserve_router": True},
     "balanced": {"preserve_quantization": True, "preserve_router": True},
@@ -216,11 +280,12 @@ POLICIES = {
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
-               policy="quality", physical_cpus=None):
+               policy="quality", physical_cpus=None, cpu_sockets=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
+    cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
@@ -297,6 +362,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
         "cpu": {"physical_cores": max(1, int(physical_cpus)),
+                "sockets": max(1, int(cpu_sockets)),
                 "thread_policy": "physical-cores"},
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
@@ -324,8 +390,15 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    result.setdefault("OMP_PROC_BIND", "spread")
-    result.setdefault("OMP_PLACES", "cores")
+    if sys.platform != "win32":
+        # la libgomp di MinGW non supporta l'affinity su Windows
+        # ("Affinity not supported on this configuration"): non impostarle li'.
+        result.setdefault("OMP_PROC_BIND", "spread")
+        result.setdefault("OMP_PLACES", "cores")
+    if sys.platform.startswith("linux") and plan["cpu"].get("sockets", 1) > 1:
+        # Selectively interleave large expert/dense slabs across memory controllers.
+        # Unlike blanket numactl interleave, this leaves CUDA staging buffers local.
+        result.setdefault("COLI_NUMA", "1")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]

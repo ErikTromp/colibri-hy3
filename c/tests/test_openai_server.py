@@ -2,13 +2,15 @@ import io
 import json
 import math
 import socket
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from pathlib import Path
 
-from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
+from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
                            READY, Engine, generation_options, parse_tool_calls,
                            read_engine_turn, render_chat, serve)
 
@@ -70,8 +72,13 @@ class TemplateTest(unittest.TestCase):
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
                          (4, 0.0, 1.0))
+        # max_tokens above the server cap is clamped, not rejected (#260): OpenAI
+        # clients default to large values; erroring breaks them.
+        self.assertEqual(generation_options({"max_tokens": 9, "temperature": 0, "top_p": 1}, 8),
+                         (8, 0.0, 1.0))
+        # non-positive / non-int max_tokens is still a hard error
         with self.assertRaises(APIError):
-            generation_options({"max_tokens": 9}, 8)
+            generation_options({"max_tokens": 0}, 8)
         with self.assertRaises(APIError):
             generation_options({"temperature": math.nan}, 8)
         with self.assertRaises(APIError):
@@ -373,6 +380,25 @@ class DispatcherTest(unittest.TestCase):
         engine.close()
         self.assertEqual(chunks, ["é"])
 
+    def test_records_profile_snapshots_from_prof_lines(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.profile_seq, 1)
+        self.assertEqual(list(engine.profile), [{
+            "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+            "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+            "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+        }])
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
@@ -436,6 +462,20 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
+    def test_profile_reports_recent_turns_without_auth(self):
+        with urlopen(self.base + "/profile", timeout=2) as response:
+            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+        turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+                "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+                "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
+        self.engine.profile = [turn]
+        self.engine.profile_seq = 1
+        try:
+            with urlopen(self.base + "/profile", timeout=2) as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+        finally:
+            del self.engine.profile, self.engine.profile_seq
+
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
             "Origin": "http://localhost:5173",
@@ -490,6 +530,12 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(body["choices"][0]["text"], "Héllo")
         self.assertEqual(self.engine.calls[-1][0], "Complete me")
 
+    def test_rejects_empty_legacy_completion(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {"model": "test-model", "prompt": ""})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
+
     def test_rejects_invalid_stream_options(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/chat/completions", {
@@ -497,6 +543,39 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class StaticServingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        dist = root / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("dashboard", encoding="utf-8")
+        sibling = root / "dist-private"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("private", encoding="utf-8")
+        self.web_dist = patch.object(APIHandler, "WEB_DIST", dist)
+        self.web_dist.start()
+        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.web_dist.stop()
+        self.tmp.cleanup()
+
+    def test_static_root_stays_inside_dist_directory(self):
+        with urlopen(self.base + "/", timeout=2) as response:
+            self.assertEqual(response.read(), b"dashboard")
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
+        self.assertEqual(caught.exception.code, 404)
 
 
 class SchedulerHTTPTest(unittest.TestCase):

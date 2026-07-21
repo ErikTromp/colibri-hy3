@@ -2,6 +2,7 @@
 """Read-only installation diagnostics for colibri."""
 
 import os
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -44,10 +45,17 @@ def cuda_linkage(engine_path):
         return {"linked": False, "missing": False}
     if os.name == "nt":
         try:
-            linked = b"amdhip64.dll" in engine.read_bytes().lower()
+            data = engine.read_bytes()
         except OSError:
-            linked = False
-        return {"linked": linked, "missing": False}
+            return {"linked": False, "missing": False}
+        if b"amdhip64.dll" in data.lower():
+            return {"linked": True, "missing": False}
+        built = (b"[CUDA] mode: routed experts" in data or
+                 b"[ROCm] mode: routed experts" in data)
+        if not built:
+            return {"linked": False, "missing": False}
+        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        return {"linked": dll_present, "missing": not dll_present}
     if os.name != "posix":
         return {"linked": False, "missing": False}
     try:
@@ -78,7 +86,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     config = model / "config.json"
     try:
-        valid_config = isinstance(json.loads(config.read_text()), dict)
+        valid_config = isinstance(json.loads(config.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
@@ -94,7 +102,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("storage.persistence", "skip", "persistence requires a model directory"))
 
     engine = Path(engine_path)
-    if is_executable_file(engine):
+    # On Windows, os.access(X_OK) always returns True for any existing file
+    # (NTFS has no execute bit; executability is governed by file extension).
+    # So a chmod(0o644) "non-executable" scenario can't be detected via X_OK
+    # on Windows. Use a platform-aware check: on POSIX, honor the mode bits;
+    # on Windows, any existing file is treated as executable. (#141)
+    if sys.platform == "win32":
+        engine_ok = engine.is_file()
+    else:
+        engine_ok = engine.is_file() and os.access(engine, os.X_OK)
+    if engine_ok:
         checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
     elif engine.is_file():
         checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))

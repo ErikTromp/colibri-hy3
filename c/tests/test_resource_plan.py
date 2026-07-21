@@ -10,6 +10,7 @@ from resource_plan import (
     GB,
     analyze_model,
     build_plan,
+    cpu_socket_count,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -66,15 +67,19 @@ class ResourcePlanTest(unittest.TestCase):
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
 
+    def test_cpu_socket_count_is_positive(self):
+        self.assertGreaterEqual(cpu_socket_count(), 1)
+
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,
                  "free_bytes": 10 * GB}]
         plan = build_plan(self.model, ram_gb=16, context=32, vram_gb=20,
                           available_memory=32 * GB, available_disk=100 * GB, gpus=gpus,
-                          physical_cpus=24)
+                          physical_cpus=24, cpu_sockets=2)
         self.assertEqual(plan["version"], 2)
         self.assertEqual(plan["policy"]["name"], "quality")
         self.assertEqual(plan["cpu"]["physical_cores"], 24)
+        self.assertEqual(plan["cpu"]["sockets"], 2)
         self.assertTrue(plan["policy"]["preserve_quantization"])
         self.assertFalse(plan["tiers"]["vram"]["requires_host_backing"])
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
@@ -105,21 +110,36 @@ class ResourcePlanTest(unittest.TestCase):
             {"index": 1, "name": "b", "total_bytes": 12 * GB, "free_bytes": 10 * GB},
         ]
         plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
-                          available_disk=1, gpus=gpus)
+                          available_disk=1, gpus=gpus, cpu_sockets=2)
         env = environment_for_plan(plan, {"RAM_GB": "12", "PIN": "stats.txt",
                                                "COLI_GPUS": "1"})
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
-        self.assertEqual(env["OMP_PROC_BIND"], "spread")
-        self.assertEqual(env["OMP_PLACES"], "cores")
+        if sys.platform == "win32":
+            # MinGW libgomp: niente affinity su Windows, le chiavi non vanno emesse
+            self.assertNotIn("OMP_PROC_BIND", env)
+            self.assertNotIn("OMP_PLACES", env)
+        else:
+            self.assertEqual(env["OMP_PROC_BIND"], "spread")
+            self.assertEqual(env["OMP_PLACES"], "cores")
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
         self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
         self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
+
+        if sys.platform.startswith("linux"):
+            self.assertEqual(env["COLI_NUMA"], "1")
+            explicit_numa = environment_for_plan(plan, {"COLI_NUMA": "0"})
+            self.assertEqual(explicit_numa["COLI_NUMA"], "0")
+
+    def test_single_socket_plan_does_not_enable_numa(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[], physical_cpus=8, cpu_sockets=1)
+        self.assertNotIn("COLI_NUMA", environment_for_plan(plan))
     def test_cpu_binary_does_not_apply_gpu_tier(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
                           gpus=[{"index": 0, "name": "a", "total_bytes": 8 * GB,

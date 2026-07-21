@@ -12,7 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #endif
 #include "st.h"
@@ -51,7 +51,11 @@ typedef struct {
 
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
+#if defined(__APPLE__)
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
+#else
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
+#endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
@@ -69,8 +73,47 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
 }
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
- * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i]. */
+ * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
+ * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
+ * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
+ * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    int32x4_t acc = vdupq_n_s32(0);
+    int8x16_t va = vld1q_s8(a), vb = vld1q_s8(b);
+#if defined(__ARM_FEATURE_DOTPROD)
+    acc = vdotq_s32(acc, va, vb);
+#else
+    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(va),  vget_low_s8(vb)));
+    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(va), vget_high_s8(vb)));
+#endif
+    return vaddvq_s32(acc);
+}
+#endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+#if defined(__ARM_NEON)
+    static int idot = -1;
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot && I % 16 == 0 && I <= 4096) {
+        int nb = I / 16; int8_t xi[4096]; float xs[256];
+        for (int b = 0; b < nb; b++) {
+            const float *xb = x + b*16;
+            float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
+            xs[b] = s; float inv = 1.f/s;
+            for (int i = 0; i < 16; i++) xi[b*16+i] = (int8_t)lrintf(xb[i]*inv);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            float acc = 0.f;
+            for (int b = 0; b < nb; b++) acc += xs[b]*(float)dot_i8_16(xi+b*16, w+b*16);
+            y[o] = acc * scale[o];
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
@@ -171,8 +214,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->dense_load_s = now_s() - t0;
 }
 
-/* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O] */
+/* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O].
+ * Container pre-quantizzato (convert_olmoe.py: int8 + scale f32 in "name.qs"):
+ * lettura raw diretta — meta' I/O e zero quantize_rows a runtime. Prima di
+ * questa patch il container int8 causava SIGBUS (st_read_f32 su tensori I8). */
 static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
+    st_tensor *t = st_find(&m->S, name);
+    if (t && t->dtype == 3) {                    /* I8/U8: container colibri */
+        char qs[300]; snprintf(qs, sizeof(qs), "%s.qs", name);
+        st_read_raw(&m->S, name, q, 1);
+        st_read_f32(&m->S, qs, scale, 1);
+        return;
+    }
     st_read_f32(&m->S, name, tmp, 1);            /* pread + fadvise DONTNEED */
     quantize_rows(tmp, q, scale, O, I, m->quant_bits);
 }
@@ -347,6 +400,37 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* teacher-forced NLL of full_ids[np..nfull): feed the REFERENCE token at each step
+ * (never the argmax), accumulate -log softmax(logits)[next_ref]. A loss meter for
+ * throughput experiments: same engine path as decode, so hit rate/speed stay
+ * comparable, but quality is measured as perplexity instead of exact-match.
+ * Cross-checked vs HF transformers bf16 on identical token ids: engine (int8
+ * experts) 12.11 ppl vs reference 12.25 (#108). Enabled by PPL=1. */
+static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
+    Cfg *c = &m->c;
+    m->max_t = nfull;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+    double nll = 0; int scored = 0;
+    float *logit = step(m, full, np, 0);              /* prefill on the prompt */
+    for (int i = np; i < nfull; i++) {
+        /* log softmax(logit)[full[i]] without materializing the softmax */
+        float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
+        double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
+        nll += -((double)logit[full[i]] - mx - log(Z));
+        scored++;
+        free(logit); logit = NULL;
+        if (i == nfull - 1) break;
+        logit = step(m, &full[i], 1, i);              /* teacher forcing */
+    }
+    if (logit) free(logit);
+    *nll_out = nll / scored;
+    return scored;
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -376,6 +460,19 @@ int main(int argc, char **argv) {
     printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+
+    if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
+        double nll; double t = now_s();
+        int scored = tf_nll(&m, full, nfull, np, &nll);
+        double dt = now_s() - t;
+        double tot = m.hits + m.miss;
+        printf("TF-NLL: %.4f nats/token over %d tokens  |  ppl = %.2f\n", nll, scored, exp(nll));
+        printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+        free(buf); free(arena);
+        return 0;
+    }
 
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();

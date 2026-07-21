@@ -23,7 +23,18 @@ Configuration through environment variables or flags (also valid after the subco
   --ngen N           maximum response tokens           --cap N    cache slots/layer
   --verbose          pass engine stderr through (or COLI_VERBOSE=1)
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
+
+# The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
+if sys.platform != "win32":
+    try:
+        import resource
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        _want = min(65536 if _hard == resource.RLIM_INFINITY else _hard, 65536)
+        if _soft < _want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+    except (ImportError, ValueError, OSError):
+        pass
 
 # Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
 if sys.platform == "win32":
@@ -32,9 +43,37 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.join(HERE, "tools")
-GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
-HY3  = os.path.join(HERE, "hy3" + (".exe" if sys.platform == "win32" else ""))
+sys.path.insert(0, HERE)
+from version import __version__ as _version
+
+# Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
+# support modules (resource_plan.py, doctor.py, openai_server.py) and
+# tools/ all live next to this script — unchanged from before.
+#
+# Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
+# while the engine binaries and support files live in
+# $(PREFIX)/libexec/colibri, since they aren't meant to be run directly
+# by users. COLI_ENGINE overrides the engine path explicitly if neither
+# guess is right (e.g. a custom packaging layout).
+_EXE = ".exe" if sys.platform == "win32" else ""
+_LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_glm = os.path.join(HERE, "glm" + _EXE)
+_here_hy3 = os.path.join(HERE, "hy3" + _EXE)
+
+if os.environ.get("COLI_ENGINE"):
+    GLM = os.environ["COLI_ENGINE"]
+    HY3 = os.environ.get("COLI_HY3_ENGINE", os.path.join(os.path.dirname(GLM), "hy3" + _EXE))
+    TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_glm) or os.path.exists(_here_hy3):
+    GLM = _here_glm
+    HY3 = _here_hy3
+    TOOLS = os.path.join(HERE, "tools")
+else:
+    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    HY3 = os.path.join(_LIBEXEC, "hy3" + _EXE)
+    TOOLS = os.path.join(_LIBEXEC, "tools")
+    sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
+
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 
 def python_for_tools():
@@ -165,7 +204,7 @@ def engine_label(model=None):
 def banner(sub="", model=None):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
+        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         model_tag(model),
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -197,15 +236,21 @@ def cuda_binary(engine=None):
     if sys.platform == "win32":
         try:
             with open(engine,"rb") as stream:
-                return b"amdhip64.dll" in stream.read().lower()
+                data = stream.read()
+            if b"amdhip64.dll" in data.lower():
+                return True
+            built = (b"[CUDA] mode: routed experts" in data or
+                     b"[ROCm] mode: routed experts" in data)
         except OSError:
             return False
+        return built and os.path.exists(os.path.join(os.path.dirname(engine),"coli_cuda.dll"))
     if sys.platform != "linux": return False
     try:
         linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
         return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                    for line in linked.stdout.splitlines())
     except (OSError,subprocess.SubprocessError): return False
+
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
@@ -272,6 +317,34 @@ def apply_accel_env(e, a, engine):
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
     normalize_rocm_env(e)
+    if sys.platform == "win32":
+        # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
+        # self-exec di glm.c; presence-based come nel motore: impostarla a
+        # qualsiasi valore, anche 0, disattiva). I default I/O piu' sotto
+        # restano attivi: kill-switch dedicati = le var stesse (DIRECT=0 ecc.)
+        if not e.get("COLI_NO_OMP_TUNE"):
+            # parita' col tuning OMP self-exec di glm.c (solo Linux/FreeBSD, e
+            # comunque saltato sotto CUDA/Metal): libgomp legge queste variabili
+            # prima di main, quindi su Windows vanno nell'ambiente del figlio.
+            # niente OMP_PROC_BIND/OMP_PLACES: la libgomp di MinGW non supporta
+            # l'affinity su Windows ("Affinity not supported on this configuration")
+            from resource_plan import physical_cpu_count
+            for k, v in (("OMP_WAIT_POLICY", "active"),
+                         ("GOMP_SPINCOUNT", "200000"),
+                         ("OMP_DYNAMIC", "FALSE"),
+                         ("OMP_NUM_THREADS", str(physical_cpu_count()))):
+                e.setdefault(k, v)
+        # Default Windows misurati sul box di riferimento (docs/tuning-9950x3d-5090.md),
+        # tutti lossless e tutti setdefault (un override esplicito vince sempre):
+        # - DIRECT=1: 10.7 GB/s O_DIRECT vs 9.0 buffered (iobench, anche a cache
+        #   calda); nel motore 0.48 -> 1.02 tok/s. Upstream #162: 1.47x.
+        # - PIPE=1: overlap load/matmul, +8% sopra DIRECT (byte-identico, riordina
+        #   solo l'I/O). PIPE_WORKERS resta al default 8 (sweep 4/8/16 piatto).
+        # - PILOT_REAL=1: prefetch cross-layer con load veri (unico prefetch
+        #   funzionante su Windows: fadvise e' no-op), +11%, hit rate +19 punti.
+        e.setdefault("DIRECT", "1")
+        e.setdefault("PIPE", "1")
+        e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
     if engine_for(a.model) == HY3 and "IDOT" not in e:
         e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
@@ -430,11 +503,51 @@ def tail_errlog(path, max_lines=40, max_chars=4000):
     except OSError:
         pass
 
+def engine_diag(p, errlog=None):
+    """Lo stdout del motore ha chiuso: il processo e' morto. Dire PERCHE'.
+    Un SIGKILL dell'OOM-killer del kernel e' altrimenti invisibile — niente errore,
+    niente exit code, il motore muore muto e sembra un bug nostro (issue #305).
+    Quasi sempre e' memoria: il picco reale ha sforato la RAM della macchina."""
+    try: rc=p.wait(timeout=5)
+    except Exception: rc=p.poll()
+    if rc is None:                      why="its output closed but the process is still alive"
+    elif rc<0:                                        # POSIX: morte per segnale
+        try: why=f"killed by {signal.Signals(-rc).name}"
+        except Exception: why=f"killed by signal {-rc}"
+    elif rc>0:                          why=f"exit code {rc}"
+    else:                               why="exited cleanly"
+    print(f"\n  {C.yel}[engine terminated: {why}]{C.r}")
+    if rc is not None and rc<0 and -rc==getattr(signal,"SIGKILL",-1):
+        print(f"  {C.yel}nothing in the engine sends SIGKILL to itself: this is the kernel's\n"
+              f"  OOM-killer. The peak RSS exceeded the machine's free memory.\n"
+              f"  Lower --ram, lower PIN_GB, or shorten the context.{C.r}")
+    if errlog is not None:
+        try:
+            errlog.flush()
+            for _ in range(20):         # il drain thread scrive su errlog quando il child chiude
+                tail=open(errlog.name).read().strip()
+                if tail: break
+                time.sleep(0.05)
+            if tail: print(f"  {C.dgray}" + "\n  ".join(tail.splitlines()[-6:]) + f"{C.r}")
+        except Exception: pass
+
+
 def stream_turn(p, sentinel, on_bytes):
-    """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT."""
-    pend=b""
+    """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT.
+    Il PRIMO Ctrl-C durante lo stream non chiude la sessione: il motore (handler SIGINT)
+    chiude il turno per la via del tetto NGEN e noi dreniamo fino alla sentinella.
+    Un SECONDO Ctrl-C esce davvero."""
+    pend=b""; interrupted=False
     while True:
-        b=p.stdout.read(1)
+        try:
+            b=p.stdout.read(1)
+        except KeyboardInterrupt:
+            if interrupted or p.poll() is not None: raise
+            interrupted=True
+            try: p.send_signal(signal.SIGINT)   # non-TTY: il motore potrebbe non aver visto il Ctrl-C
+            except Exception: pass
+            print(f"\n  {C.yel}⏹ stopping… (Ctrl-C again to quit){C.r}", flush=True)
+            continue
         if b==b"": return None
         pend+=b
         if pend.endswith(sentinel):
@@ -445,6 +558,7 @@ def stream_turn(p, sentinel, on_bytes):
             if not m: return {}
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))}
             if m.group(7) is not None: st["decode_tps"]=float(m.group(7))
+            if interrupted: st["interrupted"]=True
             return st
         if len(pend)>len(sentinel):
             out=pend[:-len(sentinel)]; pend=pend[-len(sentinel):]
@@ -453,6 +567,9 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
+    if not os.path.exists(os.path.join(HERE, "Makefile")):
+        sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
     command=["make","-C",HERE,"glm","hy3"]
     if os.environ.get("COLI_BACKEND","").lower() in ("rocm","hip"):
         command.append("ROCM=1")
@@ -571,14 +688,140 @@ def cmd_run(a):
         e["PROMPT"]=prompt
         e["CHAT_TEMPLATE"]="0"
     else:
-        e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
+        tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+        e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([eng, *engine_argv(a.model, a.cap)], env=e))
 
+def server_probe(base, api_key=None, timeout=1.5):
+    """Is a coli serve alive at `base`? Returns its model_id, or None.
+    Probes /health then /v1/models — both cheap, neither touches the engine."""
+    import urllib.request, urllib.error
+    def get(path):
+        req=urllib.request.Request(base.rstrip("/")+path)
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace"))
+    try:
+        if get("/health").get("status")!="ok": return None
+        data=get("/v1/models").get("data") or []
+        return data[0]["id"] if data else None
+    except Exception:
+        return None
+
+def chat_attached(a, base, model_id):
+    """The chat REPL over HTTP against a running `coli serve`.
+
+    Why this exists (the cold-chat cost, measured): spawning a private engine
+    pays 34-136 s of resident load on EVERY start, and begins with an empty
+    expert cache — hit rate 4% cold vs 55% warm, a ~10x on early decode. A
+    resident server pays load once and keeps the LRU warm across sessions;
+    its KV slots reuse the conversation prefix, so a continued chat skips
+    re-prefill too. The engine byte-protocol stays untouched — this is plain
+    OpenAI SSE over localhost, stdlib only."""
+    import urllib.request
+    print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
+    msgs=[]
+    w=term_w()-4
+    while True:
+        if TTY:
+            print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+            try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            except EOFError: print(); break
+            print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+        else:
+            try: msg=input()
+            except EOFError: break
+        msg=msg.strip()
+        if msg in (":q",":quit","exit"): break
+        if not msg: continue
+        if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        msgs.append({"role":"user","content":msg})
+        body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
+                         "max_tokens":a.ngen}).encode()
+        req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
+                                   headers={"Content-Type":"application/json"})
+        if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
+        print(f"\n  {C.teal}◆ colibrì{C.r}")
+        sp=Spinner("thinking…"); sp.start()
+        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    data=line[6:]
+                    if data=="[DONE]": break
+                    try: ev=json.loads(data)
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        txt=d.get("content")
+                        if not txt: continue          # ping/ruolo/reasoning: non è testo
+                        if first: sp.stop(); first=False
+                        md.feed(txt); reply.append(txt)
+        except KeyboardInterrupt:
+            interrupted=True                          # il server annulla la richiesta alla disconnessione
+        except OSError as e:
+            sp.stop()
+            print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
+        sp.stop(); md.close()
+        if reply: msgs.append({"role":"assistant","content":"".join(reply)})
+        else: msgs.pop()                              # turno vuoto: non sporcare la history
+        el=time.time()-t0
+        note=" · ⏹ interrupted" if interrupted else ""
+        print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{note}{C.r}\n")
+    print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
+
+def kv_resume_notice(model_dir):
+    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
+    started today continues a conversation from days ago, with `first=0` so the
+    turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
+    on stderr — but nothing here ever shows that: the drain thread's
+    p.stderr.read() blocks until EOF, so on a healthy start errlog is still empty
+    when the status lines are printed. The warning only appeared once the engine
+    DIED, which is exactly when it no longer mattered.
+
+    Measured cost of the silence: a chat inherited 670 tokens of an old Italian
+    session ("il mio numero preferito e 7, ricordalo!"). Every later reply came
+    back in Italian, and "explain fibonacci in short" was answered about the
+    number 7 — the model was being coherent with a context nobody could see, and
+    it read as a quantization bug for a day.
+
+    So say it here, in Python, from the file itself: no pipe, no thread, no
+    Windows deadlock risk (see the stderr comment below)."""
+    p=os.path.join(model_dir, ".coli_kv")
+    try:
+        with open(p,"rb") as f:
+            if f.read(8)!=b"COLIKV1\0": return
+            h=struct.unpack("<8i", f.read(32))
+        n=h[6]
+        if n<1: return
+        age=time.time()-os.path.getmtime(p)
+        when=f"{age/86400:.0f}d ago" if age>86400 else f"{age/3600:.0f}h ago" if age>3600 else "just now"
+        print(f"  {C.yel}↺ resuming a saved conversation: {n} tokens, last written {when}{C.r}")
+        print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
+              f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
+    except (OSError, struct.error): pass
+
 def cmd_chat(a):
+    # ATTACH: a running `coli serve` beats a private engine every time — the load
+    # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
+    # wins; otherwise probe localhost quietly and use it if it's there. --no-attach
+    # forces the old behaviour. The probe costs ~1 ms when nothing is listening.
+    if not getattr(a,"no_attach",False):
+        base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
+        mid=server_probe(base, getattr(a,"api_key",None))
+        if mid:
+            banner(f"chat · {mid} · attached")
+            chat_attached(a, base, mid); return
+        if getattr(a,"attach",None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}", a.model)
     eng=engine_for(a.model)
     verbose=verbose_chat(a)
+    kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False) if not verbose else None
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
@@ -601,7 +844,10 @@ def cmd_chat(a):
             try: errlog.write(p.stderr.read().decode("utf-8","replace"))
             except (OSError, ValueError): pass
             errlog.seek(0); print(errlog.read()[-1500:])
+        engine_diag(p, errlog)
         sys.exit("the engine exited while loading")
+    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+                          # left unread it leaks into the first answer's text
     if not verbose:
         # READY received. Drain the child's stderr into errlog without blocking:
         # the engine is still alive (blocked on stdin), so a plain read() would
@@ -628,7 +874,7 @@ def cmd_chat(a):
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
                     print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
-    print(f"  {C.dim}type and press Enter · :more continues · :reset clears memory · :q exits{C.r}\n")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
     w=term_w()-4
     def user_box(msg):
         """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
@@ -694,6 +940,7 @@ def cmd_chat(a):
             if st is None:
                 if not verbose:
                     tail_errlog(errlog.name)
+                engine_diag(p, errlog)
                 print(f"\n  {C.yel}[engine terminated]{C.r}"); break
             el=time.time()-t0
             if st.get("tok"):
@@ -701,10 +948,13 @@ def cmd_chat(a):
                 if st.get("decode_tps") is not None:
                     rate=f"{st['tps']:.2f} tok/s total · {st['decode_tps']:.2f} tok/s decode"
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {rate} · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
-                if st["tok"]>=a.ngen:
+                if st.get("interrupted"):
+                    print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
+                elif st["tok"]>=a.ngen:
                     print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
                 print()
             else:
+                if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted{C.r}")
                 print()
     except KeyboardInterrupt:
         print(f"\n  {C.dim}interrupted{C.r}")
@@ -716,14 +966,88 @@ def cmd_chat(a):
             except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
+def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+
 def cmd_serve(a):
     need_model(a.model)
     eng=engine_for(a.model)
     from openai_server import serve, default_model_id
     model_id=a.model_id or os.environ.get("COLI_MODEL_ID") or default_model_id(a.model)
-    serve(a.model, a.host, a.port, model_id, a.api_key,
-          a.cap,a.ngen,eng,env_for(a),a.cors_origin,
-          a.max_queue,a.queue_timeout,a.kv_slots)
+    # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
+    try:
+        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+    except OSError: pass
+    try:
+        serve(a.model, a.host, a.port, model_id, a.api_key,
+              a.cap,a.ngen,eng,env_for(a),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots)
+    finally:
+        try: os.unlink(serve_pidfile(a.port))
+        except OSError: pass
+
+def cmd_stop(a):
+    """Shut down a running `coli serve` AND its engine — one command, no pkill.
+    The engine re-execs itself for OMP tuning, so its process is named `exe`,
+    not `glm`: every `pkill -x glm` in history silently killed nothing (that is
+    how two 17+5 GB ghost engines OOM'd this box on 2026-07-16). This finds the
+    real processes: the pidfile first, then /proc by cmdline/environ — only
+    processes that are demonstrably ours (SERVE=1 + our SNAP, or `coli serve`
+    in the command line)."""
+    banner("stop")
+    targets=[]  # (pid, descrizione)
+    pf=serve_pidfile(a.port)
+    try:
+        pid=int(open(pf).read().split()[0])
+        os.kill(pid,0); targets.append((pid,f"coli serve (pidfile, port {a.port})"))
+    except (OSError,ValueError,IndexError): pass
+    for pd in os.listdir("/proc"):
+        if not pd.isdigit(): continue
+        pid=int(pd)
+        try:
+            cmd=open(f"/proc/{pd}/cmdline","rb").read().replace(b"\0",b" ").decode("utf-8","replace")
+            if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
+                if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
+            comm=open(f"/proc/{pd}/comm").read().strip()
+            if comm in ("glm","exe","olmoe"):
+                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
+                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
+        except (OSError,PermissionError): continue
+    if not targets:
+        print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
+    for pid,desc in targets: print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
+    if a.dry_run: return
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    time.sleep(2.0)
+    for pid,_ in targets:
+        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        except OSError: pass       # gia' morto: bene
+    try: os.unlink(pf)
+    except OSError: pass
+    print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+
+def cmd_web(a):
+    """serve + open the dashboard in the browser once the API answers."""
+    need_model(a.model)
+    dist = os.path.join(os.path.dirname(os.path.abspath(HERE)), "web", "dist")
+    if not os.path.exists(os.path.join(dist, "index.html")):
+        print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
+        print("serving the API anyway (the dashboard will 404 until built).")
+    url = f"http://{a.host}:{a.port}/"
+    if not getattr(a, "no_browser", False):
+        import threading, urllib.request, webbrowser
+        def opener():
+            for _ in range(600):                    # the 744B engine takes minutes to load
+                time.sleep(2)
+                try:
+                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=2)
+                    webbrowser.open(url); return
+                except OSError:
+                    continue
+        threading.Thread(target=opener, daemon=True).start()
+    print(f"dashboard: {url}  (opens automatically when the engine is ready)")
+    cmd_serve(a)
 
 def cmd_bench(a):
     need_model(a.model)
@@ -737,7 +1061,17 @@ def cmd_bench(a):
         print(f"  {C.dim}downloading missing datasets: {', '.join(missing)}{C.r}")
         subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
-    cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--snap",a.model,
+        # il fetch riprova da solo (#304), ma se l'hub resta giu' il bench gira sui task
+        # disponibili invece di passare a eval file inesistenti.
+        # EN: the fetch retries on its own (#304), but if the hub stays down the bench
+        # runs on the available tasks instead of handing eval nonexistent files.
+        still=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
+        if still:
+            tasks=",".join(t for t in tasks.split(",") if t not in still)
+            print(f"  {C.yel}skipping (download failed, rerun later): {', '.join(still)}{C.r}")
+            if not tasks:
+                print(f"  {C.yel}no datasets available — nothing to bench{C.r}"); sys.exit(1)
+    cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--glm", GLM, "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
     e=env_for(a)
@@ -784,6 +1118,7 @@ def main():
     common.add_argument("--verbose", action="store_true",
                         help="pass engine stderr through (or set COLI_VERBOSE=1)")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
+    ap.add_argument("--version", action="version", version=f"colibrì {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
@@ -800,7 +1135,14 @@ def main():
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
-    sub.add_parser("chat", parents=[common])
+    pc=sub.add_parser("chat", parents=[common])
+    pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
+                    help="chat against a running `coli serve` instead of spawning an engine "
+                         "(keeps the model loaded and the expert cache warm across chat sessions). "
+                         "Bare --attach probes localhost:8000.")
+    pc.add_argument("--no-attach", action="store_true",
+                    help="never auto-attach, always spawn a private engine")
+    pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=None)
@@ -809,15 +1151,33 @@ def main():
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
+    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
+    for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
+                   ("--cors-origin",dict(action="append",default=None)),
+                   ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
+                   ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
+                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1"))))):
+        pw.add_argument(arg,**kw)
+    pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
-    pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
+    pb.add_argument("--limit",type=int,default=40)
+    if sys.platform == "win32":
+        _cache_root = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
+    else:
+        _cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    _bench_cache = os.path.join(_cache_root, "colibri", "bench")
+    pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"rocm-plan":cmd_rocm_plan,"doctor":cmd_doctor,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"bench":cmd_bench,
-             "convert":cmd_convert}.get(a.cmd)
+             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
