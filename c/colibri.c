@@ -1390,9 +1390,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
-    char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
+     * nm[k]/qn snprintfs can't overflow: worst key is "model.layers.<i>.mlp.experts.<i>.down_proj.weight"
+     * = 66 bytes incl NUL, well under nm[288] and qn[320]. See #484. */
+    char nm[3][288]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
-    char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    char qn[320]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
                                                   * Reachable ONLY for unquantized models (no .qs);
                                                   * GLM always has .qs, so the pilot never hits it. */
@@ -1663,7 +1666,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int li=b->nload++;
     UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
-    char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    char nm[3][288],qn[320]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(g_mmap || !st_has(&m->S,qn))
@@ -5639,12 +5642,12 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
     if(!cnt||!first){ free(cnt); free(first); return; }
     for(int i=0;i<NR;i++) first[i]=-1;
     for(int a=from;a<to;a++){ if(first[r[a].l]<0) first[r[a].l]=a; cnt[r[a].l]++; }
-    const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int l=0;l<NR;l++){
         if(cnt[l]<2) continue;
         int64_t wtot=0, qtot=0; int ok=1;
         for(int k=0;k<3 && ok;k++){
-            char nm[288],qn[300];
+            char nm[288],qn[320];
             snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
             snprintf(qn,sizeof qn,"%s.qs",nm);
             st_tensor *tw=st_find(&m->S,nm), *tq=st_find(&m->S,qn);
