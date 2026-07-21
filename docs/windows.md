@@ -8,6 +8,8 @@ A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 
 |---|---|---|
 | git, Python 3 | clone + `coli` launcher | winget / python.org |
 | MinGW-w64 gcc + make | builds the engine (MSVC can't) | `scoop install mingw-winlibs`, MSYS2, or portable **w64devkit** (no admin, unzip and go) |
+
+> **scoop MinGW caveat (#478):** `scoop install mingw-winlibs` ships `gcc` + `make` but **no `sh.exe`** — the Makefile's recipes use POSIX shell idioms (`command -v`, `{ ...; }`, redirect to `/dev/null`) that GNU make runs through `/bin/sh`. Without sh.exe on PATH, make falls back to `cmd.exe` and the build fails with `'printf' is not recognized` / `The system cannot find the path specified`. Two fixes: install **MSYS2** (recommended — it's what the recipes target), or `set PATH=%PATH%;C:\msys64\usr\bin` in any shell you build from. The portable **w64devkit** bundle includes sh.exe and works as-is.
 | CUDA Toolkit ≥ 12.8 | GPU tier; ≥12.8 required for Blackwell/sm_120 | `winget install Nvidia.CUDA` |
 | MSVC Build Tools (C++ workload) | nvcc's host compiler for the CUDA DLL | `winget install Microsoft.VisualStudio.2022.BuildTools` + "Desktop development with C++" |
 | ~400 GB free on a local NVMe | the int4 model (~370–384 GB) | NTFS is fine; **never** a network mount |
@@ -54,6 +56,12 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 
 nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Then:
 
+> **The VS prompt has no `sh.exe` (#478):** that prompt is a `cmd.exe` shell, and the `cuda-dll` recipe uses POSIX idioms (`command -v`, `{ ...; }`) that need `/bin/sh`. Run this once in the VS prompt before building:
+> ```cmd
+> set PATH=%PATH%;C:\msys64\usr\bin
+> ```
+> (adjust the path if you installed MSYS2 elsewhere). If you skipped MSYS2 in favor of w64devkit or scoop MinGW, point this at wherever `sh.exe` lives.
+
 ```cmd
 make cuda-dll CUDA_ARCH=sm_120        # match your GPU: sm_120 Blackwell, sm_89 Ada, ...
 make glm.exe CUDA_DLL=1 ARCH=native   # relink host with the runtime loader
@@ -91,6 +99,7 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `'printf' is not recognized` / `The system cannot find the path specified` during `make glm.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |
 | `glm.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete `glm.exe` and rebuild |

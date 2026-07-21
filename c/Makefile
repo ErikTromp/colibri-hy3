@@ -228,7 +228,13 @@ glm: colibri$(EXE)
 BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
-$(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
+# $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
+# spawning a shell. The earlier `$(shell printf '%s' ... > .build-config)`
+# required a POSIX `printf` on PATH — present under MSYS2/Git-Bash but NOT under
+# cmd.exe, so `make glm.exe` from the VS Native Tools prompt or with scoop MinGW
+# (neither ships sh.exe) failed with "'printf' is not recognized" and left the
+# stamp stale. $(file ...) works regardless of the shell make falls back to. (#478)
+$(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
