@@ -15,6 +15,9 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
 Configuration through environment variables or flags (also valid after the subcommand):
   COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
+  COLI_MODEL_MIRROR=<dir>  second copy of the model on another drive: expert reads
+                     are split across both SSDs (COLI_DISK_WEIGHTS=9,3 sets the
+                     primary,mirror bandwidth ratio; default: measured at startup)
   --ram N            RAM budget in GB (automatically sizes the expert cache)
   --repin N          adapt RAM/VRAM experts every N tokens
   --topp P           adaptive expert top-p             --topk N   fixed top-k
@@ -245,7 +248,14 @@ def env_for(a):
         # has working detection + the explicit-flag UX, and changing bare-chat
         # semantics there is out of scope. Falls back to CPU with a warning if
         # nvidia-smi is missing (discover_gpus can't size VRAM without it).
-        if (sys.platform == "win32" and a.gpu is None and not a.vram):
+        # An explicit COLI_CUDA=0 in the environment must win over the implicit
+        # auto-enable: before this check, a Windows user setting COLI_CUDA=0 for
+        # a CPU baseline silently got a ~12.6 GB VRAM expert tier anyway (the
+        # engine's "CPU" rows were GPU-assisted). --gpu none remains the
+        # canonical hard off-switch (works on every platform, also clears the
+        # CUDA_* sizing vars).
+        if (sys.platform == "win32" and a.gpu is None and not a.vram
+                and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
                 from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
                 gpus = discover_gpus()
@@ -274,6 +284,11 @@ def env_for(a):
                           f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
                           f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
             # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
+        elif e.get("COLI_CUDA") == "0":
+            # honoured off-switch: also drop stale device/sizing vars so the
+            # engine can't be re-enabled by leftovers (same as --gpu none).
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:

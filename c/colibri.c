@@ -256,9 +256,17 @@ static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
 static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
 
+/* fmt=4 fused gate+up (defined later, after the quant kernels) */
+static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
+                                    const uint8_t *qg, const float *sg,
+                                    const uint8_t *qu, const float *su,
+                                    int S, int I, int O, int gs);
+
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
+    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
+        matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
 
@@ -448,6 +456,70 @@ static float *falloc(int64_t n){
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 
+
+/* Fused gate+up for grouped int4 (fmt=4): computes both yg[S,O] and yu[S,O] from
+ * the same x[S,I], reading x once instead of twice — saves ~33% of expert-matmul time at decode.
+ * The per-group scale logic matches matmul_i4_grouped exactly. */
+static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
+                                    const uint8_t *qg, const float *sg,
+                                    const uint8_t *qu, const float *su,
+                                    int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
+        const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float ag=0, au=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float scg=sgl[g], scu=sul[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 accg=_mm256_setzero_ps(), accu=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){
+                    __m128i byg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
+                    __m128i log=_mm_and_si128(byg,m4),hig=_mm_and_si128(_mm_srli_epi16(byg,4),m4);
+                    __m128i nibg=_mm_unpacklo_epi8(log,hig);
+                    __m256 w0g=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nibg),b8));
+                    __m256 w1g=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nibg,8)),b8));
+                    accg=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0g, accg);
+                    accg=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1g, accg);
+                    __m128i byu=_mm_loadl_epi64((const __m128i*)(wu2+(i>>1)));
+                    __m128i lou=_mm_and_si128(byu,m4),hiu=_mm_and_si128(_mm_srli_epi16(byu,4),m4);
+                    __m128i nibu=_mm_unpacklo_epi8(lou,hiu);
+                    __m256 w0u=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nibu),b8));
+                    __m256 w1u=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nibu,8)),b8));
+                    accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0u, accu);
+                    accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1u, accu);
+                }
+                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+#endif
+                for(; i+1<base+glen; i+=2){
+                    uint8_t bg=wg[i>>1], bu=wu2[i>>1];
+                    ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
+                    au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                }
+                if(i<base+glen){
+                    uint8_t bg=wg[i>>1], bu=wu2[i>>1];
+                    ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
+                    au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                }
+            }
+            yg[(int64_t)s*O+o]=ag; yu[(int64_t)s*O+o]=au;
+        }
+    }
+}
+
+/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
+ * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
+ * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
+ * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
+ * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
+ * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
+ * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
     if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
@@ -459,7 +531,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
@@ -524,12 +596,6 @@ static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward v
  * parte (#8). MAI un vincolo sul sampling: solo proposte, la verifica batch-union
  * decide — grammatica sbagliata = draft rifiutati, output identico.
  * GRAMMAR_DRAFT=n (default 24) limita i token forzati per forward. */
-static Grammar g_gram; static GrState g_gst;
-static Tok *g_gr_T=NULL;
-static int g_gr_on=0;     /* grammatica caricata e walker vivo */
-static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
-static int g_gr_max=24;
-static uint64_t g_gr_prop=0, g_gr_acc=0;
 static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
                                * per layer — offline co-activation / coupling analysis. Zero
                                * effect on computation; measurement only. */
@@ -549,6 +615,19 @@ static int g_couple=0, g_couple_k=8, g_couple_d=1;
 static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
 static float   *cp_cnt=NULL;
 static long g_cp_enq=0;
+/* All grammar-forced-draft state in one struct so it can become per-request
+ * in the multiplexed server. Fields (same semantics as the former globals):
+ * on = grammar loaded and walker alive; armed = lazy start from the first byte
+ * accepted at the root (skips preambles); max = forced-span cap per forward;
+ * prop/acc = proposed/accepted forced-draft counters. */
+typedef struct {
+    Grammar gram;
+    GrState st;
+    Tok *T;
+    int on, armed, max;
+    uint64_t prop, acc;
+} GrDraft;
+static GrDraft g_grd={.max=24};   /* process-level instance: PROMPT mode + run_serve keep using this */
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke);
 static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
                           * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
@@ -654,6 +733,11 @@ static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer de
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
+static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old behavior (a speculation evicts the plain LRU).
+                          * Default ON: a speculative pilot load may evict a RESIDENT expert only if the
+                          * predicted expert is historically HOTTER than the victim (same LFRU hysteresis as
+                          * tier_pick_lfru); otherwise it drops the speculation rather than thrash a warm
+                          * demand-loaded expert. Cache placement only -> output byte-identical. (#441) */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
  *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
  *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
@@ -934,13 +1018,14 @@ static void qt_cuda_colocate(QT *dst,const QT *src){
 }
 static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
-    int rb=l->kv_b.fmt==1?l->kv_b.I:(l->kv_b.fmt==2?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4);
+    int rb=l->kv_b.fmt==1?l->kv_b.I:
+           (l->kv_b.fmt==2||l->kv_b.fmt==4)?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4;
     const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
     for(int d=0,h0=0;d<g_cuda_ndev;d++){
         int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
         const void *part=weights+(int64_t)h0*(Q+V)*rb;
-        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V);
-        if(!coli_cuda_tensor_upload(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d]))return;
+        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V)*(l->kv_b.gs>0?(l->kv_b.I+l->kv_b.gs-1)/l->kv_b.gs:1);
+        if(!coli_cuda_tensor_upload_g(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d],l->kv_b.gs))return;
         l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
     }
     int old=-1;for(int i=0;i<g_cuda_ndev;i++)if(g_cuda_devices[i]==l->kv_b.cuda_device)old=i;
@@ -951,7 +1036,9 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
-    load_cfg(&m->c,snap); st_init(&m->S,snap);
+    load_cfg(&m->c,snap);
+    { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
+      st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
@@ -1122,6 +1209,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==4){ /* grouped int4: per-group scale (embed/lm_head at io_bits, usually fmt 0/1) */
+        const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); int gs=e->gs,ng=(D+gs-1)/gs;
+        const float *scl=e->s+(int64_t)tok*ng;
+        for(int g=0;g*gs<D;g++){ int base=g*gs,glen=gs; if(base+glen>D)glen=D-base; float s=scl[g];
+            for(int i=base;i+1<base+glen;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
+                x[i+1]=(float)((int)(byte>>4)-8)*s; }
+            if(glen&1){ uint8_t byte=q[(base+glen-1)>>1]; x[base+glen-1]=(float)((int)(byte&0xF)-8)*s; } }
+        return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
@@ -1173,6 +1268,57 @@ static void *map_of_fd(int fd){
 #endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;
+}
+
+/* ==================== DUAL-SSD: two model copies, two drives ====================
+ * COLI_MODEL_MIRROR=<dir> registers a SECOND (read-only) copy of the model on
+ * another drive; expert reads are split between the two according to
+ * COLI_DISK_WEIGHTS=<primary>,<mirror> (relative bandwidth; without the env it
+ * is measured at startup with the engine's own access pattern). Cold decode is
+ * disk-bound (~11 GB/token): two NVMe drives reading in parallel add up. */
+static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR */
+static int g_mirror=0;                 /* 1 = mirror active (at least one shard accepted) */
+static int g_mir_share=64;             /* expert share routed to the mirror, out of 256 */
+static _Atomic int64_t g_mir_bytes[2]; /* bytes served per drive: [0] primary, [1] mirror */
+static _Atomic int64_t g_mir_nread[2];
+
+/* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
+ * requirement, not a style choice: the readahead/PILOT WILLNEED and the demand
+ * pread must hit the same fd/page-cache, and in buffered mode an expert must
+ * never be cached twice (one copy per drive). */
+static inline int expert_route(int layer,int eid){
+    if(!g_mirror) return 0;
+    uint32_t h=(uint32_t)layer*2654435761u ^ (uint32_t)eid*0x9E3779B9u;
+    h^=h>>16; h*=0x45d9f3bu; h^=h>>16;
+    return (int)(h&255) < g_mir_share;
+}
+
+/* buffered fd of the replica, falling back to the primary if the file is not mirrored */
+static inline int rep_bfd(shards *S,int fd,int rep){
+    int r=st_fd_rep(S,fd,rep); return r<0?fd:r;
+}
+
+static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag);
+
+/* pread on the chosen replica with fallback to the primary on error/short-read:
+ * an unreadable sector (or an unmount) of the mirror must never kill the process
+ * when the primary can serve the same bytes. Delegates to pread_full so the
+ * mirror path inherits the short-read/EINTR loop and honest reporting (#236).
+ * Accounts bytes per drive. Returns 0 = ok, -1 = real error/EOF (like pread_full). */
+static ssize_t mir_pread(shards *S,int fd,int rep,void *buf,int64_t n,int64_t off,const char *tag){
+    int rfd = st_fd_rep(S,fd,rep);
+    int used = rep && rfd>=0;
+    if(rfd<0) rfd=fd;
+    int rc=pread_full(rfd,buf,n,off,tag);
+    if(rc && used){
+        static _Atomic int warned;
+        if(!atomic_exchange(&warned,1))
+            fprintf(stderr,"[MIRROR] read error on the mirror copy — falling back to the primary drive\n");
+        used=0; rc=pread_full(fd,buf,n,off,tag);
+    }
+    if(!rc){ atomic_fetch_add_explicit(&g_mir_bytes[used],n,memory_order_relaxed);
+             atomic_fetch_add_explicit(&g_mir_nread[used],1,memory_order_relaxed); }
+    return rc;
 }
 
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
@@ -1270,10 +1416,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         else                  { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED);
                                 __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
     }
+    int rep=expert_route(layer,eid);             /* DUAL-SSD: this expert's replica */
+    if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
-            bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
+            bw[k]=map_of_fd(rep_bfd(&m->S,tw[k]->fd,rep)); bq[k]=map_of_fd(rep_bfd(&m->S,tq[k]->fd,rep));
             if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
         }
         if(okm){
@@ -1308,7 +1456,9 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                  * the final resident set only, after GPU release has already nulled out the
                  * pointers for anything that isn't genuinely RAM-tier. */
                 atomic_fetch_add_explicit(&g_prof_io,(int64_t)(n+nq),memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_bytes[rep],tw[k]->nbytes+tq[k]->nbytes,memory_order_relaxed);
             }
+            atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             s->eid=eid; return 0;
         }
     }
@@ -1387,7 +1537,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     int64_t pos[3]; int done=0, dc_direct=0;
     if(contig){
         int64_t off0=tw[ord[0]]->off;
-        int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;
+        int dfd = g_direct ? st_direct_fd_rep(&m->S, tw[ord[0]]->fd, rep) : -1;
         if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
             int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
             int64_t len=(need+4095)&~4095LL;
@@ -1395,10 +1545,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             if(r>=need){
                 pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
                 pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1; dc_direct=1;
+                atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1);
+            if(mir_pread(&m->S, tw[ord[0]]->fd, rep, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1);
                 if(dc_on) dc_wall_exit(dc_cls,now_s());   /* pair the enter on the non-fatal unwind */
                 return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
@@ -1407,14 +1559,14 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1);
+            if(mir_pread(&m->S, tw[k]->fd, rep, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1);
                 if(dc_on) dc_wall_exit(dc_cls,now_s());   /* pair the enter on the non-fatal unwind */
                 return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1);
+        if(mir_pread(&m->S, tq[k]->fd, rep, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1);
             if(dc_on) dc_wall_exit(dc_cls,now_s());       /* pair the enter on the non-fatal unwind */
             return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
@@ -1430,9 +1582,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             atomic_fetch_add_explicit(&g_dc_direct_n[dc_cls],1,memory_order_relaxed);
     }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
-                                                  * cache in pressione strangoli il throughput */
-        posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
-        for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd, tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
+                                                  * cache in pressione strangoli il throughput.
+                                                  * The drop targets the fd of the replica READ. */
+        posix_fadvise(rep_bfd(&m->S,tw[ord[0]]->fd,rep), tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
+        for(int k=0;k<3;k++) posix_fadvise(rep_bfd(&m->S,tq[k]->fd,rep), tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
@@ -1835,15 +1988,17 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
  * Le scale .qs restano SEMPRE bufferizzate (pread sul fd normale), quindi il loro
  * WILLNEED resta utile anche con DIRECT=1. fadvise e' solo consultivo: saltarlo non
  * cambia mai l'output (bit-identico), riduce solo I/O sprecato.
+ * The readahead targets the SAME replica that will serve the pread (expert_route
+ * is deterministic).
  * EN: under O_DIRECT the weights bypass the page cache, so their WILLNEED is wasted;
  * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
 static void expert_prefetch(Model *m, int layer, int eid){
-    char nm[300];
+    char nm[300]; int rep=expert_route(layer,eid);
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]);
-        if(!g_direct) st_prefetch(&m->S,nm);
-        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
+        if(!g_direct) st_prefetch_rep(&m->S,nm,rep);
+        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch_rep(&m->S,qs,rep);
     }
 }
 
@@ -1885,6 +2040,13 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     int I=t->I;
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
+        else if(t->fmt==4){ /* grouped int4: per-group scale */
+            const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); int gs=t->gs,ng=(I+gs-1)/gs;
+            const float *scl=t->s+(int64_t)row*ng;
+            for(int g=0;g*gs<I;g++){ int base=g*gs,glen=gs; if(base+glen>I)glen=I-base; float sc=scl[g]; float acc=0;
+                for(int i=base;i+1<base+glen;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+                if(glen&1){ uint8_t b=w[(base+glen-1)>>1]; acc+=((int)(b&0xF)-8)*x[base+glen-1]; }
+                a+=acc*sc; } }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
@@ -3270,7 +3432,16 @@ static void pilot_realload(Model *m, int layer, int eid){
     for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
     int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
     if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
+    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
+        /* LFRU eviction guard (#441): a speculation must not drop a WARM demand-loaded expert.
+         * Evict only if the predicted expert's history is hotter than the victim by tier_pick_lfru's
+         * hysteresis (25% + 4 freq); else drop the speculation. Cache placement only -> output unchanged. */
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
+            int vid=Sl[lru].eid;
+            uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
+            uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+            if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                        pthread_mutex_unlock(&g_pilot_mx); return; } } }
     ESlot *dst=&Sl[slot];
     dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
     g_pilot_inflight[layer]++;
@@ -3320,6 +3491,14 @@ static void pilot_uring_batch(Model *m){
                 if(Sl[z].eid==-1){ slot=z; break; }
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
+            }
+            /* LFRU eviction guard (#441): don't drop a warm resident for a speculation (see pilot_realload) */
+            if(slot>=0 && Sl[slot].eid>=0 && g_pilot_evict_guard && m->eheat && m->elast){
+                int vid=Sl[slot].eid;
+                uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                            pthread_mutex_unlock(&g_pilot_mx); continue; }
             }
         }
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
@@ -4004,10 +4183,36 @@ static void repin_pass(Model *m){ repin_pass_limit(m,16); }
  * grammar_draft propone lo span FORZATO successivo (un solo byte legale per posizione)
  * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
  * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
-static void grammar_setup(Tok *T){
+/* Compile grammar TEXT into g: raw GBNF, or — if the first non-space byte is '{'
+ * — a JSON-Schema compiled via schema_gbnf.h. Takes ownership of txt (always
+ * freed). Fail-soft: returns -1 with g->on=0, engine runs without a grammar. */
+static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
+    const char *p=txt; while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+    if(*p=='{'){
+        char serr[160];
+        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
+        free(txt);
+        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",label,serr); return -1; }
+        txt=gbnf;
+    }
+    if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
+    free(txt);
+    gr_state_init(&g->st,&g->gram);
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(g->max<1) g->max=24;
+    if(g->max>48) g->max=48;
+    g->T=T; g->on=1; g->armed=0;
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",label,g->gram.n,g->max);
+    return 0;
+}
+/* Release a per-request grammar so the slot can host the next request (keeps max). */
+static void grammar_teardown(GrDraft *g){
+    if(g->gram.n) gr_free(&g->gram);
+    int max=g->max; memset(g,0,sizeof(*g)); g->max=max;
+}
+static void grammar_setup(GrDraft *g, Tok *T){
     /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
-     * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
-     * runs without a grammar and output is unchanged. */
+     * to GBNF. Both fail soft: the engine runs without a grammar, output unchanged. */
     const char *gf=getenv("GRAMMAR");
     const char *sf=(gf&&*gf)?NULL:getenv("SCHEMA");
     if((!gf||!*gf)&&(!sf||!*sf)) return;
@@ -4019,59 +4224,45 @@ static void grammar_setup(Tok *T){
     if(!txt || fread(txt,1,(size_t)n,f)!=(size_t)n){
         fprintf(stderr,"[GRAMMAR] failed to read %s\n",path); fclose(f); free(txt); return; }
     fclose(f); txt[n]=0;
-    if(sf){ /* schema -> GBNF, then the same gr_parse as the GRAMMAR path */
-        char serr[160];
-        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
-        free(txt);
-        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",sf,serr); return; }
-        txt=gbnf;
-    }
-    if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g_gram.err); free(txt); return; }
-    free(txt);
-    gr_state_init(&g_gst,&g_gram);
-    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
-    if(getenv("GRAMMAR_DRAFT")) g_gr_max=atoi(getenv("GRAMMAR_DRAFT"));
-    if(g_gr_max<1) g_gr_max=1;
-    if(g_gr_max>48) g_gr_max=48;
-    g_gr_T=T; g_gr_on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g_gram.n,g_gr_max);
+    if(getenv("GRAMMAR_DRAFT")) g->max=atoi(getenv("GRAMMAR_DRAFT"));
+    grammar_setup_text(g,T,txt,path);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
-static void grammar_reset(void){
-    if(!g_gr_on) return;
-    gr_state_init(&g_gst,&g_gram); g_gr_armed=0;
-    if(!g_gst.alive) g_gr_on=0;
+static void grammar_reset(GrDraft *g){
+    if(!g->on) return;
+    gr_state_init(&g->st,&g->gram); g->armed=0;
+    if(!g->st.alive) g->on=0;
 }
 /* consuma i byte di un token emesso. Preambolo (prima dell'arming): ignorato.
  * Desync dopo l'arming: si riarma in attesa del prossimo inizio valido — al peggio
  * i draft vengono rifiutati dalla verifica, l'output non cambia MAI. */
-static void gr_feed(int t){
-    if(!g_gr_on||!g_gr_T) return;
-    char b[64]; int n=tok_decode(g_gr_T,&t,1,b,63);
+static void gr_feed(GrDraft *g, int t){
+    if(!g->on||!g->T) return;
+    char b[64]; int n=tok_decode(g->T,&t,1,b,63);
     for(int i=0;i<n;i++){
-        int r=gr_accept(&g_gst,(unsigned char)b[i]);
-        if(r==1){ g_gr_armed=1; continue; }
-        if(r<0){ g_gr_on=0; return; }                 /* walker spento: fine dei draft */
-        if(!g_gr_armed) continue;                     /* preambolo: aspetta l'inizio */
-        gr_state_init(&g_gst,&g_gram); g_gr_armed=0;  /* desync: riparti dalla radice */
-        if(!g_gst.alive){ g_gr_on=0; return; }
-        if(gr_accept(&g_gst,(unsigned char)b[i])==1) g_gr_armed=1;
+        int r=gr_accept(&g->st,(unsigned char)b[i]);
+        if(r==1){ g->armed=1; continue; }
+        if(r<0){ g->on=0; return; }                   /* walker spento: fine dei draft */
+        if(!g->armed) continue;                       /* preambolo: aspetta l'inizio */
+        gr_state_init(&g->st,&g->gram); g->armed=0;   /* desync: riparti dalla radice */
+        if(!g->st.alive){ g->on=0; return; }
+        if(gr_accept(&g->st,(unsigned char)b[i])==1) g->armed=1;
     }
 }
 /* propone lo span forzato come token (max cap); 0 se la grammatica dirama qui */
-static int grammar_draft(int *draft, int cap){
-    if(!g_gr_on||!g_gr_armed||!g_gr_T||cap<1) return 0;
-    if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* guardia adattiva, come per MTP:
+static int grammar_draft(GrDraft *g, int *draft, int cap){
+    if(!g->on||!g->armed||!g->T||cap<1) return 0;
+    if(g->prop>=32 && g->acc*2<g->prop){              /* guardia adattiva, come per MTP:
         acceptance sotto il 50% = tokenizzazione fuori asse, meglio spegnersi */
-        g_gr_on=0;
+        g->on=0;
         fprintf(stderr,"[GRAMMAR] %.0f%% acceptance after %llu proposals: grammar drafts disabled\n",
-            100.0*g_gr_acc/g_gr_prop,(unsigned long long)g_gr_prop);
+            100.0*g->acc/g->prop,(unsigned long long)g->prop);
         return 0;
     }
-    char fb[512]; int nb=gr_forced(&g_gst,fb,(int)sizeof fb-1);
+    char fb[512]; int nb=gr_forced(&g->st,fb,(int)sizeof fb-1);
     if(nb<=0) return 0;
-    int g=tok_encode(g_gr_T,fb,nb,draft,cap);
-    return g>0?g:0;
+    int nt=tok_encode(g->T,fb,nb,draft,cap);          /* renamed local: 'g' is now the state param */
+    return nt>0?nt:0;
 }
 
 /* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
@@ -4129,12 +4320,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
-        gr_feed(next);                                  /* il walker segue l'output emesso */
+        gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
-        if(g_gr_on){                                    /* metodo F: prima la grammatica — dove
+        if(g_grd.on){                                   /* metodo F: prima la grammatica — dove
                                                          * forza, l'acceptance e' ~1 (#48) */
-            g=grammar_draft(draft,g_gr_max);
+            g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
         }
         if(!g && g_draft>0 && m->has_mtp){
@@ -4156,7 +4347,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g>n_new-emitted) g=n_new-emitted;
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
-        if(gsrc==1) g_gr_prop+=(uint64_t)g;
+        if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
         double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
@@ -4172,9 +4363,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
-            gr_feed(draft[k]); k++;
+            gr_feed(&g_grd,draft[k]); k++;
         }
-        if(gsrc==1) g_gr_acc+=(uint64_t)k;
+        if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
@@ -4308,6 +4499,14 @@ static void profile_print(Model *m, double elapsed){
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
+    if(g_mirror){
+        double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
+        double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
+        printf("MIRROR: primary %.2f GB (%lld reads) | mirror %.2f GB (%lld reads) — %.0f%% of expert bytes from the mirror\n",
+            b0,(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed),
+            b1,(long long)atomic_load_explicit(&g_mir_nread[1],memory_order_relaxed),
+            b0+b1>0?100.0*b1/(b0+b1):0.0);
+    }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -4451,6 +4650,8 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
+    atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
+    atomic_store(&g_mir_nread[0],0); atomic_store(&g_mir_nread[1],0);
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         double tf0=g_prof?now_s():0;
@@ -4476,12 +4677,24 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
-    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
+    int cap=(int)strlen(prompt)+16; int *pids=malloc((cap+2)*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
+    /* GLM prefix (#108): every GLM training sequence starts [gMASK]<sop>; without it the
+     * model is out-of-distribution and generates garbage. Serve/SCORE modes prepend it;
+     * run_text must too. CHAT_TEMPLATE=0 disables (raw prompt, for debugging/non-GLM).
+     * A prompt that already starts with the prefix passes through intact. */
+    int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
+    if(templ){
+        int gmask=tok_id_of(&T,"[gMASK]"), sop=tok_id_of(&T,"<sop>");
+        if(gmask>=0 && sop>=0 && (np<2 || pids[0]!=gmask || pids[1]!=sop)){
+            memmove(pids+2,pids,np*sizeof(int));
+            pids[0]=gmask; pids[1]=sop; np+=2;
+        }
+    }
     printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
@@ -4505,7 +4718,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     ProfBase pb; prof_base(m,&pb);
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
-    grammar_reset();
+    grammar_reset(&g_grd);
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
@@ -4532,8 +4745,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
-    if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
-        100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
+    if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
+        100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
     if(g_disk_split) printf("disk-load split: draft %llu + absorb %llu + verify/main %llu misses | "
            "MTP-layer %llu loads %.2f GB | main-layers %llu loads %.2f GB (MTP %.1f%% of bytes)\n",
         (unsigned long long)m->miss_draft, (unsigned long long)m->miss_absorb,
@@ -4853,8 +5066,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
-static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
-                      int maxctx, int eos){
+static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *grd,
+                      int nctx, int maxctx, int eos){
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
@@ -4875,21 +5088,31 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
+    char *gtxt=NULL;                     /* optional per-request grammar/schema text */
+    if(sub.gbytes){
+        gtxt=malloc((size_t)sub.gbytes+1);
+        if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
+        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
+            free(gtxt); free(raw); free(line); return -1; }
+        gtxt[sub.gbytes]=0;
+    }
     int delim=fgetc(stdin);
     if(delim!='\n'){
         printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
-        free(raw); free(line); return -1;
+        free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
-        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     if(req[sub.slot].active){
-        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
-        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
+    grammar_teardown(&grd[sub.slot]);    /* new request owns the slot's grammar state */
+    if(gtxt) grammar_setup_text(&grd[sub.slot],T,gtxt,"request");   /* fail-soft; owns gtxt */
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
@@ -4915,6 +5138,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
     if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next);
     if(r->emitted>=r->maximum) mux_done(m,sc,r);
     return 1;
@@ -4923,14 +5147,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
-    g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
+    g_draft=0; /* one scheduler owns every forward; MTP/n-gram speculation is not ragged-safe.
+                * Grammar-forced drafts ARE mux-safe (below): a drafting slot leaves the shared
+                * batch for one forward and runs the proven single-sequence verify path
+                * (kv_bind + step_all), exactly like prefill already does per submission. */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
-    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    GrDraft *grd=calloc(nctx,sizeof(*grd));   /* per-slot request grammars (SUBMIT 7th field) */
+    for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx); grd[i].max=24; }
 #ifdef _WIN32
     /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
      * fread() payloads (waits forever for the missing bytes) and expands LF on the
@@ -4978,14 +5206,47 @@ static void run_serve_mux(Model *m, const char *snap){
             else ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
             if(ready)
 #endif
-                if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+                if(mux_submit(m,&T,ctx,req,grd,nctx,maxctx,eos)<0) eof=1;
         }
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[512]; int slots[512], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){
-            rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
+            ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i]; GrDraft *gd=&grd[i];
+            /* grammar-forced drafts (greedy requests only: verification under sampling
+             * needs rejection resampling, out of scope here). The slot leaves the shared
+             * batch for one forward and runs the single-sequence verify path. */
+            int draft[49], k=0;
+            if(gd->on && r->temp==0) k=grammar_draft(gd,draft,gd->max);
+            if(k>0 && sc->len+1+k<maxctx-1){
+                if(sc->len+1+k>=(int)sc->kv.max_t) k=(int)sc->kv.max_t-sc->len-2;
+                if(k<1){ rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i; continue; }
+                kv_bind(m,&sc->kv);
+                int seq[50]; seq[0]=r->pending;
+                memcpy(seq+1,draft,(size_t)k*sizeof(int));
+                float *lo=step_all(m,seq,1+k,sc->len); m->n_fw++;
+                gd->prop+=(uint64_t)k;
+                int done=0;
+                for(int j=0;j<=k && !done;j++){
+                    g_temp=r->temp; g_nuc=r->top_p;
+                    int next=pick_tok(lo+(int64_t)j*m->c.vocab,m->c.vocab,-1);
+                    sc->len++;                       /* seq[j] joins the committed history */
+                    if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
+                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+                    if(gd->on) gr_feed(gd,next);
+                    mux_data(&T,r->id,next);
+                    if(r->emitted>=r->maximum){ mux_done(m,sc,r); done=1; break; }
+                    if(j<k){
+                        if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
+                        gd->acc++;
+                    }
+                }
+                free(lo);
+                continue;                            /* handled outside the shared batch */
+            }
+            rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i;
         }
+        if(S==0) continue;               /* every active slot drafted this round */
         double tf0=g_prof?now_s():0;
         float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
         m->n_fw++;
@@ -4996,13 +5257,15 @@ static void run_serve_mux(Model *m, const char *snap){
             int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next);
             if(r->emitted>=r->maximum) mux_done(m,sc,r);
         }
         free(lo);
     }
     usage_save(m);
-    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
+    for(int i=0;i<nctx;i++){ serve_ctx_free(m,&ctx[i]); grammar_teardown(&grd[i]); }
+    free(ctx); free(req); free(grd);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
@@ -5026,7 +5289,7 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
@@ -5145,7 +5408,7 @@ static void run_serve(Model *m, const char *snap){
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
-        grammar_reset();                         /* nuova risposta = nuovo documento (MORE invece continua) */
+        grammar_reset(&g_grd);                         /* nuova risposta = nuovo documento (MORE invece continua) */
         if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
@@ -5287,6 +5550,71 @@ static void pin_wire(Model *m){
     else
         fprintf(stderr,"[PIN] mlock: %.1f GB wired in physical RAM "
             "(no compression) in %.0fs\n", wired/1e9, now_s()-t0);
+}
+
+/* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
+ * pattern (parallel ~19 MB reads, O_DIRECT twin when available — buffered would
+ * measure the page cache, see iobench's #86 caveat). Reads the largest shard at
+ * deterministic spread-out offsets; ~150 MB per drive, a few hundred ms total. */
+static double mirror_probe_bw(shards *S,int rep){
+    int big=-1; int64_t bsz=0;
+    for(int i=0;i<S->nfd;i++){
+        if(rep && S->mfds[i]<0) continue;
+        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        if(sz>bsz){ bsz=sz; big=i; }
+    }
+    const int64_t blk=19ll<<20; const int NB=8;
+    if(big<0 || bsz<blk*(NB+1)) return 0;
+    int dfd = rep? S->mdfds[big] : S->dfds[big];
+    int fd  = dfd>=0? dfd : (rep? S->mfds[big] : S->fds[big]);
+    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on %s: the probe may read the page cache — "
+                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep?"the mirror":"the primary");
+    double t0=now_s(); int64_t tot=0;
+    #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
+    for(int i=0;i<NB;i++){
+        void *buf;
+        if(!posix_memalign(&buf,4096,blk)){
+            int64_t off=(((bsz-blk)/NB)*i) & ~4095ll;   /* deterministic, spread across the file */
+            ssize_t r=pread(fd,buf,blk,off);
+            if(r>0) tot+=r;
+            compat_aligned_free(buf);
+        }
+    }
+    double dt=now_s()-t0;
+    return (dt>0 && tot>0)? tot/1e9/dt : 0;
+}
+
+/* DUAL-SSD setup: register the mirror copy, derive the read split from
+ * COLI_DISK_WEIGHTS=<primary>,<mirror> or from a startup bandwidth probe.
+ * Runs after model_init (needs the shard index) and BEFORE any pin/autopin
+ * load, so the OMP-parallel pin warmup already streams from both drives. */
+static void mirror_setup(Model *m){
+    if(!g_mirror_dir) return;
+    const char *snap=getenv("SNAP");
+    if(snap && !strcmp(snap,g_mirror_dir)){
+        fprintf(stderr,"[MIRROR] mirror dir equals the model dir — ignored\n"); return;
+    }
+    int nf=st_mirror_init(&m->S,g_mirror_dir);
+    if(nf<=0){
+        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — "
+                       "running on the primary drive only\n",g_mirror_dir);
+        return;
+    }
+    g_mirror=1;
+    double wp=0,wm=0; const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
+    if(w && (sscanf(w," %lf , %lf",&wp,&wm)!=2 || wp<=0 || wm<=0)){
+        fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want e.g. 9,3) — probing instead\n",w);
+        wp=wm=0;
+    }
+    if(wp<=0||wm<=0){
+        wp=mirror_probe_bw(&m->S,0); wm=mirror_probe_bw(&m->S,1); how="measured";
+        if(wp>0&&wm>0) fprintf(stderr,"[MIRROR] probe: primary %.2f GB/s, mirror %.2f GB/s\n",wp,wm);
+        else { wp=wm=1; how="fallback 1:1 (probe failed)"; }
+    }
+    int share=(int)(256.0*wm/(wp+wm)+0.5);
+    g_mir_share = share<1?1 : share>255?255 : share;
+    fprintf(stderr,"[MIRROR] %s: %d/%d shards | read split primary %.0f%% / mirror %.0f%% (%s)\n",
+        g_mirror_dir,nf,m->S.nfd,100.0*(256-g_mir_share)/256,100.0*g_mir_share/256,how);
 }
 
 typedef struct { int l,e; uint32_t c; } PinRec;
@@ -5799,6 +6127,7 @@ int main(int argc, char **argv){
     if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
      * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
      * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
@@ -5842,6 +6171,9 @@ int main(int argc, char **argv){
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
 #endif
     }
+    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* DUAL-SSD: second model copy */
+    if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
+    if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
@@ -5978,6 +6310,9 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
+    /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
+     * OMP-parallel pin warmup already streams from both drives. */
+    mirror_setup(&m);
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){

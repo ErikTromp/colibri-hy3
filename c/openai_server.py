@@ -370,6 +370,21 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# Generic whitespace-tolerant JSON grammar for response_format {"type": "json_object"}.
+# Draft-source semantics: positions with one legal byte draft; jws points just keep
+# the walker alive through the model's own spacing (see docs/grammar-draft.md).
+GENERIC_JSON_GBNF = (
+    'root ::= jws jval jws\n'
+    'jval ::= jobj | jarr | jstr | jnum | "true" | "false" | "null"\n'
+    'jobj ::= "{" jws ( jstr jws ":" jws jval jws ( "," jws jstr jws ":" jws jval jws )* )? "}"\n'
+    'jarr ::= "[" jws ( jval jws ( "," jws jval jws )* )? "]"\n'
+    'jstr ::= "\\"" jchar* "\\""\n'
+    'jchar ::= [^"\\\\\\x00-\\x1f] | "\\\\" ( ["\\\\/bfnrt] | "u" jhex jhex jhex jhex )\n'
+    'jhex ::= [0-9a-fA-F]\n'
+    'jnum ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( ( "e" | "E" ) ( "+" | "-" )? [0-9]+ )?\n'
+    'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
+)
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -424,10 +439,38 @@ def generation_options(body, limit):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
     if body.get("seed") is not None:
         raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
+    # response_format -> optional per-request grammar for the engine's grammar-forced
+    # draft source (#70/#148). NEVER a sampling constraint: drafts are verified, so a
+    # schema the engine cannot compile degrades to "no speedup", not to an error and
+    # not to changed output. json_schema payloads are forwarded as-is (the engine
+    # compiles them via schema_gbnf.h); {"type": "gbnf"} is a raw-GBNF extension.
+    grammar = None
     response_format = body.get("response_format")
-    if response_format not in (None, {"type": "text"}):
-        raise APIError(400, "Only the default text response format is supported.",
-                       "response_format", "unsupported_parameter")
+    if response_format is not None and response_format != {"type": "text"}:
+        if not isinstance(response_format, dict) or "type" not in response_format:
+            raise APIError(400, "`response_format` must be an object with a `type`.",
+                           "response_format", "invalid_value")
+        ftype = response_format["type"]
+        if ftype == "json_object":
+            grammar = GENERIC_JSON_GBNF
+        elif ftype == "json_schema":
+            schema = (response_format.get("json_schema") or {}).get("schema")
+            if not isinstance(schema, dict):
+                raise APIError(400, "`response_format.json_schema.schema` must be an object.",
+                               "response_format", "invalid_value")
+            grammar = json.dumps(schema)
+        elif ftype == "gbnf":
+            grammar = response_format.get("grammar")
+            if not isinstance(grammar, str) or not grammar.strip():
+                raise APIError(400, "`response_format.grammar` must be a non-empty GBNF string.",
+                               "response_format", "invalid_value")
+        else:
+            raise APIError(400, "`response_format.type` must be \"text\", \"json_object\", "
+                                "\"json_schema\" or \"gbnf\".",
+                           "response_format", "unsupported_value")
+        if grammar is not None and len(grammar.encode("utf-8")) > (1 << 20):
+            raise APIError(400, "`response_format` grammar/schema exceeds 1 MiB.",
+                           "response_format", "invalid_value")
 
     maximum = body.get("max_completion_tokens")
     maximum_param = "max_completion_tokens"
@@ -454,7 +497,7 @@ def generation_options(body, limit):
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p)
+    return maximum, float(temperature), float(top_p), grammar
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -618,12 +661,15 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
+                 cancelled=None, grammar=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
+        gpayload = grammar.encode("utf-8") if grammar else b""
+        if b"\0" in gpayload:
+            raise APIError(400, "NUL bytes are not supported in grammars.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
@@ -643,12 +689,13 @@ class Engine:
             self.next_request_id += 1
             self.pending[request_id] = events
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
-                  f"{temperature:.8g} {top_p:.8g}\n").encode()
+                  f"{temperature:.8g} {top_p:.8g}"
+                  + (f" {len(gpayload)}" if gpayload else "") + "\n").encode()
         try:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
-                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.write(header + payload + gpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
             with self.pending_lock:
@@ -895,7 +942,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
@@ -924,7 +971,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 output = []
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
-                    self.client_disconnected)
+                    self.client_disconnected, grammar=grammar)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
@@ -1031,7 +1078,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    lambda: not connected)
+                    lambda: not connected, grammar=grammar)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_tool_calls("".join(raw), tools)
@@ -1048,7 +1095,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     emit(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected)
+                    lambda: not connected, grammar=grammar)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)

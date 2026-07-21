@@ -296,7 +296,16 @@ def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_meta
     n_gpu = len(gpus)
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
-    if bottleneck_class == "compute":
+    # or streaming-bound (#467 measured 32% loss under CUDA at 85% hit).
+    # EXCEPTION: an explicit COLI_CUDA_MTP=1 in the environment is a documented
+    # opt-in to test speculation under CUDA (glm.c resolves DRAFT=-1 -> 3 only
+    # when it sees the var). Exporting DRAFT=0 here preempted that auto path,
+    # so the opt-in was silently inert on the Windows bare-run/auto-tier flows
+    # (#467): respect it and let the engine's auto path take over. Unset still
+    # gets DRAFT=0 -> MTP off, which is the measured-correct default.
+    if os.environ.get("COLI_CUDA_MTP") == "1":
+        pass  # explicit opt-in: leave DRAFT to the engine's auto resolution
+    elif bottleneck_class == "compute":
         tune["DRAFT"] = {"value": "0",
                          "reason": "compute-bound: MTP batch overhead exceeds yield"}
     elif bottleneck_class == "disk" and projected_hit < 0.90:
