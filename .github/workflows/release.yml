@@ -52,8 +52,8 @@ jobs:
       - name: Build engine
         run: |
           cd c
-          make glm ${{ matrix.make_args }}
-          ls -lh glm${{ matrix.ext }}
+          make colibri ${{ matrix.make_args }}
+          ls -lh colibri${{ matrix.ext }}
 
       - name: Package
         run: |
@@ -64,7 +64,7 @@ jobs:
           # colibri-<tag>-<platform>.exe made every downloaded archive fail with
           # "engine is not built. Run: coli build" -- with the engine sitting right there.
           # The version lives in the ARCHIVE name, which is where a downloader looks for it.
-          cp c/glm${{ matrix.ext }} dist/colibri${{ matrix.ext }}
+          cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
