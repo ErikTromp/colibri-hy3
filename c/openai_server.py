@@ -24,6 +24,18 @@ from urllib.parse import unquote, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
+
+
+def default_engine():
+    """The engine next to this file. Since #391 it is built as `colibri`; `glm` stays as a
+    fallback so an old tree (or an old hand-built binary) still starts. Reported by
+    @RDouglasSharp in #488: the default still said `glm`, so `python3 openai_server.py`
+    on a clean checkout looked for a file the build no longer produces."""
+    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+        candidate = HERE / name
+        if candidate.exists():
+            return candidate
+    return HERE / "colibri"
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
@@ -1612,8 +1624,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
+          cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1):
+    if engine is None:
+        engine = default_engine()
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -1658,7 +1672,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=str(default_engine()))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
