@@ -53,14 +53,14 @@ def download_file_ms(fn):
         model_id=REPO_MS,
         file_path=fn,
         local_dir=DEST,
-        revision="master",
+        revision=os.environ.get("GLM_MS_REVISION", "master"),   # pin to a commit for supply-chain integrity
     )
 
 def download_file_hf(fn):
     """Download a single file from HuggingFace with hf_transfer."""
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     from huggingface_hub import hf_hub_download
-    hf_hub_download(REPO_HF, fn, local_dir=DEST)
+    hf_hub_download(REPO_HF, fn, local_dir=DEST, revision=os.environ.get("GLM_HF_REVISION", "main"))
 
 def download_file_curl(fn, base_url, expected_size):
     """Fallback: download with curl to a .part file with resume."""

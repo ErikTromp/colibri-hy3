@@ -49,6 +49,46 @@ errors before streaming headers are sent. `GET /health` exposes
 active/queued/completed/rejected counters, and successful generation responses
 include `x-colibri-queue-wait-ms`.
 
+## Anthropic-protocol endpoint (`/v1/messages`)
+
+The same server also speaks the **Anthropic Messages API**, so clients that only talk
+to Anthropic endpoints — Claude Code, the Anthropic SDKs — work against colibri
+without a shim. Nothing to enable: `/v1/messages` is served alongside
+`/v1/chat/completions` on the same port.
+
+```bash
+curl http://127.0.0.1:8000/v1/messages \
+  -H 'x-api-key: local' -H 'content-type: application/json' \
+  -d '{"model":"glm-5.2-colibri","max_tokens":128,
+       "messages":[{"role":"user","content":"Hello"}]}'
+```
+
+For Claude Code, point it at the server and give it any non-empty key:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=local            # only enforced if you set COLI_API_KEY
+export ANTHROPIC_MODEL=glm-5.2-colibri
+claude
+```
+
+Supported: system prompts (string or text blocks), multi-turn `user`/`assistant`
+messages, `text` / `tool_use` / `tool_result` content blocks, tools with
+`input_schema`, every `tool_choice` mode, streaming with the full named-event
+sequence (`message_start` → `content_block_*` → `message_delta` → `message_stop`,
+plus protocol `ping` keepalives during long prefills), `stop_reason`
+(`end_turn` / `max_tokens` / `tool_use`), Anthropic `usage` field names, and
+`x-api-key` authentication (`Authorization: Bearer` also works). Extended
+thinking is enabled with `{"thinking": {"type": "enabled"}}`.
+
+Not supported, and refused explicitly rather than ignored: `stop_sequences`,
+`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
+own `{"type":"error","error":{...}}` envelope on this path.
+
+> The prefill warning below applies here too, and applies *hardest* to Claude Code:
+> its system prompt and tool catalog are large, and on a disk-streaming CPU path
+> that is a long silent wait before the first token. Read it before you connect.
+
 ## Connect a coding CLI or editor
 
 The API is OpenAI-compatible, so most coding CLIs and editor extensions work by

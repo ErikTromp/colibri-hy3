@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, generation_options, parse_tool_calls,
+                           READY, Engine, _engine_error, generation_options, parse_tool_calls,
                            read_engine_turn, render_chat, serve)
 
 
@@ -20,8 +20,8 @@ class FakeEngine:
         self.calls = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
-        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
+                 cancelled=None, grammar=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
         on_text("Hé")
         on_text("llo")
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
@@ -34,7 +34,7 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
+                 cancelled=None, grammar=None):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
@@ -71,11 +71,11 @@ class TemplateTest(unittest.TestCase):
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
-                         (4, 0.0, 1.0))
+                         (4, 0.0, 1.0, None))
         # max_tokens above the server cap is clamped, not rejected (#260): OpenAI
         # clients default to large values; erroring breaks them.
         self.assertEqual(generation_options({"max_tokens": 9, "temperature": 0, "top_p": 1}, 8),
-                         (8, 0.0, 1.0))
+                         (8, 0.0, 1.0, None))
         # non-positive / non-int max_tokens is still a hard error
         with self.assertRaises(APIError):
             generation_options({"max_tokens": 0}, 8)
@@ -84,7 +84,31 @@ class TemplateTest(unittest.TestCase):
         with self.assertRaises(APIError):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
-                         (8, 0.7, 0.9))
+                         (8, 0.7, 0.9, None))
+        # response_format -> grammar plumbing (draft source, never a constraint)
+        opts = generation_options({"max_tokens": 4, "response_format": {"type": "json_object"}}, 8)
+        self.assertIn("root ::=", opts[3])
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        opts = generation_options({"max_tokens": 4, "response_format":
+                                   {"type": "json_schema", "json_schema": {"schema": schema}}}, 8)
+        self.assertEqual(json.loads(opts[3]), schema)
+        opts = generation_options({"max_tokens": 4, "response_format":
+                                   {"type": "gbnf", "grammar": 'root ::= "x"'}}, 8)
+        self.assertEqual(opts[3], 'root ::= "x"')
+        with self.assertRaises(APIError):
+            generation_options({"response_format": {"type": "yaml"}}, 8)
+        with self.assertRaises(APIError):
+            generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        with self.assertRaises(APIError):   # non-dict response_format
+            generation_options({"response_format": "json"}, 8)
+        with self.assertRaises(APIError):   # empty gbnf
+            generation_options({"response_format": {"type": "gbnf", "grammar": "  "}}, 8)
+        with self.assertRaises(APIError):   # oversized grammar (> 1 MiB pre-check)
+            generation_options({"response_format": {"type": "gbnf", "grammar": "x" * ((1 << 20) + 1)}}, 8)
+        # malformed GBNF passes the gateway by design: the ENGINE fail-softs it
+        # (draft source only — bad grammar costs the speedup, never the request)
+        opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
+        self.assertEqual(opts[3], "not a grammar ::=")
 
 
 class ProtocolTest(unittest.TestCase):
@@ -656,6 +680,91 @@ class ToolArgumentTypeTest(unittest.TestCase):
         args = self._args("<tool_call>lookup_order"
                           "<arg_key>extra</arg_key><arg_value>7</arg_value></tool_call>")
         self.assertEqual(args["extra"], 7)
+
+
+class EngineErrorFrameTest(unittest.TestCase):
+    """#401: an over-long prompt used to be silently truncated to the first CTX-2 tokens, so the
+    model answered from a mutilated prompt and the client got HTTP 200 with junk. The engine now
+    refuses, and the refusal has to reach the client as a 400 it can act on -- not a 500."""
+
+    def test_context_exceeded_becomes_a_400_the_client_can_act_on(self):
+        err = _engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "CONTEXT_EXCEEDED 8321 4094")
+        self.assertIsInstance(err, APIError)
+        self.assertEqual(err.status, 400)
+        self.assertEqual(err.code, "context_length_exceeded")
+        self.assertEqual(err.param, "messages")
+        self.assertIn("4094", err.message)
+        self.assertIn("8321", err.message)
+
+    def test_other_engine_errors_stay_runtime_errors(self):
+        for frame in (["SLOT_BUSY"], ["BAD_REQUEST"], []):
+            err = _engine_error(frame, " ".join(frame) or "engine request failed")
+            self.assertIsInstance(err, RuntimeError)
+            self.assertNotIsInstance(err, APIError)
+
+    def test_malformed_context_frame_does_not_crash_the_dispatcher(self):
+        err = _engine_error(["CONTEXT_EXCEEDED"], "CONTEXT_EXCEEDED")
+        self.assertIsInstance(err, APIError)
+        self.assertEqual(err.status, 400)
+class UnclosedToolCallTest(unittest.TestCase):
+    """#401: the model opens <tool_call>, emits a well-formed call, then stops without the
+    closing tag (budget ran out, or quantization mangled it). The strict regex needs both tags,
+    so the client used to get zero tool_calls -- a total failure from a recoverable output."""
+
+    NO_ARG_TOOL = ORDER_TOOL + [{"type": "function",
+                                 "function": {"name": "list_orders", "parameters": {}}}]
+
+    def _calls(self, reply, tools=ORDER_TOOL):
+        return parse_tool_calls(reply, tools)
+
+    def test_unclosed_box_is_recovered(self):
+        content, calls = self._calls("<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "A-1"})
+        self.assertEqual(content, "")
+
+    def test_mangled_closing_tag_is_recovered(self):
+        _, calls = self._calls("<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>A-1</arg_value></tool_cal")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "A-1"})
+
+    def test_leading_prose_is_kept_as_content(self):
+        content, calls = self._calls("Let me check.\n<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "Let me check.")
+
+    def test_closed_call_followed_by_an_unclosed_one(self):
+        _, calls = self._calls("<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>A-1</arg_value></tool_call>"
+                               "<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>B-2</arg_value>")
+        self.assertEqual([json.loads(c["function"]["arguments"])["order_id"] for c in calls],
+                         ["A-1", "B-2"])
+
+    def test_bare_declared_name_recovers_a_zero_argument_call(self):
+        _, calls = self._calls("<tool_call>list_orders", self.NO_ARG_TOOL)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "list_orders")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {})
+
+    def test_prose_mentioning_the_marker_does_not_fabricate_a_call(self):
+        content, calls = self._calls("To call a tool, write <tool_call> and then the name.")
+        self.assertEqual(calls, [])
+        self.assertIn("<tool_call>", content)
+
+    def test_undeclared_name_without_arguments_is_not_recovered(self):
+        _, calls = self._calls("<tool_call>drop_all_tables")
+        self.assertEqual(calls, [])
+
+    def test_well_formed_output_is_untouched(self):
+        content, calls = self._calls("Done.<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>"
+                                     "</tool_call>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "Done.")
 
 
 class ToolChoiceTest(unittest.TestCase):

@@ -56,10 +56,15 @@ OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
-# which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+# For older X86_64 Macs (for example, Mac Pro 2019) we need to use -march
 ifneq ($(ARCH),)
+ifneq (,$(X86_64))
+CFLAGS += -march=$(ARCH)
+else
 CFLAGS += -mcpu=$(ARCH)
+endif
 endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
@@ -70,7 +75,7 @@ else ifneq ($(IS_WIN),)
 # ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
 # machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
 # it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
-# which the x86-64-v3 baseline does not define. The #ifdef guards in glm.c mean
+# which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
@@ -125,22 +130,17 @@ IOURING_LDFLAGS = -luring
 endif
 endif
 
-# CUDA=1 adds an opt-in backend for resident tensors. ROCM=1 selects the same
-# backend ABI with HIP/ROCm. The default build remains pure C and keeps the
-# original zero-dependency runtime.
 # --- install ---
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
 LIBEXECDIR ?= $(PREFIX)/libexec/colibri
 INSTALL    ?= install
+
+# CUDA=1 adds an opt-in backend for resident tensors. The default build remains
+# pure C and keeps the original zero-dependency runtime.
 #
 # Two paths:
 #   - Linux/macOS: CUDA=1 links backend_cuda.o directly (cudart via -l).
-#   - Linux/WSL:   ROCM=1 compiles backend_cuda.cu with hipcc and links
-#                  amdhip64; the source uses a small HIP compatibility layer.
-#   - Windows:     ROCM=1 uses MinGW gcc for C host objects and the HIP SDK's
-#                  hipcc for device compilation/linking (set ROCM_HOME or put
-#                  hipcc on PATH).
 #   - Windows:      CUDA_DLL=1 builds a standalone coli_cuda.dll (nvcc+MSVC),
 #                   then the host glm.exe loads it at runtime via backend_loader.c
 #                   (LoadLibrary/GetProcAddress). MinGW gcc cannot compile .cu
@@ -167,22 +167,49 @@ else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 endif
+# CUDA target selection. Default `native` builds SASS for the build machine's GPU
+# only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
+# there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
+# For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
+# plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
 CUDA_ARCH ?= native
+ifeq ($(CUDA_ARCH),portable)
+CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
+               -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 \
+               -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_120,code=sm_120 \
+               -gencode arch=compute_120,code=compute_120
+else
+CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
 # -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 endif
+# HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
+# compiled unchanged through backend_gpu_compat.h (one source, two vendors,
+# like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
+# machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+HIP       ?= 0
 ROCM      ?= 0
-ROCM_HOME ?= $(if $(HIP_PATH),$(HIP_PATH),/opt/rocm)
-HIPCC     ?= $(if $(IS_WIN),hipcc,$(ROCM_HOME)/bin/hipcc)
-ROCM_ARCH ?= gfx1101
-HIPFLAGS  ?= -O3 -std=c++17 -fPIC --offload-arch=$(ROCM_ARCH) -I"$(ROCM_HOME)/include"
+ifeq ($(ROCM),1)
+HIP := 1
+endif
+ROCM_HOME ?= /opt/rocm
+HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+HIP_ARCH  ?= native
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip --offload-arch=$(HIP_ARCH) -Wall -Wextra
+GPUCC      = $(NVCC)
+GPUFLAGS   = $(NVCCFLAGS)
+GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
 # triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
@@ -195,8 +222,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-ROCM_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -218,57 +244,24 @@ ifneq ($(IS_WIN),)
 # On Windows use CUDA_DLL=1 (runtime DLL), not CUDA=1 (direct link).
 $(error On Windows use: make CUDA_DLL=1 cuda-dll  (see backend_loader.c))
 endif
+ifeq ($(HIP),1)
+$(error choose CUDA=1 or HIP=1, not both)
+endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
-# Linux/WSL ROCm path. Keep the existing COLI_CUDA symbols and CLI variables
-# as the stable accelerator ABI; COLI_ROCM only selects HIP compilation and
-# disables the NVIDIA-only WMMA fast path in backend_cuda.cu.
-ifeq ($(ROCM),1)
-ifneq ($(CUDA),0)
-$(error CUDA=1 and ROCM=1 are mutually exclusive)
+ifeq ($(HIP),1)
+ifeq (,$(LINUX))
+$(error HIP=1 is supported only on Linux)
 endif
-ifneq ($(CUDA_DLL),0)
-$(error CUDA_DLL=1 and ROCM=1 are mutually exclusive)
-endif
-ifeq ($(UNAME_S),Darwin)
-$(error ROCM=1 is supported on Linux/WSL, not macOS)
-endif
-CFLAGS     += -DCOLI_CUDA -DCOLI_ROCM
-ROCM_OBJ   = backend_hip.o
-ifeq ($(IS_WIN),)
-LDFLAGS    += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-else
-# The Windows HIP SDK owns the clang/clang++ link step and supplies the
-# runtime import library. Keep MinGW gcc for the C host objects because the
-# HIP SDK alone does not ship pthread.h; hipcc links those objects with HIP.
-ROCM_LINK  = "$(HIPCC)"
-CFLAGS     := -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -DCOLI_ROCM
-LDFLAGS    := -fopenmp
-endif
-endif
-
-GPU_OBJ = $(CUDA_OBJ) $(ROCM_OBJ)
-ROCM_LINK ?= $(CC)
-GLM_INPUT = glm.c
-HY3_INPUT = hy3.c
-
-# Native Windows ROCm uses MinGW for the C host translation unit and hipcc for
-# the final link. This keeps pthread/OpenMP headers available while still
-# linking amdhip64 and the HIP device object.
-ifeq ($(ROCM),1)
-ifeq ($(IS_WIN),1)
-GLM_INPUT = glm_host.o
-HY3_INPUT = hy3_host.o
-
-glm_host.o: glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h
-	$(CC) $(CFLAGS) -c $< -o $@
-
-hy3_host.o: hy3.c st.h json.h compat.h
-	$(CC) $(CFLAGS) $(IOURING_CFLAGS) -c $< -o $@
-endif
+CFLAGS    += -DCOLI_CUDA
+LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ   = backend_cuda.o
+GPUCC      = $(HIPCC)
+GPUFLAGS   = $(HIPCCFLAGS)
+GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
@@ -285,30 +278,42 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE) hy3$(EXE)
+HY3_INPUT = hy3.c
 
-# phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+all: colibri$(EXE) hy3$(EXE)
+
+# phony targets — 'glm' kept for backward compatibility
+colibri: colibri$(EXE)
+glm: colibri$(EXE)
 ifneq ($(EXE),)
-glm: glm$(EXE)
 hy3: hy3$(EXE)
 endif
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
-# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
-# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
-# worked but isn't. We record the build-affecting flags in .build-config and rewrite
-# it ONLY when they change (evaluated here at parse time, so the file's timestamp
-# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
+# and silently keeps the CPU-only binary (no CUDA loader) — a build that looks like
+# it worked but isn't. We record the build-affecting flags in .build-config and
+# rewrite it ONLY when they change (evaluated here at parse time, so the file's
+# timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ROCM=$(ROCM)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|IOURING=$(IOURING)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|IOURING=$(IOURING)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
-$(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
+# $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
+# spawning a shell. The earlier `$(shell printf '%s' ... > .build-config)`
+# required a POSIX `printf` on PATH — present under MSYS2/Git-Bash but NOT under
+# cmd.exe, so `make glm.exe` from the VS Native Tools prompt or with scoop MinGW
+# (neither ships sh.exe) failed with "'printf' is not recognized" and left the
+# stamp stale. $(file ...) works regardless of the shell make falls back to. (#478)
+$(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-glm$(EXE): $(GLM_INPUT) st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(GPU_OBJ) $(METAL_OBJ) .build-config
-	$(ROCM_LINK) $(CFLAGS) $(GLM_INPUT) $(GPU_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -326,15 +331,9 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda.cu -o $@
-
-# ROCm/HIP build. backend_cuda.cu is intentionally shared with CUDA so the
-# numerical implementation stays covered by the same backend test suite.
-backend_hip.o: backend_cuda.cu backend_cuda.h
-	@command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found: set ROCM_HOME or HIPCC" >&2; exit 1; }
-	"$(HIPCC)" $(HIPFLAGS) -DCOLI_CUDA -DCOLI_ROCM -c backend_cuda.cu -o $@
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
@@ -343,22 +342,23 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
-cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
-hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h $(GPU_OBJ)
-	$(ROCM_LINK) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(GPU_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
+# convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
+hip-test:
+	$(MAKE) cuda-test HIP=1
 
-rocm-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found: set ROCM_HOME or HIPCC" >&2; exit 1; }
-	"$(HIPCC)" $(HIPFLAGS) -DCOLI_CUDA -DCOLI_ROCM backend_cuda.cu tests/test_backend_cuda.cu -o backend_hip_test$(EXE)
-	./backend_hip_test$(EXE)
+# CI: compile the backend and its test binary WITHOUT executing them (for
+# runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
+gpu-compile: backend_cuda.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 
-cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
+cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
@@ -367,8 +367,9 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+# Intel Macs need -march for vector instructions
 ifneq (,$(DARWIN))
-PORTABLE_ARCH =
+PORTABLE_ARCH = $(if $(X86_64),x86-64-v3,)
 else ifneq (,$(AARCH64))
 PORTABLE_ARCH = armv8-a
 else ifneq (,$(PPC64))
@@ -380,7 +381,7 @@ PORTABLE_ARCH = native
 endif
 
 portable:
-	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
+	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
@@ -388,10 +389,15 @@ iobench$(EXE): iobench.c compat.h
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
@@ -406,30 +412,44 @@ tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h j
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_topp$(EXE): tests/test_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_sample_nan$(EXE): tests/test_sample_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_logit_nan$(EXE): tests/test_logit_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# fmt=6 kernel oracle: needs the generated grid table, and its fixture comes from
+# the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
+tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
@@ -438,15 +458,28 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_dsa_select$(EXE): tests/test_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+# bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
+# Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
+# NOT a test gate. Build on demand: make tests/bench_mla_simd
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
@@ -457,21 +490,44 @@ test-python:
 
 test: test-c test-python
 
+# --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
+# The tiny-model assertions live in test_inefficiency.py and run as part of
+# test-python (they're discovered by the test_*.py glob). These targets are
+# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+#
+#   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
+#   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
+#   make efficiency-report opt-in full-model 🟢/🔴 diagnostic, never fails CI
+#
+# CUDA build (Windows): the CUDA tests need a host built with -DCOLI_CUDA plus
+# the runtime DLL. Do this FIRST — note CUDA_DLL=1 on BOTH the host and the
+# rule below, or `make glm.exe` will rebuild a CPU-only host and overwrite it:
+#   make clean && make glm.exe CUDA_DLL=1 && make cuda-dll
+# The tests auto-skip with a clear message if the host is CPU-only.
+efficiency: test-python
+	$(PYTHON) -m unittest tests.test_inefficiency -v
+
+efficiency-cuda:
+	$(PYTHON) -m unittest tests.test_inefficiency.TinyCudaEfficiencyTest -v
+
+efficiency-report:
+	$(PYTHON) tests/test_efficiency_report.py
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) hy3$(EXE) olmoe$(EXE)
+install: colibri$(EXE) hy3$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
-	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
+	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 hy3$(EXE) $(DESTDIR)$(LIBEXECDIR)/hy3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
-	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 
 uninstall:
@@ -480,8 +536,8 @@ uninstall:
 
 clean:
 	$(PYTHON) tools/clean.py
-	rm -f hy3$(EXE) glm_host.o hy3_host.o backend_hip.o backend_hip_test$(EXE) backend_hip_bench$(EXE)
+	rm -f hy3$(EXE)
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm hy3 cuda-test rocm-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm hy3 cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

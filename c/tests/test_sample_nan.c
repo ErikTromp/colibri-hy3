@@ -6,7 +6,7 @@
  * iniettato il token scelto e' l'argmax dei FINITI (mai 0 per default), su ogni posizione
  * del NaN inclusa lo[0]; (c) nessun NaN sopravvive in g_pbuf. */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 #include <stdio.h>
 

@@ -9,7 +9,7 @@ Token-exact vs the CPU path.
 
 ```bash
 cd c
-make glm METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+make colibri METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
 make metal-test           # standalone kernel/attention correctness vs CPU reference
 COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
 ```

@@ -19,6 +19,7 @@
 #include <limits.h>
 #include "json.h"
 #include "tok_unicode.h"
+#include "tok_unicode_o200k.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -50,6 +51,7 @@ typedef struct {
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
+    int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -88,8 +90,14 @@ static void tk_build_bytemap(Tok *T){
 /* ---------- caricamento tokenizer.json ---------- */
 static char *tk_read_file(const char *path, long *out_n){
     FILE *f=fopen(path,"rb"); if(!f){ perror(path); exit(1); }
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
+    if(fseek(f,0,SEEK_END)!=0){ perror(path); exit(1); }
+    long n=ftell(f);
+    if(n<0){ perror(path); exit(1); }
+    if(n>(1L<<30)){ fprintf(stderr,"%s: file too large (%ld bytes)\n",path,n); exit(1); }   /* sanity cap vs a hostile size */
+    if(fseek(f,0,SEEK_SET)!=0){ perror(path); exit(1); }
+    char *b=malloc((size_t)n+1); if(!b){ fprintf(stderr,"OOM reading %s (%ld bytes)\n",path,n); exit(1); }
+    if(fread(b,1,(size_t)n,f)!=(size_t)n){ fprintf(stderr,"%s: short read\n",path); exit(1); }
+    b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
 }
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
@@ -104,14 +112,28 @@ static void tok_load(Tok *T, const char *path){
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
-    /* id massimo per dimensionare id2str */
+    /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
+     * mirror non fidato: un id NEGATIVO indicizzerebbe id2str[id] SOTTO l'allocazione
+     * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
-    for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
-    if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
+    for(int i=0;i<vocab->len;i++){
+        if(vocab->kids[i]->t!=J_NUM){ fprintf(stderr,"tokenizer.json: non-numeric vocab id at %d\n",i); exit(1); }
+        int id=(int)vocab->kids[i]->num;
+        if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
+        if(id>maxid)maxid=id; }
+    if(added) for(int i=0;i<added->len;i++){
+        jval *ji=json_get(added->kids[i],"id");
+        if(!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_token missing numeric id\n"); exit(1); }
+        int id=(int)ji->num;
+        if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
+        if(id>maxid)maxid=id; }
+    /* an id near INT_MAX would overflow n_ids=maxid+1 (UB) and calloc multi-GB */
+    if(maxid > (1<<21)){ fprintf(stderr,"tokenizer.json: implausible max vocab id %d\n",maxid); exit(1); }
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
     T->id_special=calloc(T->n_ids,sizeof(int));
+    if(!T->id2str||!T->id_added||!T->id_special){ fprintf(stderr,"tokenizer.json: OOM sizing %d ids\n",T->n_ids); exit(1); }
 
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
@@ -126,6 +148,9 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
+        if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
+           pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
+            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
         const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
         int ll=(int)strlen(l), rl=(int)strlen(r);
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
@@ -136,13 +161,27 @@ static void tok_load(Tok *T, const char *path){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            jval *jc=json_get(a,"content"), *ji=json_get(a,"id");
+            if(!jc||jc->t!=J_STR||!jc->str||!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: malformed added_token\n"); exit(1); }
+            char *content=jc->str; int id=(int)ji->num;
+            if(id<0||id>maxid){ fprintf(stderr,"tokenizer.json: added id %d out of range\n",id); exit(1); }
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
             jval *sf=json_get(a,"special");                 /* "special": true/false */
             if(sf && sf->t==J_BOOL && sf->boolean) T->id_special[id]=1;
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
+    }
+    /* pre_tokenizer family: the o200k Split regex is recognizable by its
+     * case-category classes (\p{Lu}...) which cl100k does not use */
+    jval *pt=json_get(root,"pre_tokenizer");
+    if(pt){
+        jval *ps=json_get(pt,"pretokenizers");
+        if(ps&&ps->t==J_ARR) for(int i=0;i<ps->len;i++){
+            jval *pat=json_get(ps->kids[i],"pattern");
+            jval *rx=pat?json_get(pat,"Regex"):NULL;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
+        }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
     (void)arena;
@@ -241,6 +280,104 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
     free(cp); free(off);
 }
 
+/* ---------- pre-tokenizer o200k (Inkling / GPT-4o family) ----------
+ * Split regex:
+ *   A: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *   B: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *   C: \p{N}{1,3}   D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * S1 = Lu|Lt|Lm|Lo|M, S2 = Ll|Lm|Lo|M. The letter matcher below replays the
+ * regex engine's backtracking order exactly: A with greedy optional prefix and
+ * maximally-greedy S1* given back until S2+ can take >=1 char, then B. */
+#define O2_S1(c) (is_U(c)||is_X(c))
+#define O2_S2(c) (is_X(c)||(is_L(c)&&!is_U(c)))
+static uint32_t o2_low(uint32_t c){ return (c>='A'&&c<='Z')?c+32:c; }
+static int o2_contraction(const uint32_t *cp, int n, int k){
+    if(k<n && cp[k]=='\'' && k+1<n){
+        uint32_t d=o2_low(cp[k+1]);
+        if(k+2<n){ uint32_t e=o2_low(cp[k+2]);
+            if((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')) return k+3; }
+        if(d=='s'||d=='t'||d=='m'||d=='d') return k+2;
+    }
+    return k;
+}
+/* end (cp index) of branch A|B match at i, or -1 */
+static int o2_letters(const uint32_t *cp, int n, int i){
+    /* branch A, prefix greedy (taken first), then without prefix */
+    for(int pfx=1; pfx>=0; pfx--){
+        int j0=i;
+        if(pfx){
+            uint32_t c=cp[i];
+            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
+            j0=i+1;
+        }
+        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        for(int s=m1; s>=j0; s--){
+            if(s<n && O2_S2(cp[s])){
+                int k=s+1; while(k<n && O2_S2(cp[k])) k++;
+                return o2_contraction(cp,n,k);
+            }
+        }
+    }
+    /* branch B */
+    for(int pfx=1; pfx>=0; pfx--){
+        int j0=i;
+        if(pfx){
+            uint32_t c=cp[i];
+            if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
+            j0=i+1;
+        }
+        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        if(m1>j0){
+            int k=m1; while(k<n && O2_S2(cp[k])) k++;
+            return o2_contraction(cp,n,k);
+        }
+    }
+    return -1;
+}
+
+static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    #define ISNL(c) ((c)=='\r'||(c)=='\n')
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* A|B: letter runs with case-aware split + optional contraction */
+        {
+            int e=o2_letters(cp,n,i);
+            if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* C: \p{N}{1,3} */
+        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*' */
+        {
+            int j=i;
+            if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
+            if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
+                while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
+                while(j<n && (ISNL(cp[j]) || cp[j]=='/')) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        /* E: \s*[\r\n]+  F: \s+(?!\S)  G: \s+  (same as cl100k) */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){ int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
+                if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+                int end = (r<n) ? r-1 : r;
+                if(end<=i) end=i+1;
+                i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        i++;
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    #undef ISNL
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -254,7 +391,10 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
             }
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
-        if(chunk_end>i) pretok_chunk(T,p,i,chunk_end,out,&no,max);
+        if(chunk_end>i){
+            if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
+            else         pretok_chunk(T,p,i,chunk_end,out,&no,max);
+        }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;
         i=hitpos+hitlen;

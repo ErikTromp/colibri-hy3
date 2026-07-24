@@ -117,9 +117,77 @@ def quantize_param(w, bits, group, rot=False, e8=""):
 
 
 def _grid_or_e8(x, bits, group, e8):
+    if e8 == "-iq3":
+        return _quant_iq3(x.float())
     if e8:
         return _quant_e8(x.float(), group, bits, ball=(e8 == "-e8"))
     return _quant_last_dim(x, bits, group)
+
+
+# --------------------------------------------------------------------------------------
+# IQ3_XXS-style codebook (#452 candidate (a)): llama.cpp's deployed 3.06-bpw scheme.
+# 4-dim magnitude blocks quantized to a 256-entry lattice-subset grid (magnitudes on the
+# odd ladder 4,12,..,62 in half-units), signs factored out per 8 weights with an odd-parity
+# constraint (7 stored + 1 derived: a block whose true signs violate parity gets its
+# smallest-magnitude sign flipped — modelled here so the ablation pays the real cost).
+# Scales: fp16 super-scale per 256 + 4-bit sub-scale per 32, db = d*(0.5+s)*0.5.
+# Grid extracted from ggml-common.h (MIT).
+# --------------------------------------------------------------------------------------
+_IQ3_GRID = None
+def _iq3_grid(device):
+    global _IQ3_GRID
+    if _IQ3_GRID is None or _IQ3_GRID.device != device:
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), "iq3xxs_grid.json")
+        _IQ3_GRID = torch.tensor(json.load(open(path)), dtype=torch.float32, device=device)
+    return _IQ3_GRID          # [256,4], half-unit magnitudes (value/2 = weight units)
+
+def _quant_iq3(x):
+    orig = x.shape
+    K = orig[-1]
+    assert K % 256 == 0, "iq3 needs multiples of 256 along the input dim"
+    xb = x.reshape(-1, 256)                                   # super-blocks
+    grid = _iq3_grid(x.device) * 0.5                          # weight units
+    out = torch.empty_like(xb)
+    signs = torch.sign(xb); signs[signs == 0] = 1.0
+    mags = xb.abs()
+    for sb in range(8):                                       # 8 sub-blocks of 32
+        m = mags[:, sb*32:(sb+1)*32]                          # [N,32]
+        s = signs[:, sb*32:(sb+1)*32]
+        # per-8 sign parity: flip the smallest-|w| sign where the product is negative
+        s8 = s.reshape(-1, 4, 8)
+        m8 = m.reshape(-1, 4, 8)
+        viol = (s8.prod(-1) < 0)                              # odd number of minus signs
+        idxmin = m8.argmin(-1)
+        flip = torch.zeros_like(s8)
+        flip.scatter_(-1, idxmin[..., None], 1.0)
+        s8 = torch.where(viol[..., None].expand_as(s8) & (flip > 0), -s8, s8)
+        s = s8.reshape(-1, 32)
+        # sub-scale search: db candidates from the 4-bit code, super d from block RMS
+        d = m.pow(2).mean(-1, keepdim=True).sqrt() / 20.0 + 1e-12   # rough anchor
+        best = None
+        for code in range(16):
+            db = d * (0.5 + code) * 0.5
+            q = m / db                                       # [N,32] target magnitudes
+            q4 = q.reshape(-1, 4)                            # 4-dim grid blocks
+            # chunked argmin ||q-g||^2 = argmin(|g|^2 - 2 q.g): a full cdist on a
+            # 100M-param tensor materializes tens of GB — this stays at ~256 MB.
+            g2 = grid.pow(2).sum(-1)
+            idx = torch.empty(q4.shape[0], dtype=torch.long, device=q4.device)
+            CH = 1 << 18
+            for i0 in range(0, q4.shape[0], CH):
+                cc = q4[i0:i0+CH]
+                idx[i0:i0+CH] = (g2 - 2.0 * (cc @ grid.T)).argmin(-1)
+            hit = grid[idx].reshape(-1, 8, 4)
+            rec = (hit.reshape(-1, 32) * db)
+            err = (rec - m).pow(2).sum(-1, keepdim=True)
+            if best is None:
+                best = (err, rec)
+            else:
+                take = err < best[0]
+                best = (torch.where(take, err, best[0]), torch.where(take, rec, best[1]))
+        out[:, sb*32:(sb+1)*32] = best[1] * s
+    return out.reshape(orig)
 
 
 def _rot_quant(x, bits, group, e8=""):
@@ -206,13 +274,30 @@ def _quant_e8(x, group, bits, ball):
     return best_out.reshape(shp)
 
 
-SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?)?(-rot)?(-nohead)?$")
+SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?|-iq3)?(-rot)?(-nohead)?$")
+
+
+def _quant_iq3_pack(x):
+    """Bytes-true fmt=6 (#452 step 2): the tensor goes through tools/iq3_pack —
+    real 98-byte blocks, the parity sign cost, fp16 super-scales, regenerated
+    rotation signs — and comes back to model space via the inverse rotation.
+    This is the number a SHIPPED container gets, where `int3-iq3-rot` above is
+    the float simulation that chose the scheme. The rotation sign diagonal
+    differs from the simulation's torch PRNG (xorshift spec, quant.h e8_signs);
+    statistically equivalent, and it is what the engine regenerates."""
+    import iq3_pack as IP
+    w = x.detach().cpu().float().numpy()
+    packed = IP.encode(IP.rotate_rows(w.reshape(-1, w.shape[-1])))
+    deq = IP.decode(packed, w.shape[-1])
+    return torch.from_numpy(IP.unrotate_rows(deq).reshape(w.shape)).to(x.device)
 
 
 def parse_scheme(name):
     """'int4-g128-nohead' -> (bits, group, e8, skip_head...). 'fp16' -> None."""
     if name == "fp16":
         return None
+    if name == "iq3-pack":
+        return "PACK"
     m = SCHEME_RE.match(name)
     if not m:
         raise SystemExit(f"bad scheme '{name}' (expected fp16 | int{{2,3,4,8}}[-g<N>][-e8|-e8u][-rot][-nohead])")
@@ -236,8 +321,19 @@ def apply_scheme(model, scheme):
     spec = parse_scheme(scheme)
     if spec is None:
         return 0, 0, total
-    bits, group, e8, rot, skip_head = spec
     n = qp = 0
+    if spec == "PACK":
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.ndim < 2 or is_router(name):
+                    continue
+                if p.shape[-1] % 256:      # fmt=6 needs I % 256 == 0 — same rule the converter enforces
+                    continue
+                p.data.copy_(_quant_iq3_pack(p.data).to(p.dtype))
+                n += 1
+                qp += p.numel()
+        return n, qp, total
+    bits, group, e8, rot, skip_head = spec
     with torch.no_grad():
         for name, p in model.named_parameters():
             if p.ndim < 2 or is_router(name):

@@ -2,31 +2,31 @@ import { useEffect, useRef, useState } from "react"
 import { BrainCircuit, Flame, Layers } from "lucide-react"
 
 import { endpoint } from "@/lib/api"
+import { useLocale } from "./i18n"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
 interface AtlasEntry { affinity: Record<string, number>; entropy: number; top: string; label: string }
 
-const TIER_NAME = ["Disk", "RAM", "VRAM"]
+const TIER_KEYS = ["tier.disk", "tier.ram", "tier.vram"] as const
 const TIER_RGB: [number, number, number][] = [[58, 71, 80], [90, 155, 216], [78, 214, 165]]
 
-/* Layer-depth heuristic: what this region of the network tends to specialise in.
- * Honest framing — these are the depth roles observed across MoE interpretability
- * work, not per-expert ground truth (that needs co-activation analysis, #119). */
-function depthRole(row: number, rows: number, isMtp: boolean): string {
-  if (isMtp) return "MTP head — drafts the next token for speculative decoding"
+function depthRoleKey(row: number, rows: number, isMtp: boolean): string {
+  if (isMtp) return "brain.mtp"
   const f = row / Math.max(rows - 1, 1)
-  if (f < 0.2) return "early layers — surface features: tokens, spelling, local syntax"
-  if (f < 0.45) return "lower-middle — phrase structure, word relations, simple facts"
-  if (f < 0.7) return "upper-middle — semantics, long-range context, reasoning steps"
-  if (f < 0.9) return "late layers — planning the answer, style, coherence"
-  return "final layers — output shaping: picks the actual next-token distribution"
+  if (f < 0.2) return "brain.early"
+  if (f < 0.45) return "brain.lowerMiddle"
+  if (f < 0.7) return "brain.upperMiddle"
+  if (f < 0.9) return "brain.late"
+  return "brain.final"
 }
 
 export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey: string; connected: boolean }) {
+  const { t } = useLocale()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [wrapSize, setWrapSize] = useState({ w: 1200, h: 700 })
   const [data, setData] = useState<ExpertMap | null>(null)
+  const [probeErr, setProbeErr] = useState(false)   // (#U3) surface /experts failures instead of an endless spinner
   const [atlas, setAtlas] = useState<Record<string, AtlasEntry> | null>(null)
   const [tip, setTip] = useState<{ x: number; y: number; row: number; col: number; tier: number; heat: number } | null>(null)
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
@@ -59,9 +59,11 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     const poll = async () => {
       try {
         const res = await fetch(endpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+        if (!res.ok) throw new Error(`/experts ${res.status}`)
         const next = (await res.json()) as ExpertMap
         if (disposed || !next.rows) return
         setData(next)
+        setProbeErr(false)
         if (next.seq !== lastSeq.current && next.hits) {
           lastSeq.current = next.seq
           const n = next.rows * next.cols
@@ -72,7 +74,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
             if (byte & (1 << (i & 7))) p[i] = 1
           }
         }
-      } catch { /* engine busy or restarting — keep the last frame */ }
+      } catch { if (!disposed) setProbeErr(true) /* surface repeated failures; keep the last frame */ }
     }
     void poll()
     const t = window.setInterval(() => void poll(), 1500)
@@ -142,36 +144,36 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   return (
     <div className="brain-page">
       <div className="brain-head">
-        <div className="section-title"><BrainCircuit className="size-4" /> Expert Cortex — {data ? `${data.rows} layers × ${data.cols} experts` : "waiting for engine"}</div>
+        <div className="section-title"><BrainCircuit className="size-4" /> {t("brain.title")} — {data ? t("brain.layers", { rows: data.rows, cols: data.cols }) : t("brain.waiting")}</div>
         <div className="brain-legend">
-          <span><i style={{ background: "#4ed6a5" }} /> VRAM {totals[2].toLocaleString()}</span>
-          <span><i style={{ background: "#5a9bd8" }} /> RAM {totals[1].toLocaleString()}</span>
-          <span><i style={{ background: "#3a4750" }} /> Disk {totals[0].toLocaleString()}</span>
-          <span><Flame className="size-3" /> brightness = routing heat</span>
-          <span className="brain-pulse-hint">⚡ white flash = routed this turn</span>
+          <span><i style={{ background: "#4ed6a5" }} /> {t("tier.vram")} {totals[2].toLocaleString()}</span>
+          <span><i style={{ background: "#5a9bd8" }} /> {t("tier.ram")} {totals[1].toLocaleString()}</span>
+          <span><i style={{ background: "#3a4750" }} /> {t("tier.disk")} {totals[0].toLocaleString()}</span>
+          <span><Flame className="size-3" /> {t("brain.brightnessHint")}</span>
+          <span className="brain-pulse-hint">{t("brain.flashHint")}</span>
         </div>
       </div>
       <div className="brain-canvas-wrap" ref={wrapRef}>
         <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
-        {!connected && <p className="runtime-unavailable">Connect to the engine to see the cortex.</p>}
+        {!connected && <p className="runtime-unavailable">{t("brain.connectHint")}</p>}
       </div>
       {tip && data && (() => {
         const isMtp = tip.row === data.rows - 1
         const realLayer = isMtp ? 78 : tip.row + 3
         const entry = atlas?.[`${realLayer}:${tip.col}`]
         return (
-        <div className="brain-tip" style={{ left: tip.x + 14, top: tip.y + 14 }}>
+        <div className="brain-tip" style={{ left: Math.min(tip.x + 14, window.innerWidth - 260), top: Math.min(tip.y + 14, window.innerHeight - 170) }}>
           <div className="brain-tip-title"><Layers className="size-3" /> Layer {realLayer}{isMtp ? " (MTP)" : ""} · Expert {tip.col}</div>
-          <div>Tier: <strong style={{ color: ["#8b9aa3", "#5a9bd8", "#4ed6a5"][tip.tier] }}>{TIER_NAME[tip.tier]}</strong></div>
-          <div>Heat: <strong>{tip.heat === 0 ? "never routed" : `~2^${tip.heat} selections`}</strong></div>
+          <div>Tier: <strong style={{ color: ["#8b9aa3", "#5a9bd8", "#4ed6a5"][tip.tier] }}>{t(TIER_KEYS[tip.tier])}</strong></div>
+          <div>Heat: <strong>{tip.heat === 0 ? t("brain.neverRouted") : t("brain.selections", { heat: tip.heat })}</strong></div>
           {entry ? <>
             <div className={entry.label.startsWith("specialist") ? "brain-tip-spec" : undefined}>
-              {entry.label.startsWith("specialist") ? `⭐ Specialist: ${entry.top}` : "Generalist"}
+              {entry.label.startsWith("specialist") ? t("brain.specialist", { top: entry.top }) : t("brain.generalist")}
               <small> (entropy {entry.entropy})</small>
             </div>
             <div className="brain-tip-aff">{Object.entries(entry.affinity).sort((a, b) => b[1] - a[1]).slice(0, 3)
               .map(([c, p]) => `${c} ${Math.round(p * 100)}%`).join(" · ")}</div>
-          </> : <div className="brain-tip-role">{depthRole(tip.row, data.rows, isMtp)}</div>}
+          </> : <div className="brain-tip-role">{t(depthRoleKey(tip.row, data.rows, isMtp))}</div>}
         </div>
         )
       })()}

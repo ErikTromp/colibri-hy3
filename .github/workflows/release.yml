@@ -52,14 +52,19 @@ jobs:
       - name: Build engine
         run: |
           cd c
-          make glm ${{ matrix.make_args }}
-          ls -lh glm${{ matrix.ext }}
+          make colibri ${{ matrix.make_args }}
+          ls -lh colibri${{ matrix.ext }}
 
       - name: Package
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p dist
-          cp c/glm${{ matrix.ext }} dist/colibri-${TAG}-${{ matrix.name }}${{ matrix.ext }}
+          # The engine goes in under its PLAIN name. `coli` locates the engine by looking for
+          # "colibri"/"colibri.exe" (then "glm") next to itself, so shipping it as
+          # colibri-<tag>-<platform>.exe made every downloaded archive fail with
+          # "engine is not built. Run: coli build" -- with the engine sitting right there.
+          # The version lives in the ARCHIVE name, which is where a downloader looks for it.
+          cp c/colibri${{ matrix.ext }} dist/colibri${{ matrix.ext }}
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
@@ -73,10 +78,38 @@ jobs:
             tar czf colibri-${TAG}-${{ matrix.name }}.tar.gz *
           fi
 
+      # Unpack what we are about to publish, in a clean directory, and prove `coli` finds the
+      # engine. A packaging mistake is invisible to every other job in this repo: the build is
+      # green, the tests are green, and the artifact is still unusable. Assert on behaviour.
+      - name: Verify the packaged archive actually runs
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p verify && cd verify
+          if [ "${{ matrix.ext }}" = ".exe" ]; then
+            7z x ../dist/colibri-${TAG}-${{ matrix.name }}.zip > /dev/null
+          else
+            tar xzf ../dist/colibri-${TAG}-${{ matrix.name }}.tar.gz
+          fi
+          test -x colibri${{ matrix.ext }} || { echo "engine missing from archive"; ls -la; exit 1; }
+          out=$(python3 coli info 2>&1 || true)
+          echo "$out"
+          case "$out" in
+            *"engine is not built"*) echo "FAIL: coli cannot find the packaged engine"; exit 1 ;;
+          esac
+          # The program name is plain ASCII "colibri" -- exactly what the banner prints.
+          # (The v1.1.0 tag build failed here when the banner still said "colibrì".)
+          echo "$out" | grep -q "colibri" || { echo "FAIL: coli did not run"; exit 1; }
+          echo "OK: coli locates the engine in the published archive"
+
+      # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
+      # (the engine was versioned, so it did not match); now that the engine is plainly named,
+      # be explicit about what gets published.
       - uses: actions/upload-artifact@v4
         with:
           name: colibri-${{ matrix.name }}
-          path: dist/colibri-*.*
+          path: |
+            dist/colibri-*.zip
+            dist/colibri-*.tar.gz
 
   release:
     needs: build
@@ -94,11 +127,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          # SHA256SUMS: lets anyone verify a download against what CI built. Named in
+          # the response to #527 (Defender ML false positive) — the checksums are the
+          # public, permanent form of the release-vs-artifact comparison done there.
+          (cd artifacts && sha256sum colibri-*) > artifacts/SHA256SUMS.txt
+          cat artifacts/SHA256SUMS.txt
           # Extract the latest version section from CHANGELOG
           NOTES=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
           if [ -z "$NOTES" ]; then
             NOTES="Release ${TAG}"
           fi
           gh release create "$TAG" artifacts/* \
-            --title "colibrì ${TAG}" \
+            --title "colibri ${TAG}" \
             --notes "$NOTES"

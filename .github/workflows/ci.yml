@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build glm
-        run: cd c && make glm
+      - name: Build engines
+        run: cd c && make colibri hy3
       - name: C test suite
         run: cd c && make test-c
 
@@ -40,6 +40,27 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "CUDA syntax check passed"
+
+  engine-hip-syntax:
+    name: HIP syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        # rocm/dev images are large; hosted runners need the headroom freed
+        # BEFORE the pull (which is why this is not a container: job).
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Compile backend_cuda.cu + test binary with hipcc (no GPU)
+        run: |
+          # Tag pinned: `latest` outgrew the runner disk once already. The
+          # gcc-side engine link is skipped: containerized gcc/ld cannot link
+          # ROCm runtime libs (both 22.04 and 24.04 bases); the hipcc-driver
+          # link of the test binary below covers the single-source claim, and
+          # the engine link is exercised on real ROCm hardware (GPU_BACKENDS.md).
+          docker run --rm -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:6.2 bash -c '
+            apt-get update && apt-get install -y --no-install-recommends make gcc g++ &&
+            make -C c gpu-compile HIP=1 HIP_ARCH=gfx1100'
+          echo "HIP syntax check passed"
 
   windows-cuda-build:
     # The Windows CUDA path has no coverage anywhere: `engine-cuda-syntax` above
@@ -105,13 +126,13 @@ jobs:
           make cuda-dll CUDA_ARCH=sm_80
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
           echo "coli_cuda.dll built (MSVC host)"
-      - name: make glm CUDA_DLL=1 (host links backend_loader, not cudart)
+      - name: make colibri CUDA_DLL=1 (host links backend_loader, not cudart)
         shell: msys2 {0}
         run: |
           cd c
-          make glm CUDA_DLL=1
-          test -f glm.exe || { echo "glm CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "glm.exe built against the DLL loader"
+          make colibri CUDA_DLL=1
+          test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "colibri.exe built against the DLL loader"
 
   web:
     name: Web UI

@@ -24,7 +24,7 @@
  * Run:  make tests/bench_dsa_select && ./tests/bench_dsa_select  (not in TEST_BINS)
  */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 #include <math.h>

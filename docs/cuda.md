@@ -10,7 +10,7 @@ cd c
 make cuda-test CUDA=1                  # q8/q4/q2/f32 kernel correctness
 make CUDA=1
 # optional dense-path experiment (hot experts are configured below)
-COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 ```
 
 Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
@@ -26,19 +26,19 @@ A measured `PIN` profile promotes its hottest experts into a persistent VRAM
 tier while keeping the rest in RAM:
 
 ```bash
-STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
+STATS=stats.txt SNAP=/nvme/glm52_i4 ./colibri 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
-PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 
 # multi-GPU expert tier, 150 GB total budget across six 32 GB devices
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
-SNAP=/nvme/glm52_i4 ./glm 64 4 4
+SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 
 # large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
 CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
-SNAP=/nvme/glm52_i4 ./glm 64 4 4
+SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before

@@ -40,6 +40,9 @@ typedef struct {
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
     int        nfd;
+    int        mfds[512];  /* MIRROR: fds of the second model copy (dual-SSD), -1 = absent */
+    int        mdfds[512]; /* O_DIRECT twins of the second copy, -1 = absent */
+    int        nmirror;    /* files accepted into the mirror (0 = mirror inactive) */
     int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
                            * costava decine di secondi/token (misurato sul primo run reale) */
@@ -99,9 +102,79 @@ static int st_open_fd(shards *S, const char *path) {
 
 /* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
  * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
-static int st_direct_fd(shards *S, int fd) {
-    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return S->dfds[i];
+static int st_fidx(shards *S, int fd) {
+    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return i;
     return -1;
+}
+static int st_direct_fd(shards *S, int fd) {
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->dfds[i];
+}
+
+/* ---- MIRROR (dual-SSD): second read-only copy of the model on another drive ----
+ * st_fd_rep/st_direct_fd_rep: fd of replica `rep` (0 = primary, 1 = mirror) for
+ * the SAME file identified by its primary fd. -1 if that replica is absent. */
+static int st_fd_rep(shards *S, int fd, int rep) {
+    if (!rep) return fd;
+    if (!S->nmirror) return -1;
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mfds[i];
+}
+static int st_direct_fd_rep(shards *S, int fd, int rep) {
+    if (!rep) return st_direct_fd(S, fd);
+    if (!S->nmirror) return -1;
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[i];
+}
+
+/* Registers <dir>/<basename> as a read replica of every already-indexed shard.
+ * A file is accepted ONLY if its size and safetensors header are byte-identical
+ * to the primary: the data_offsets then match by construction, so every pread
+ * is valid on either copy. Missing or divergent files simply stay on the
+ * primary (the mirror may be partial, e.g. a smaller SSD holding only the
+ * expert shards). Returns the number of accepted files. The mirror is NEVER
+ * written to: .coli_usage/.coli_kv keep deriving from the primary alone. */
+static int st_mirror_init(shards *S, const char *dir) {
+    if (S->nmirror) for (int i = 0; i < S->nfd; i++) {   /* re-init: drop the old replica */
+        if (S->mfds[i] >= 0) close(S->mfds[i]);
+        if (S->mdfds[i] >= 0) close(S->mdfds[i]);
+    }
+    for (int i = 0; i < ST_MAX_SHARDS; i++) { S->mfds[i] = -1; S->mdfds[i] = -1; }
+    S->nmirror = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        const char *base = strrchr(S->paths[i], '/');
+#ifdef _WIN32
+        const char *b2 = strrchr(S->paths[i], '\\');
+        if (b2 && (!base || b2 > base)) base = b2;
+#endif
+        base = base ? base + 1 : S->paths[i];
+        char mp[2048]; snprintf(mp, sizeof(mp), "%s/%s", dir, base);
+        int mfd = open(mp, COMPAT_O_RDONLY);
+        if (mfd < 0) continue;               /* partial mirror: this shard stays on the primary */
+        int64_t sza = lseek(S->fds[i], 0, SEEK_END), szb = lseek(mfd, 0, SEEK_END);
+        if (sza != szb) {
+            fprintf(stderr, "[MIRROR] %s: size differs from the primary copy — file skipped\n", mp);
+            close(mfd); continue;
+        }
+        uint64_t ha = 0, hb = 0; int ok = 1;   /* identical header => identical data_offsets */
+        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8 ||
+            ha != hb || ha == 0 || ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza) ok = 0;
+        if (ok) {
+            char *ba = malloc(ha), *bb = malloc(ha);
+            if (!ba || !bb || pread(S->fds[i], ba, ha, 8) != (ssize_t)ha ||
+                pread(mfd, bb, ha, 8) != (ssize_t)ha || memcmp(ba, bb, ha)) ok = 0;
+            free(ba); free(bb);
+        }
+        if (!ok) {
+            fprintf(stderr, "[MIRROR] %s: header differs from the primary copy — file skipped\n", mp);
+            close(mfd); continue;
+        }
+        S->mfds[i] = mfd;
+#ifdef O_DIRECT
+        S->mdfds[i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
+#elif defined(__APPLE__)
+        S->mdfds[i] = compat_open_direct(mp);
+#endif
+        S->nmirror++;
+    }
+    return S->nmirror;
 }
 
 /* indicizza tutti i model-*.safetensors in snap_dir */
@@ -137,21 +210,66 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
-static void st_init(shards *S, const char *snap_dir) {
+/* Scan one directory for *.safetensors shards, appending to files[] (dedup by
+ * basename, so a list of directories acts as a SEARCH PATH: the same shard
+ * present on two drives is taken from the first-listed one only). *added
+ * returns how many shards this dir contributed. */
+static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
+    DIR *d = opendir(dir); struct dirent *e;
+    if (!d) { perror(dir); exit(1); }
+    int base_n = *nf;
+    while ((e = readdir(d))) {
+        const char *dot = strrchr(e->d_name, '.');
+        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+            int dup = 0;
+            for (int i = 0; i < *nf; i++) {
+                const char *b = strrchr(files[i], '/');
+#ifdef _WIN32
+                const char *b2 = strrchr(files[i], '\\'); if (b2 && (!b || b2 > b)) b = b2;
+#endif
+                b = b ? b + 1 : files[i];
+                if (!strcmp(b, e->d_name)) { dup = 1; break; }  /* already taken from a higher-priority drive */
+            }
+            if (dup) continue;
+            if (*nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            snprintf(files[(*nf)++], 1024, "%s/%s", dir, e->d_name);
+        }
+    }
+    closedir(d);
+    if (added) *added = *nf - base_n;
+}
+
+/* Index shards from snap_dir, optionally SPLIT across extra drives listed in
+ * extra_dirs (';' or ',' separated). Each shard lives on exactly ONE drive
+ * (no duplication — unlike the dual-SSD mirror); a demand pread hits whichever
+ * drive holds that shard, so concurrent expert loads parallelise across drives
+ * and combined capacity is used. Scales to N drives. Metadata (config /
+ * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
-    DIR *d = opendir(snap_dir); struct dirent *e;
-    if (!d) { perror(snap_dir); exit(1); }
-    while ((e = readdir(d))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
-            snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
+    int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
+    int ndir = 1;
+    if (extra_dirs && *extra_dirs) {
+        char buf[4096]; snprintf(buf, sizeof(buf), "%s", extra_dirs);
+        char *p = buf;
+        while (p && *p) {
+            char *sep = p; while (*sep && *sep != ';' && *sep != ',') sep++;
+            int last = (*sep == 0); *sep = 0;
+            while (*p == ' ') p++;
+            size_t plen = strlen(p); while (plen > 0 && p[plen-1] == ' ') p[--plen] = 0;
+            if (*p) {
+                int cN = 0; st_scan_dir(p, files, &nf, &cN);
+                fprintf(stderr, "[SPLIT] +%s -> %d shard(s)\n", p, cN);
+                ndir++;
+            }
+            p = last ? NULL : sep + 1;
         }
+        fprintf(stderr, "[SPLIT] model across %d dir(s): %d shard(s) total (primary %s -> %d shard(s)), no duplication\n",
+                ndir, nf, snap_dir, c0);
     }
-    closedir(d);
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
 
@@ -200,11 +318,32 @@ static void st_init(shards *S, const char *snap_dir) {
             if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+            /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard
+             * di overflow, uno shape tipo [65535,65535,65535,...] fa avvolgere
+             * numel a un valore piccolo/negativo che poi passerebbe il cross-check
+             * numel*esz==nbytes in st_read_f32, riaprendo l'OOB. */
+            int64_t numel = 1; int bad_shape = 0;
+            for (int k = 0; k < shp->len; k++) {
+                int64_t d = (int64_t)shp->kids[k]->num;
+                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) { bad_shape = 1; break; }
+                numel *= d;
+            }
+            if (bad_shape) {
+                fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
+                        files[fi], name); exit(1); }
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            /* cross-check the declared element count against the byte span for FLOAT
+             * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
+             * into a caller-sized buffer, so a header with numel != nbytes/esz is an
+             * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
+             * their numel is unused by the read path and legitimately may differ. */
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+                  fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
+                          files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
@@ -219,6 +358,9 @@ static void st_init(shards *S, const char *snap_dir) {
         S->hidx[h] = i;
     }
 }
+
+/* backward-compatible single-directory entry point */
+static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
 
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
@@ -244,11 +386,30 @@ static void st_prefetch(shards *S, const char *name) {
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
+/* like st_prefetch, but on replica `rep`'s drive: the WILLNEED must warm the
+ * page cache of the SAME fd the later demand pread will hit. */
+static void st_prefetch_rep(shards *S, const char *name, int rep) {
+    st_tensor *t = st_find(S, name);
+    if (!t) return;
+    int fd = st_fd_rep(S, t->fd, rep);
+    if (fd < 0) fd = t->fd;
+    posix_fadvise(fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+}
+
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
+     * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
+     * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
+     * che e' dimensionato sul config, non sul file. Il chiamante che alloca su
+     * st_numel resta coerente; questo blocca l'ingresso ostile a monte. */
+    int esz = (t->dtype == 2) ? 4 : 2;
+    if (t->numel < 0 || t->numel > t->nbytes / esz || t->numel * (int64_t)esz != t->nbytes) {
+        fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
+                name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
@@ -262,6 +423,20 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
     return t->numel;
+}
+
+/* like st_read_f32 but refuses to write more than `cap` floats into `out`.
+ * Callers that size `out` from CONFIG dims (qt_alloc's O*I, per-row scales) must
+ * use this: a crafted header whose tensor holds more elements than the config
+ * shape would otherwise overrun `out`. Callers that size `out` from st_numel are
+ * self-consistent and may keep using st_read_f32. */
+static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->numel > cap) {
+        fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
+                name, (long long)t->numel, (long long)cap); exit(1); }
+    return st_read_f32(S, name, out, drop);
 }
 
 static int64_t st_numel(shards *S, const char *name) {
@@ -287,9 +462,13 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
+    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
+                name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");
+    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }

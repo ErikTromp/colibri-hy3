@@ -1,0 +1,15 @@
+# Python dependencies for the colibri offline converter / oracle / download tools
+# (c/tools/*.py and c/*.py). Minimum-version pins; for a fully reproducible env,
+# freeze exact versions into your own lockfile with `pip freeze > locked.txt`.
+torch>=2.4
+safetensors>=0.4
+huggingface-hub>=0.24
+numpy>=1.26
+tokenizers>=0.20
+transformers>=5.11        # <5.11 applies split-half Llama RoPE and drifts vs the engine's interleaved MLA (issue #281)
+datasets>=2.20
+requests>=2.31
+
+# Optional download-fallback backends (only needed for download_fp8.py's alt paths):
+#   modelscope>=1.9
+#   hf_transfer>=0.1

@@ -40,6 +40,13 @@ Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels; explicit `OMP_*` settings always take precedence.
 
+> Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
+> the engine's one-time OpenMP tuning re-exec on Linux — the re-exec'd image
+> inherited the first image's place-0 thread binding and the whole team landed on
+> one core (~20× slowdown). The engine now resets its affinity to all online CPUs
+> right before the re-exec, so explicit `OMP_*` pinning works as documented.
+> `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+
 ```bash
 coli plan --model /models/glm52_i4 --policy quality
 coli run --auto-tier --policy quality "Explain MoE offloading"

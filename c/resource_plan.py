@@ -152,14 +152,28 @@ def discover_gpus():
         result = None
     if result is not None:
         devices = []
-        for line in result.stdout.splitlines():
-            fields = [field.strip() for field in line.split(",", 3)]
+        import csv
+        for fields in csv.reader(result.stdout.splitlines()):
+            fields = [f.strip() for f in fields]
             if len(fields) != 4:
                 continue
             try:
-                index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
+                index = int(fields[0])
             except ValueError:
                 continue
+            # Unified-memory chips (e.g. NVIDIA GB10 Grace Blackwell) have no
+            # discrete VRAM pool, so nvidia-smi reports memory.total/memory.free
+            # as "[N/A]" rather than a number. Fall back to system RAM figures
+            # in that case instead of silently dropping the GPU from discovery.
+            try:
+                total, free = int(fields[2]), int(fields[3])
+            except ValueError:
+                try:
+                    meminfo = Path("/proc/meminfo").read_text()
+                    total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
+                    free = memory_available() // (1024 * 1024)
+                except (OSError, AttributeError):
+                    total = free = 0
             devices.append({"index": index, "name": fields[1],
                             "total_bytes": total * 1024 * 1024,
                             "free_bytes": free * 1024 * 1024})
@@ -218,14 +232,33 @@ def discover_gpus():
             for index, item in sorted(devices.items()) if "total_bytes" in item]
 
 
+def _physical_cores_warn(message):
+    """Visibility for a mis-detected core count: a silent "1" here becomes
+    OMP_NUM_THREADS=1 and pins the whole run to a single core (#325). Emit on
+    stderr so it surfaces in the [PLAN]/[OMP] stream without being swallowed."""
+    print(f"[plan] warning: {message}", file=sys.stderr)
+
+
 def physical_cpu_count():
+    """Number of physical CPU cores (not SMT siblings).
+
+    Per-expert matmul regions are tiny and back-to-back; two SMT siblings share
+    one AVX-512 unit and contend, so logical (SMT) counts over-subscribe and
+    hurt throughput. We want true physical cores. A silent 1 here propagates to
+    OMP_NUM_THREADS=1 and pins the run to one core (#325), so every fallback
+    must be visible, never just ``or 1``.
+    """
     if sys.platform == "win32":
-        # os.cpu_count() conta i processori logici (SMT): 2 thread/core saturano
-        # le unita' AVX-512 e peggiorano il matmul. Contiamo i core fisici veri
-        # con GetLogicalProcessorInformationEx(RelationProcessorCore).
+        # Contiamo i core fisici veri con GetLogicalProcessorInformationEx
+        # (RelationProcessorCore). Le firme vanno dichiarate: su Python a 64 bit
+        # una WinAPI non dichiarata ritorna c_int (32 bit) e riceve i puntatori
+        # come c_int di default, quindi il probe puo' fallire silenziosamente.
         try:
             import ctypes
             k32 = ctypes.windll.kernel32
+            k32.GetLogicalProcessorInformationEx.argtypes = [
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
             need = ctypes.c_ulong(0)
             k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
             buf = (ctypes.c_char * need.value)()
@@ -241,18 +274,69 @@ def physical_cpu_count():
                     off += size
                 if cores:
                     return cores
-        except (OSError, ValueError, AttributeError):
-            pass
+            _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
+        except (OSError, ValueError, AttributeError) as error:
+            _physical_cores_warn(f"Windows core probe failed: {error}")
     try:
+        # Ask lscpu for exactly core,socket and dedupe on (core, socket).
+        # Counting un-deduplicated rows would return logical threads (SMT),
+        # which was the original over-subscription bug. Empty fields ("-")
+        # mark an offline core/socket and fail int() -> skipped.
+        #
+        # Column layout robustness: `lscpu -p=<list>` emits *exactly* the
+        # requested columns (no CPU prefix), while bare `lscpu -p` prepends
+        # CPU. We requested two columns, but take the LAST TWO fields so the
+        # parser stays correct whether or not a CPU column is present
+        # (JustVugg review: the previous fields[1]/fields[2] indexing assumed
+        #  a 3-column layout and regressed 2-column output to the logical
+        # count -- the opposite of the fix).
         result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
-        cores = {tuple(map(int, line.split(","))) for line in result.stdout.splitlines()
-                 if line and not line.startswith("#")}
+        cores = set()
+        for line in result.stdout.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split(",")
+            if len(fields) < 2:
+                continue
+            try:
+                core, socket = int(fields[-2]), int(fields[-1])
+            except ValueError:
+                continue  # "-" for an offline core/socket
+            cores.add((core, socket))
         if cores:
             return len(cores)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return os.cpu_count() or 1
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        _physical_cores_warn(f"lscpu core probe failed: {error}")
+    logical = os.cpu_count()
+    if not logical:
+        _physical_cores_warn(
+            "could not detect any CPU cores; falling back to 1. "
+            "Set OMP_NUM_THREADS manually to fix single-core decode (#325).")
+        return 1
+    _physical_cores_warn(
+        f"physical-core probes unavailable; using {logical} logical CPUs "
+        f"(SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.")
+    return logical
+
+
+def _resolve_physical_cores(physical_cpus):
+    """Coerce the build_plan() physical-core argument to a sane positive int.
+
+    A None/0/None-ish value reaching here means physical_cpu_count() already
+    warned; clamp to 1 (so the engine always gets a positive team size) but keep
+    that clamp visible rather than silently masking it as the old ``max(1, int())``
+    did (#325)."""
+    try:
+        count = int(physical_cpus or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 1:
+        _physical_cores_warn(
+            "physical core count resolved to 0; defaulting to 1. "
+            "Set OMP_NUM_THREADS to fix single-core decode (#325).")
+        return 1
+    return count
 
 
 def cpu_socket_count():
@@ -269,6 +353,63 @@ def cpu_socket_count():
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return 1
+
+
+def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal):
+    """Derive tuning knobs from the bottleneck classification."""
+    tune = {}
+    has_gpu = bool(gpus)
+    n_gpu = len(gpus)
+
+    # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
+    # or streaming-bound (#467 measured 32% loss under CUDA at 85% hit).
+    # EXCEPTION: an explicit COLI_CUDA_MTP=1 in the environment is a documented
+    # opt-in to test speculation under CUDA (glm.c resolves DRAFT=-1 -> 3 only
+    # when it sees the var). Exporting DRAFT=0 here preempted that auto path,
+    # so the opt-in was silently inert on the Windows bare-run/auto-tier flows
+    # (#467): respect it and let the engine's auto path take over. Unset still
+    # gets DRAFT=0 -> MTP off, which is the measured-correct default.
+    if os.environ.get("COLI_CUDA_MTP") == "1":
+        pass  # explicit opt-in: leave DRAFT to the engine's auto resolution
+    elif bottleneck_class == "compute":
+        tune["DRAFT"] = {"value": "0",
+                         "reason": "compute-bound: MTP batch overhead exceeds yield"}
+    elif bottleneck_class == "disk" and projected_hit < 0.90:
+        tune["DRAFT"] = {"value": "0",
+                         "reason": "low hit rate: MTP widens expert union, adds disk reads"}
+    # otherwise leave DRAFT unset (engine default: auto)
+
+    # PIPE: resident pipeline mode depends on GPU count
+    if has_gpu and n_gpu == 1:
+        tune["COLI_CUDA_PIPE"] = {"value": "1",
+                                  "reason": "single GPU: S=1 pipeline gate"}
+    elif has_gpu and n_gpu > 1:
+        tune["COLI_CUDA_PIPE"] = {"value": "2",
+                                  "reason": "multi-GPU: residual stays on-device across layers"}
+    elif not has_gpu and bottleneck_class == "disk":
+        tune["PIPE"] = {"value": "1",
+                        "reason": "overlap disk reads with resident expert compute"}
+
+    # NUMA: selective interleave for GPU hosts, blanket hint for CPU-only
+    if cpu_sockets > 1 and has_gpu:
+        tune["COLI_NUMA"] = {"value": "1",
+                             "reason": "multi-socket + GPU: interleave expert slabs, protect DMA buffers"}
+    elif cpu_sockets > 1 and not has_gpu:
+        tune["COLI_NUMA"] = {"value": "1",
+                             "reason": "multi-socket CPU-only: interleave expert slabs across nodes"}
+        tune["_numa_hint"] = "numactl --interleave=all may perform better on CPU-only hosts"
+
+    # OMP: kill hot-thread spin when GPU/Metal owns the power budget
+    if plan_has_metal:
+        tune["COLI_NO_OMP_TUNE"] = {"value": "1",
+                                    "reason": "Metal: OMP spin-wait steals GPU power budget"}
+
+    # PIN: fully resident if RAM allows and no GPU tier competes
+    if projected_hit >= 0.99 and not has_gpu:
+        tune["PIN_GB"] = {"value": "all",
+                          "reason": "enough RAM for full expert residency"}
+
+    return tune
 
 
 POLICIES = {
@@ -349,19 +490,35 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if cold_bytes:
         warnings.append("cold expert misses may reach disk; normal decode speed depends on hit rate")
 
+    total_expert = info["expert_bytes"]
+    resident_expert = hot_bytes + warm_bytes
+    projected_hit = resident_expert / total_expert if total_expert else 1.0
+
     if cold_bytes:
         bottleneck = "disk expert misses"
-    elif warm_bytes:
-        bottleneck = "CPU expert compute and RAM bandwidth"
+        bottleneck_class = "disk"
+    elif warm_bytes and gpus:
+        bottleneck = "CPU expert tail and GPU compute"
+        bottleneck_class = "mixed"
+    elif projected_hit >= 0.99:
+        if gpus:
+            bottleneck = "GPU compute and interconnect"
+        else:
+            bottleneck = "CPU expert compute (fully resident)"
+        bottleneck_class = "compute"
     else:
-        bottleneck = "GPU compute and interconnect"
+        bottleneck = "CPU expert compute and RAM bandwidth"
+        bottleneck_class = "memory"
+
+    tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
+                      plan_has_metal=False)
 
     return {
         "version": 2,
         "policy": {"name": policy, **POLICIES[policy],
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
-        "cpu": {"physical_cores": max(1, int(physical_cpus)),
+        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
                 "sockets": max(1, int(cpu_sockets)),
                 "thread_policy": "physical-cores"},
         "tiers": {
@@ -376,6 +533,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
+        "bottleneck_class": bottleneck_class,
+        "projected_hit_rate": round(projected_hit, 4),
+        "tune": tune,
         "decisions": [
             {"target": "VRAM", "reason": "profile-ranked hot experts"},
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
@@ -390,15 +550,23 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    if sys.platform != "win32":
-        # la libgomp di MinGW non supporta l'affinity su Windows
-        # ("Affinity not supported on this configuration"): non impostarle li'.
-        result.setdefault("OMP_PROC_BIND", "spread")
-        result.setdefault("OMP_PLACES", "cores")
-    if sys.platform.startswith("linux") and plan["cpu"].get("sockets", 1) > 1:
-        # Selectively interleave large expert/dense slabs across memory controllers.
-        # Unlike blanket numactl interleave, this leaves CUDA staging buffers local.
-        result.setdefault("COLI_NUMA", "1")
+    # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
+    # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
+    # self-exec) sets OMP_PROC_BIND=close with overwrite=0 -- it prefers
+    # packing the team onto adjacent cores for the tiny back-to-back per-expert
+    # matmuls. Pre-setting OMP_PROC_BIND=spread here ran first and won (the
+    # engine's overwrite=0 setenv could not override an already-set var), and
+    # spread + OMP_PLACES=cores collapsed the team to one CPU on some libgomp /
+    # multi-socket topologies (#325: --auto-tier pinned decode to 1 core on a
+    # 64-core box even with OMP_NUM_THREADS=64). Leaving affinity to the engine
+    # makes --auto-tier match the plain (working) path. A user who wants a
+    # specific policy can still set OMP_PROC_BIND/OMP_PLACES in the environment
+    # themselves -- setdefault above only covers OMP_NUM_THREADS.
+    tune = plan.get("tune", {})
+    for key, entry in tune.items():
+        if key.startswith("_"):
+            continue
+        result.setdefault(key, entry["value"])
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
@@ -445,5 +613,18 @@ def format_plan(plan):
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
     lines.append(f"limit  {plan['expected_bottleneck']}")
+    hit = plan.get("projected_hit_rate", 0)
+    lines.append(f"hit    {hit:.0%} projected expert residency")
+    tune = plan.get("tune", {})
+    if tune:
+        lines.append("")
+        lines.append("auto-tune:")
+        for key, entry in tune.items():
+            if key.startswith("_"):
+                continue
+            lines.append(f"  {key}={entry['value']:12s} {entry['reason']}")
+        hint = tune.get("_numa_hint")
+        if hint:
+            lines.append(f"  hint: {hint}")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

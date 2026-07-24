@@ -83,6 +83,45 @@ def quant_int4_grouped(w, bits, gs=128):
     s_flat = s[:, :, 0].astype(np.float32).reshape(-1)
     return out.reshape(-1), s_flat
 
+def quant_int3_g64(w, bits=3, group=64):        # -> (qbytes U8 [O*ceil(I/64)*24], scales f32 [O*ceil(I/64)])
+    """int3 with PER-GROUP scales (fmt=5 in colibri.c): per 64-input group, symmetric absmax
+    (qmax=3, clamp [-4,3], stored v+4), packed as 16B low plane (2 bits/val, int2 layout)
+    + 8B high plane (1 bit/val). Same math as quant_ablation._quant_last_dim(bits=3,
+    group=64) (#132), here with real packing. 3.5 bits/weight effective."""
+    O, I = w.shape
+    ng = (I + group - 1) // group
+    pad = ng * group - I
+    wp = np.pad(w, ((0, 0), (0, pad))) if pad else w
+    g = wp.reshape(O, ng, group)
+    amax = np.abs(g).max(axis=2, keepdims=True)
+    s = np.maximum(amax / 3.0, 1e-8)
+    q = (np.clip(np.rint(g / s), -4, 3).astype(np.int32) + 4).astype(np.uint8)  # 0..7
+    if pad: q[:, -1, group - pad:] = 4                                          # pad packs as 0 after -4
+    lo = np.zeros((O, ng, 16), np.uint8)
+    for k in range(4):
+        lo |= ((q[:, :, k::4] & 3) << (k * 2)).astype(np.uint8)
+    hi = np.zeros((O, ng, 8), np.uint8)
+    for b in range(8):
+        hi |= (((q[:, :, b::8] >> 2) & 1) << b).astype(np.uint8)
+    out = np.concatenate([lo, hi], axis=2)                                      # [O, ng, 24]
+    return out.reshape(-1), s[:, :, 0].astype(np.float32).reshape(-1)
+
+E8 = "e8"                                       # CLI/bits-plumbing marker for fmt=6 (not a bit width)
+
+def quant_e8(w):                                # -> (qbytes U8 [O*ceil(I/256)*98], tag f32 [1])
+    """E8/IQ3 lattice (fmt=6 in colibri.c, #452): rotate the rows first (W@Q,
+    block-diagonal FWHT with regenerated signs — iq3_pack.rotate_rows mirrors
+    quant.h e8_rot_rows), then pack with the iq3 codec: 98B per 256 weights,
+    3.0625 bpw, every scale in-block. The .qs companion is a single float,
+    the engine's fmt=6 discriminator — not a scale."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import iq3_pack
+    O, I = w.shape
+    if I % 256:
+        raise SystemExit(f"e8: input dim {I} is not a multiple of 256")
+    packed = iq3_pack.encode(iq3_pack.rotate_rows(np.asarray(w, dtype=np.float32)))
+    return packed.reshape(-1), np.array([6.0], dtype=np.float32)
+
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
     qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
@@ -214,6 +253,14 @@ def dequant(f, name, keys):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
+# Per-projection bit overrides for ROUTED experts (gate_proj/up_proj/down_proj), set from
+# --up-bits/--gate-bits/--down-bits in main(). Empty = uniform xbits. Motivated by the
+# measured result that up_proj tolerates int3-g64 at ~zero quality cost while int2 craters
+# (OLMoE ablation, PR #168 comment): up-only int3 drops ~8% of expert bytes for free.
+# NB: the resume manifests (check_or_record_params and the --indir progress file) already
+# record dict(PROJ_BITS) — this global is the definition those sites depend on.
+PROJ_BITS = {}
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
@@ -235,9 +282,19 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # Any unknown kind that fell through classify as "q"
                 if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
                     bits = ebits
+                # Per-projection override for routed experts, applied on top of the type-level bits.
+                if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
+                    for proj, pb in PROJ_BITS.items():
+                        if f".{proj}.weight" in name: bits = pb; break
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
                     out_dict[name] = w.astype(np.float32); continue
-                if group_size > 0 and bits <= 4:
+                if bits == E8:
+                    # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
+                    q, s = quant_e8(w)
+                elif bits == 3:
+                    # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
+                    q, s = quant_int3_g64(w)
+                elif group_size > 0 and bits <= 4:
                     q, s = quant_int4_grouped(w, bits, group_size)
                 else:
                     q, s = (quant_int2(w, bits) if bits <= 2 else
@@ -247,6 +304,35 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
+def check_or_record_params(outdir, prefix, params):
+    """#383-class guard, mirrored onto the --repo download loops from the --indir
+    path's resume manifest (below): a resumed run with DIFFERENT conversion
+    parameters (bits, group size, PROJ_BITS, ...) must not silently mix bit-widths
+    across shards in the same outdir -- the #355 failure mode (a second pass with
+    changed flags overwriting/interleaving with a finished container in silence).
+    Unlike the --indir manifest this doesn't need to track per-shard completion:
+    the --repo loops already do that via out-NNNNN.safetensors existence, since
+    shard index maps directly to output filename there. Only whether the params
+    used SO FAR match this run's needs checking. Returns False (caller should
+    abort) on a mismatch, True otherwise; records params on first use."""
+    path = os.path.join(outdir, f".{prefix}params.json")
+    if os.path.exists(path):
+        try: prev = json.loads(open(path).read())
+        except (OSError, ValueError): prev = None
+        if prev is not None and prev != params:
+            print(f"ERROR: {path} records a conversion with {prev};\n"
+                  f"       this run uses {params}. Refusing to mix conversions in the "
+                  f"same outdir — use a fresh --outdir (or delete {path} and the "
+                  f"{prefix}*.safetensors shards to redo).")
+            return False
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: json.dump(params, f, indent=1)   # atomic write, same reasoning as the --indir manifest
+    os.replace(tmp, path)
+    return True
+
+def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
+    return E8 if v == E8 else int(v)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
@@ -254,7 +340,7 @@ def main():
     ap.add_argument("--outdir", required=False)
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
-    ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    ap.add_argument("--xbits", type=_bits, default=None) # bit degli expert ROUTED (streaming), o "e8" (fmt=6); default=ebits
     # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
     # Set these higher to protect sensitive tensors from quantization error.
     ap.add_argument("--shared-bits", type=int, default=None,
@@ -269,6 +355,13 @@ def main():
         help="bits for dense MLP (first 3 layers). Default=ebits")
     ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
         help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
+    # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
+    ap.add_argument("--up-bits", type=_bits, default=None,
+        help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
+    ap.add_argument("--gate-bits", type=_bits, default=None,
+        help="bits for gate_proj in routed experts. Default=xbits")
+    ap.add_argument("--down-bits", type=_bits, default=None,
+        help="bits for down_proj in routed experts. Default=xbits")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
@@ -298,6 +391,17 @@ def main():
               "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
               "or add --group-size 128 for group-scaled int4.")
     if a.xbits is None: a.xbits = a.ebits
+    for proj, val in (("gate_proj", a.gate_bits), ("up_proj", a.up_bits), ("down_proj", a.down_bits)):
+        if val is not None: PROJ_BITS[proj] = val
+    if PROJ_BITS:
+        print(f"[per-projection expert bits] {PROJ_BITS} (others -> xbits={a.xbits})")
+    # fmt=6 is all-or-nothing across the three expert projections: gate and up
+    # share one rotated input row in the engine (the placement rule in quant.h),
+    # so a mixed layout would need two gather buffers for zero measured benefit.
+    eff = [PROJ_BITS.get(p, a.xbits) for p in ("gate_proj", "up_proj", "down_proj")]
+    if any(b == E8 for b in eff) and not all(b == E8 for b in eff):
+        raise SystemExit(f"e8 covers all three expert projections or none (got {eff}); "
+                         "use --xbits e8, or none of the e8 flags")
 
     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
     # converter falls back to ebits for that type.
@@ -440,7 +544,8 @@ def main():
         # EN: resume skips only what matches, and different parameters on the same
         # EN: outdir are refused instead of mixing containers (the #355 failure mode).
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
-                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map}
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
         prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
         prog = {}
         if os.path.exists(prog_path):
@@ -587,8 +692,9 @@ def main():
             s0, s1 = segs[t]
             while done[t] < s1 - s0 and not stopfail:
                 pos = s0 + done[t]
-                req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
-                                                           "Range": f"bytes={pos}-{s1-1}"})
+                _hdrs = {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"}
+                if os.environ.get("HF_TOKEN"): _hdrs["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+                req = urllib.request.Request(url, headers=_hdrs)
                 try:
                     with urllib.request.urlopen(req, timeout=8) as r:
                         if r.status != 206:               # Range ignorato: multi-stream impossibile
@@ -651,6 +757,7 @@ def main():
             have0 = have
             req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
             if have: req.add_header("Range", f"bytes={have}-")
+            if os.environ.get("HF_TOKEN"): req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
                     if have and r.status == 200:          # server ha ignorato il Range: riparti pulito
@@ -718,6 +825,10 @@ def main():
         except Exception: pass
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
     if a.mtp:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-mtp-", params): return
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
@@ -737,6 +848,10 @@ def main():
             print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensors)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
     if a.indexer:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-idx-", params): return
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
@@ -756,6 +871,10 @@ def main():
                 if os.path.isfile(blob): os.remove(blob)
             print(f"    -> {os.path.basename(outp)} ({len(out)} tensors)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
+    params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+              "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+              "proj_bits": dict(PROJ_BITS)}
+    if not check_or_record_params(a.outdir, "out-", params): return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
