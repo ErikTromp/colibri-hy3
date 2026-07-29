@@ -55,6 +55,26 @@ jobs:
           make colibri ${{ matrix.make_args }}
           ls -lh colibri${{ matrix.ext }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The dashboard is what README shows and what serves the Expert Atlas, but it
+      # was never packaged: a release user has no web/ to build from, so `coli web`
+      # pointed them at a directory the archive does not contain. Built here rather
+      # than committed, so dist/ stays a build artifact.
+      # shell: bash — on Windows the job default is msys2, but setup-node installs
+      # the native node/npm, which msys2's minimal PATH does not see.
+      - name: Build web dashboard
+        shell: bash
+        run: |
+          cd web
+          npm ci
+          npm run build
+          ls -lh dist/index.html dist/experts.json
+
       - name: Package
         run: |
           TAG=${GITHUB_REF#refs/tags/}
@@ -71,6 +91,10 @@ jobs:
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp LICENSE dist/
+          # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
+          # probe that layout as well as the source checkout's one-level-up form.
+          mkdir -p dist/web
+          cp -r web/dist dist/web/dist
           cd dist
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             7z a colibri-${TAG}-${{ matrix.name }}.zip *
@@ -100,6 +124,12 @@ jobs:
           # (The v1.1.0 tag build failed here when the banner still said "colibrì".)
           echo "$out" | grep -q "colibri" || { echo "FAIL: coli did not run"; exit 1; }
           echo "OK: coli locates the engine in the published archive"
+          # Same reasoning for the dashboard: assert the files are there AND that the
+          # server resolves them, since a right-looking archive with an unresolvable
+          # path is exactly the failure this whole step exists to catch.
+          test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
+          test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
+          python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
 
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,

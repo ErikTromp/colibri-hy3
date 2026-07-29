@@ -178,7 +178,7 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使用
 **含 int8 MTP head 的版本**。它約為 **372 GB**，請放在空間足夠的硬碟上，最好是快碟：
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
 > ⚠️ 原始鏡像使用 int4 MTP head → 草稿接受率為 0%
 >（[#8](https://github.com/JustVugg/colibri/issues/8)）。請檢查你的版本：

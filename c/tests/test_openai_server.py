@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import math
@@ -10,20 +11,29 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from pathlib import Path
 
-from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, _engine_error, generation_options, parse_tool_calls,
-                           read_engine_turn, render_chat, serve)
+from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+                           DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
+                           READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
+                           _engine_error, conversation_cache_slot, generation_options,
+                           parse_tool_calls, read_engine_turn,
+                           render_chat, serve, split_thinking_reply, stop_policy)
 
 
 class FakeEngine:
     def __init__(self):
         self.calls = []
+        self.stop_requests = 0
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
-        on_text("Hé")
-        on_text("llo")
+        if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
+            on_accept({"prompt_tokens": 7})
+        for chunk in ("Hé", "llo"):
+            on_text(chunk)
+            if stopped and stopped():
+                self.stop_requests += 1
+                break
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
 
 
@@ -34,11 +44,11 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
-                                cancelled)
+                                cancelled, grammar, stopped, on_accept)
 
 
 class TemplateTest(unittest.TestCase):
@@ -71,11 +81,11 @@ class TemplateTest(unittest.TestCase):
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
-                         (4, 0.0, 1.0, None))
+                         (4, 0.0, 1.0, None, ()))
         # max_tokens above the server cap is clamped, not rejected (#260): OpenAI
         # clients default to large values; erroring breaks them.
         self.assertEqual(generation_options({"max_tokens": 9, "temperature": 0, "top_p": 1}, 8),
-                         (8, 0.0, 1.0, None))
+                         (8, 0.0, 1.0, None, ()))
         # non-positive / non-int max_tokens is still a hard error
         with self.assertRaises(APIError):
             generation_options({"max_tokens": 0}, 8)
@@ -84,7 +94,7 @@ class TemplateTest(unittest.TestCase):
         with self.assertRaises(APIError):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
-                         (8, 0.7, 0.9, None))
+                         (8, 0.7, 0.9, None, ()))
         # response_format -> grammar plumbing (draft source, never a constraint)
         opts = generation_options({"max_tokens": 4, "response_format": {"type": "json_object"}}, 8)
         self.assertIn("root ::=", opts[3])
@@ -109,6 +119,85 @@ class TemplateTest(unittest.TestCase):
         # (draft source only — bad grammar costs the speedup, never the request)
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
+
+    def test_validates_stop_sequences(self):
+        self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
+        self.assertEqual(generation_options({"stop": ["ONE", "TWO"]}, 8)[4],
+                         ("ONE", "TWO"))
+        for value in ("", [], [""], ["1", "2", "3", "4", "5"], 7, ["ok", 7]):
+            with self.subTest(value=value), self.assertRaises(APIError):
+                generation_options({"stop": value}, 8)
+
+    def test_glm_chat_defaults_role_stops_without_changing_other_policies(self):
+        with patch("openai_server.ARCH", "glm"):
+            self.assertEqual(stop_policy({}, True), (DEFAULT_CHAT_STOP_SEQUENCES, True))
+            self.assertEqual(stop_policy({}, False), ((), False))
+            self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
+            self.assertEqual(stop_policy({
+                "stop": "END", "x_colibri_ignore_leading_stop": True,
+            }, True), (("END",), True))
+        with patch("openai_server.ARCH", "inkling"):
+            self.assertEqual(stop_policy({}, True), ((), False))
+            self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
+        with self.assertRaises(APIError):
+            stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
+
+
+class StopFilterTest(unittest.TestCase):
+    def test_explicit_stop_composes_with_inkling_stream_split(self):
+        content = []
+        reasoning = []
+        splitter = InklingStreamSplit(content.append, reasoning.append)
+        stop_filter = StopFilter(("END",), splitter.feed)
+        for chunk in ("<|content_thinking|>why<|content_text|>answer EN", "Dignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        splitter.close()
+        self.assertEqual("".join(reasoning), "why")
+        self.assertEqual("".join(content), "answer ")
+        self.assertEqual(stop_filter.matched, "END")
+
+    def test_hides_match_split_across_chunks(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append)
+        for chunk in ("answer S", "TO", "Pignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer ")
+        self.assertEqual(stop_filter.matched, "STOP")
+
+    def test_flushes_partial_prefix_when_generation_finishes(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append)
+        stop_filter.feed("answer ST")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer ST")
+
+    def test_optional_patient_mode_ignores_only_leading_matches(self):
+        output = []
+        stop_filter = StopFilter(("<|user|>",), output.append, ignore_leading=True)
+        for chunk in ("<|us", "er|>answer", "<|user|>ignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer")
+        self.assertEqual(stop_filter.matched, "<|user|>")
+        self.assertEqual(stop_filter.leading_matches_ignored, 1)
+
+    def test_patient_mode_preserves_remainder_after_same_chunk_leading_match(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append, ignore_leading=True)
+        stop_filter.feed("STOPuseful STOPdiscarded")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "useful ")
+        self.assertEqual(stop_filter.matched, "STOP")
+
+    def test_strict_mode_still_stops_on_a_leading_match(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append)
+        stop_filter.feed("STOPignored")
+        stop_filter.finish()
+        self.assertEqual(output, [])
+        self.assertEqual(stop_filter.matched, "STOP")
 
 
 class ProtocolTest(unittest.TestCase):
@@ -446,6 +535,30 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_stops_generation_through_successful_done_path(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        stats = engine.generate("hello", 8, 0.7, 0.9, output.append,
+                                stopped=lambda: output == ["x"])
+        engine.close()
+        self.assertEqual(output, ["x"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
 
 class HTTPTest(unittest.TestCase):
     @classmethod
@@ -525,6 +638,35 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
 
+    def test_chat_completion_stops_across_engine_chunks(self):
+        before = self.engine.stop_requests
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stop": "éll",
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(body["choices"][0]["message"]["content"], "H")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(self.engine.stop_requests, before + 1)
+
+    def test_patient_stop_extension_ignores_a_leading_match(self):
+        before = self.engine.stop_requests
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stop": "H", "x_colibri_ignore_leading_stop": True,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(body["choices"][0]["message"]["content"], "éllo")
+        self.assertEqual(self.engine.stop_requests, before)
+
+    def test_patient_stop_extension_requires_a_boolean(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "stop": "H", "x_colibri_ignore_leading_stop": "yes",
+            })
+        self.assertEqual(caught.exception.code, 400)
+
     def test_rejects_invalid_cache_slot(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/chat/completions", {
@@ -544,6 +686,21 @@ class HTTPTest(unittest.TestCase):
         self.assertIn('\"content\":\"Hé\"', stream)
         self.assertIn('\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}', stream)
         self.assertTrue(stream.endswith("data: [DONE]\n\n"))
+
+    def test_streaming_stop_never_exposes_partial_sequence(self):
+        before = self.engine.stop_requests
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True, "stop": "éll",
+        }) as response:
+            raw = response.read().decode()
+        payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"]
+        content = "".join((choice.get("delta") or {}).get("content", "")
+                          for payload in payloads for choice in payload["choices"])
+        self.assertEqual(content, "H")
+        self.assertEqual(payloads[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(self.engine.stop_requests, before + 1)
 
     def test_legacy_completion(self):
         with self.request("/v1/completions", {
@@ -802,6 +959,513 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+
+class AllowedHostsTest(unittest.TestCase):
+    """#597: the DNS-rebinding guard must accept operator-trusted reverse-proxy
+    Host values, while still rejecting everything else by default."""
+
+    def _make_server(self, allowed_hosts=()):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
+                           allowed_hosts=allowed_hosts)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def _get_models(self, port, host_header):
+        # http.client lets us set an arbitrary Host header (urlopen forces its own).
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", host_header)
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_allowlist_wiring_normalises_and_filters(self):
+        server = self._make_server(allowed_hosts=("  Proxy.Example.TS.net ", "", "   "))
+        self.assertEqual(server.allowed_hosts, ("proxy.example.ts.net",))
+
+    def test_trusted_reverse_proxy_host_is_accepted(self):
+        server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
+        port = server.server_port
+        # trusted name (with a port suffix, case-insensitive) passes the guard
+        self.assertEqual(self._get_models(port, "Proxy.Example.TS.net:8000"), 200)
+        # loopback still works, unaffected by the allowlist
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_untrusted_host_is_rejected_by_default(self):
+        server = self._make_server()               # no allowlist: loopback/bind only
+        self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+    def test_untrusted_host_still_rejected_with_allowlist(self):
+        server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
+        self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+
+class ThinkingSplitUnitTest(unittest.TestCase):
+    """#597 item 4: the GLM reasoning splitter, incl. mkelcb's cross-chunk cases."""
+
+    def test_single_chunk(self):
+        self.assertEqual(split_thinking_reply("abc</think>def"), ("abc", "def"))
+
+    def test_close_tag_split_across_chunks(self):
+        thinking, answer = [], []
+        s = ThinkingStreamSplit(thinking.append, answer.append)
+        s.feed("abc</thi"); s.feed("nk>def"); s.finish()
+        self.assertEqual(("".join(thinking), "".join(answer)), ("abc", "def"))
+
+    def test_open_tag_split_and_stray_open_marker(self):
+        thinking, answer = [], []
+        s = ThinkingStreamSplit(thinking.append, answer.append)
+        s.feed("abc<thi"); s.feed("nk>def</think>ghi"); s.finish()
+        self.assertEqual(("".join(thinking), "".join(answer)), ("abcdef", "ghi"))
+
+    def test_thinking_disabled_is_all_answer(self):
+        # initial_thinking=False: a pure answer with no markers must not be filed as reasoning
+        self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
+                         ("", "plain answer"))
+
+    def test_missing_close_tag_surfaces_reasoning(self):
+        self.assertEqual(split_thinking_reply("thought with no end"),
+                         ("thought with no end", ""))
+
+
+class _ChunkEngine(FakeEngine):
+    """Engine that emits a caller-supplied chunk sequence, to exercise the streaming
+    reasoning splitter across arbitrary chunk boundaries."""
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = list(chunks)
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
+            on_accept({"prompt_tokens": 7})
+        for chunk in self.chunks:
+            on_text(chunk)
+            if stopped and stopped():
+                self.stop_requests += 1
+                break
+        return {"prompt_tokens": 7, "completion_tokens": len(self.chunks), "length_limited": False}
+
+
+class GlmReasoningStreamTest(unittest.TestCase):
+    """#597 item 4 end-to-end: GLM reasoning streams as reasoning_content, the answer as
+    content, no <think>/</think> leaks, cross-chunk-safe, and reasoning never contaminates
+    the tool-call buffer."""
+
+    def _server(self, chunks):
+        server = APIServer(("127.0.0.1", 0), _ChunkEngine(chunks), "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def _post(self, base, body):
+        req = Request(base + "/v1/chat/completions",
+                      data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            return response.read().decode()
+
+    def _deltas(self, raw):
+        reasoning, content, tool_calls = [], [], []
+        for line in raw.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            for choice in json.loads(line[6:])["choices"]:
+                delta = choice.get("delta") or {}
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
+                if delta.get("content"):
+                    content.append(delta["content"])
+                if delta.get("tool_calls"):
+                    tool_calls.extend(delta["tool_calls"])
+        return "".join(reasoning), "".join(content), tool_calls
+
+    def test_streaming_splits_reasoning_from_answer(self):
+        base = self._server(["I think ", "42", "</think>", "The answer ", "is 42"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "2+2?"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "I think 42")
+        self.assertEqual(content, "The answer is 42")
+        self.assertNotIn("<think>", raw)
+        self.assertNotIn("</think>", raw)
+
+    def test_streaming_close_tag_split_across_chunks(self):
+        base = self._server(["reason</thi", "nk>ans", "wer"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "x"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(content, "answer")
+        self.assertNotIn("think>", raw)
+
+    def test_streaming_thinking_off_is_all_content(self):
+        base = self._server(["Just ", "the answer"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": False,
+                                "messages": [{"role": "user", "content": "x"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "")
+        self.assertEqual(content, "Just the answer")
+
+    def test_streaming_reasoning_stays_out_of_tool_call(self):
+        base = self._server(["deciding to call", "</think>",
+                             "<tool_call>get_weather<arg_key>city</arg_key>"
+                             "<arg_value>Paris</arg_value></tool_call>"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "weather?"}],
+                                "tools": [{"type": "function", "function": {
+                                    "name": "get_weather", "parameters": {"type": "object",
+                                    "properties": {"city": {"type": "string"}}}}}]})
+        reasoning, content, tool_calls = self._deltas(raw)
+        self.assertEqual(reasoning, "deciding to call")
+        self.assertTrue(tool_calls, "expected a parsed tool call")
+        args = tool_calls[0]["function"]["arguments"]
+        self.assertIn("Paris", args)
+        self.assertNotIn("deciding", args)     # reasoning must not leak into the tool arguments
+        self.assertNotIn("deciding", content)  # nor into the visible answer
+
+    def test_nonstreaming_splits_reasoning(self):
+        base = self._server(["mulling ", "it over", "</think>", "final ", "answer"])
+        req = Request(base + "/v1/chat/completions",
+                      data=json.dumps({"model": "test-model", "enable_thinking": True,
+                        "messages": [{"role": "user", "content": "x"}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        message = body["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "mulling it over")
+        self.assertEqual(message["content"], "final answer")
+
+
+class AcceptFrameTest(unittest.TestCase):
+    """#597 item 6: the engine's ACCEPT frame gates the HTTP commit, and its invariants."""
+
+    def _engine(self, respond):
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            return Engine("glm", "model")
+
+    def test_accept_fires_before_any_data(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + rid + b" 42\n")
+            process.stdout.feed(b"DATA " + rid + b" 3\nHi!\n")
+            process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+        engine = self._engine(respond)
+        seen = []
+        engine.generate("hi", 8, 0.7, 0.9, lambda t: seen.append(("text", t)),
+                        on_accept=lambda info: seen.append(("accept", info)))
+        engine.close()
+        self.assertEqual(seen[0], ("accept", {"prompt_tokens": 42}))
+        self.assertEqual("".join(t for k, t in seen if k == "text"), "Hi!")
+
+    def test_error_before_accept_never_commits(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ERROR " + rid + b" CONTEXT_EXCEEDED 5000 4094\n")
+        engine = self._engine(respond)
+        accepts = []
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 8, 0.7, 0.9, lambda _: None,
+                            on_accept=lambda info: accepts.append(info))
+        engine.close()
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "context_length_exceeded")
+        self.assertEqual(accepts, [])          # nothing committed -> HTTP layer can send a clean 400
+
+    def test_data_before_accept_still_commits_for_old_engine(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"DATA " + rid + b" 3\nHey\n")
+            process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+        engine = self._engine(respond)
+        accepts, chunks = [], []
+        engine.generate("hi", 8, 0.7, 0.9, chunks.append,
+                        on_accept=lambda info: accepts.append(info))
+        engine.close()
+        self.assertEqual("".join(chunks), "Hey")
+        self.assertEqual(len(accepts), 1)      # first DATA implies acceptance (no ACCEPT frame)
+        self.assertIsNone(accepts[0]["prompt_tokens"])
+
+    def test_duplicate_accept_is_a_protocol_error(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
+            process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
+        engine = self._engine(respond)
+        with self.assertRaisesRegex(RuntimeError, "duplicate ACCEPT"):
+            engine.generate("hi", 8, 0.7, 0.9, lambda _: None, on_accept=lambda _: None)
+        engine.close()
+
+
+class _ContextExceededEngine(FakeEngine):
+    """Engine that rejects the prompt before ACCEPT — on_accept is never called."""
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        raise APIError(400, "This model's maximum context length is 4094 tokens.",
+                       "messages", "context_length_exceeded")
+
+
+class StreamingContextRejectTest(unittest.TestCase):
+    """#597 item 6: an oversized prompt on a *streaming* request must return a clean HTTP 400,
+    not a committed 200 SSE stream that only later discovers the overflow."""
+
+    def setUp(self):
+        self.server = APIServer(("127.0.0.1", 0), _ContextExceededEngine(), "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_streaming_context_exceeded_is_clean_400(self):
+        req = Request(self.base + "/v1/chat/completions",
+                      data=json.dumps({"model": "test-model", "stream": True,
+                        "messages": [{"role": "user", "content": "x" * 100}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
+        body = json.load(caught.exception)
+        self.assertEqual(body["error"]["code"], "context_length_exceeded")
+        self.assertEqual(body["error"]["param"], "messages")
+
+
+class _ExplodingEngine(FakeEngine):
+    """ACCEPTs the prompt (committing the streaming 200), then dies mid-generation."""
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 7})
+        on_text("partial")
+        raise RuntimeError("engine died mid-stream")
+
+
+class KeepAliveFramingTest(unittest.TestCase):
+    """#597 item 3: HTTP/1.1 persistence must not desynchronise.
+
+    The report was `Bad request syntax ('{...json body...}POST /v1/chat/completions HTTP/1.1')`
+    -- a previous body being parsed as the next request line. Two independent causes: an early
+    rejection returning before the body is read, and a streaming 200 that neither announced
+    close-framing nor stopped offering the socket for reuse when generation failed."""
+
+    CHAT = {"model": "test-model", "messages": [{"role": "user", "content": "x"}]}
+
+    def _server(self, engine=None, **kw):
+        server = APIServer(("127.0.0.1", 0), engine or FakeEngine(), "test-model", **kw)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def _conn(self, server):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _post(self, conn, body=None, headers=None, path="/v1/chat/completions"):
+        payload = json.dumps(self.CHAT if body is None else body)
+        head = {"Content-Type": "application/json"}
+        head.update(headers or {})
+        conn.request("POST", path, body=payload, headers=head)
+        response = conn.getresponse()
+        return response.status, response.read()
+
+    def _raw(self, server, request_bytes, read=4096):
+        """Byte-level exchange, for assertions about framing that a client library hides."""
+        sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=3)
+        self.addCleanup(sock.close)
+        sock.sendall(request_bytes)
+        chunks = []
+        try:
+            while True:
+                chunk = sock.recv(read)
+                if not chunk:
+                    break                      # server closed: the SSE message boundary
+                chunks.append(chunk)
+        except socket.timeout:
+            chunks.append(b"<STILL-OPEN>")     # no EOF: the connection was left reusable
+        return b"".join(chunks).decode("utf-8", "replace")
+
+    def _request_bytes(self, body, host="127.0.0.1"):
+        payload = json.dumps(body)
+        return (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+                f"\r\n{payload}").encode()
+
+    # --- an early rejection must not leave its body in the socket -------------------------
+
+    def test_rejected_host_does_not_desync_the_next_request(self):
+        server = self._server()
+        conn = self._conn(server)
+        status, _ = self._post(conn, headers={"Host": "evil.example.com"})
+        self.assertEqual(status, 403)
+        status, payload = self._post(conn)                  # same connection, valid request
+        self.assertEqual(status, 200, "the 403's unread body desynchronised the connection")
+        self.assertEqual(json.loads(payload)["object"], "chat.completion")
+
+    def test_rejected_auth_does_not_desync_the_next_request(self):
+        server = self._server(api_key="secret")
+        conn = self._conn(server)
+        status, _ = self._post(conn)                        # no Authorization header
+        self.assertEqual(status, 401)
+        status, payload = self._post(conn, headers={"Authorization": "Bearer secret"})
+        self.assertEqual(status, 200, "the 401's unread body desynchronised the connection")
+        self.assertEqual(json.loads(payload)["object"], "chat.completion")
+
+    def test_unknown_model_does_not_desync_the_next_request(self):
+        server = self._server()
+        conn = self._conn(server)
+        status, _ = self._post(conn, body=dict(self.CHAT, model="nope"))
+        self.assertEqual(status, 404)
+        status, _ = self._post(conn)
+        self.assertEqual(status, 200)
+
+    def test_each_body_is_consumed_exactly_once_across_reused_requests(self):
+        """The engine sees one prompt per request, with no body bytes bleeding between them."""
+        engine = FakeEngine()
+        server = self._server(engine)
+        conn = self._conn(server)
+        for index in range(4):
+            body = {"model": "test-model",
+                    "messages": [{"role": "user", "content": f"question-{index}"}]}
+            status, _ = self._post(conn, body=body)
+            self.assertEqual(status, 200)
+        self.assertEqual(len(engine.calls), 4)
+        for index, call in enumerate(engine.calls):
+            self.assertIn(f"question-{index}", call[0])
+            self.assertNotIn("question-", call[0].split(f"question-{index}")[1],
+                             "a later body leaked into an earlier prompt")
+
+    def test_interleaved_rejections_and_successes_stay_in_sync(self):
+        server = self._server(api_key="secret")
+        conn = self._conn(server)
+        good = {"Authorization": "Bearer secret"}
+        for _ in range(3):
+            self.assertEqual(self._post(conn)[0], 401)
+            self.assertEqual(self._post(conn, headers={"Host": "evil.example.com", **good})[0], 403)
+            self.assertEqual(self._post(conn, headers=good)[0], 200)
+
+    # --- bodies we refuse to swallow must close rather than desynchronise -----------------
+
+    def test_oversized_content_length_closes_instead_of_desyncing(self):
+        server = self._server()
+        raw = self._raw(server, (b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: 99999999\r\n\r\n{}"))
+        self.assertIn(" 400 ", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw,
+                         "an over-limit body must close the connection, not keep it alive")
+
+    def test_unparseable_content_length_closes_instead_of_desyncing(self):
+        server = self._server()
+        raw = self._raw(server, (b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: abc\r\n\r\n{}"))
+        self.assertIn("400", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    # --- a streaming 200 is close-framed, and says so ------------------------------------
+
+    def test_streaming_response_announces_close_framing(self):
+        server = self._server()
+        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        headers = raw.split("\r\n\r\n", 1)[0].lower()
+        self.assertIn("content-type: text/event-stream", headers)
+        self.assertIn("connection: close", headers,
+                      "SSE has no Content-Length, so the close IS the boundary and must be declared")
+        self.assertIn("data: [DONE]", raw)
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_anthropic_stream_announces_close_framing(self):
+        server = self._server()
+        payload = json.dumps({"model": "test-model", "stream": True, "max_tokens": 16,
+                              "messages": [{"role": "user", "content": "x"}]})
+        raw = self._raw(server, (f"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 f"Content-Type: application/json\r\n"
+                                 f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode())
+        self.assertIn("connection: close", raw.split("\r\n\r\n", 1)[0].lower())
+        self.assertIn("event: message_stop", raw)
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
+        """Once the 200 is out, a 500 status line would land inside the event stream."""
+        server = self._server(_ExplodingEngine())
+        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        self.assertEqual(raw.count("HTTP/1."), 1,
+                         "a second HTTP response was spliced into the committed SSE stream")
+        self.assertIn("partial", raw)            # the events sent before the failure survive
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_non_streaming_response_still_reuses_the_connection(self):
+        """The fix must not turn every response into a close: plain JSON stays persistent."""
+        server = self._server()
+        conn = self._conn(server)
+        self.assertEqual(self._post(conn)[0], 200)
+        self.assertEqual(self._post(conn)[0], 200)
+        self.assertIsNotNone(conn.sock, "the JSON path should keep the connection open")
+
+
+class ConversationCacheSlotTest(unittest.TestCase):
+    """#634 Defect 1: a conversation must map to one stable KV slot across its turns."""
+
+    def _conv(self, *user_and_assistant_turns, system="you are a helpful assistant"):
+        messages = [{"role": "system", "content": system}]
+        for i, text in enumerate(user_and_assistant_turns):
+            messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": text})
+        return messages
+
+    def test_single_slot_is_always_zero(self):
+        self.assertEqual(conversation_cache_slot(self._conv("hi"), 1), 0)
+
+    def test_empty_or_bad_input_is_zero(self):
+        self.assertEqual(conversation_cache_slot(None, 8), 0)
+        self.assertEqual(conversation_cache_slot([], 8), 0)
+
+    def test_slot_is_in_range(self):
+        for kv in (2, 3, 8, 16):
+            slot = conversation_cache_slot(self._conv("solve x"), kv)
+            self.assertTrue(0 <= slot < kv, f"slot {slot} out of range for kv={kv}")
+
+    def test_stable_across_turns_of_one_conversation(self):
+        # The engine caches the prefix; every turn of the same conversation must return
+        # the same slot so it lands on its warm KV instead of re-prefilling.
+        first_turn = self._conv("1+1=")
+        second_turn = self._conv("1+1=", "2", "and 2+2?")
+        third_turn = self._conv("1+1=", "2", "and 2+2?", "4", "thanks")
+        base = conversation_cache_slot(first_turn, 8)
+        self.assertEqual(conversation_cache_slot(second_turn, 8), base)
+        self.assertEqual(conversation_cache_slot(third_turn, 8), base)
+
+    def test_distinct_conversations_can_differ(self):
+        # Not a guarantee for any single pair (hashing collides sometimes), but across a
+        # spread of openings we must see more than one slot used, i.e. not everything on 0.
+        slots = {conversation_cache_slot(self._conv(f"task number {i}"), 8) for i in range(40)}
+        self.assertGreater(len(slots), 1)
+
+    def test_deterministic(self):
+        conv = self._conv("same question", "same answer", "again")
+        self.assertEqual(conversation_cache_slot(conv, 8), conversation_cache_slot(conv, 8))
 
 
 if __name__ == "__main__":

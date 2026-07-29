@@ -15,6 +15,7 @@ c/colibri.exe
 c/glm
 c/glm.exe
 c/olmoe
+c/inkling
 c/olmoe.exe
 c/iobench
 c/iobench.exe
@@ -68,3 +69,4 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+c/tiny_inkling/

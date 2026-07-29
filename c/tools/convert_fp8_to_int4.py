@@ -261,6 +261,25 @@ def dequant(f, name, keys):
 # record dict(PROJ_BITS) — this global is the definition those sites depend on.
 PROJ_BITS = {}
 
+# Rows per quantization block. Every non-E8 format here carries per-row scales (or
+# per-group scales along I), so rows never interact and blocking is BIT-IDENTICAL to
+# quantizing the whole tensor — it only caps the peak of the quantizer's full-size
+# temporaries. That matters on small hosts: embed/lm_head at [154880, 6144] is 3.8 GB
+# as f32, and abs/divide/rint/clip each materialise another copy (~15 GB peak) on a
+# box with 13 GB free. E8 is excluded — it is already blocked inside iq3_pack.encode,
+# and its ".qs" companion is a single format tag, not a per-row scale.
+QUANT_ROWS = int(os.environ.get("COLI_QUANT_ROWS", "8192"))
+
+def _rowwise(fn, w, *args):
+    O = w.shape[0]
+    if O <= QUANT_ROWS:
+        return fn(w, *args)
+    qs, ss = [], []
+    for r0 in range(0, O, QUANT_ROWS):
+        q, s = fn(w[r0:r0 + QUANT_ROWS], *args)
+        qs.append(q); ss.append(s)
+    return np.concatenate(qs), np.concatenate(ss)
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
@@ -290,15 +309,16 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                     out_dict[name] = w.astype(np.float32); continue
                 if bits == E8:
                     # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
+                    # Already row-blocked inside iq3_pack.encode.
                     q, s = quant_e8(w)
                 elif bits == 3:
                     # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
-                    q, s = quant_int3_g64(w)
+                    q, s = _rowwise(quant_int3_g64, w)
                 elif group_size > 0 and bits <= 4:
-                    q, s = quant_int4_grouped(w, bits, group_size)
+                    q, s = _rowwise(quant_int4_grouped, w, bits, group_size)
                 else:
-                    q, s = (quant_int2(w, bits) if bits <= 2 else
-                            quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+                    q, s = _rowwise(quant_int2 if bits <= 2 else
+                                    quant_int4 if bits <= 4 else quant_int8, w, bits)
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
 
@@ -353,8 +373,16 @@ def main():
         help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
     ap.add_argument("--dmlp-bits", type=int, default=None,
         help="bits for dense MLP (first 3 layers). Default=ebits")
-    ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
-        help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
+    ap.add_argument("--group-size", type=int, default=64,
+        # gs64 is the community-validated default (#225 root cause, #455 5/5-clean
+        # verification, ablation #453: per-row int4 costs -9.3pp mean acc_norm vs
+        # -2.2..-3.4pp for group-scaled). Per-row remains available as an explicit
+        # opt-out; the resume manifest (check_or_record_params) refuses to mix the
+        # two in one outdir, so a resumed pre-default conversion aborts loudly
+        # instead of interleaving formats (#355-class).
+        help="group size for int4 scales: 64=one scale per 64 elements (default, "
+             "much better quality), 0=per-row (legacy; costs ~9pp on quality "
+             "benchmarks and is the #455 non-termination trigger)")
     # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
     ap.add_argument("--up-bits", type=_bits, default=None,
         help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
@@ -389,7 +417,7 @@ def main():
         # EN: this way is repairable in place with tools/repair_mtp_int8.py.
         print(f"WARNING: --mtp with --ebits {a.ebits} and per-row scales ZEROES eh_proj's "
               "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
-              "or add --group-size 128 for group-scaled int4.")
+              "or drop --group-size 0 to get the group-scaled default.")
     if a.xbits is None: a.xbits = a.ebits
     for proj, val in (("gate_proj", a.gate_bits), ("up_proj", a.up_bits), ("down_proj", a.down_bits)):
         if val is not None: PROJ_BITS[proj] = val
@@ -559,6 +587,8 @@ def main():
                 return
         done = prog.setdefault("shards", {}); prog["params"] = params
         n = 0; fresh = 0; skipped = 0
+        import time as _t
+        t_start = _t.time()
         for i, sp in enumerate(shards):
             key = os.path.basename(sp)
             prev = done.get(key)                          # None = mai visto; "" = visto, vuoto; nome = emesso
@@ -566,6 +596,14 @@ def main():
                 if prev: n += 1
                 skipped += 1
                 continue
+            # Progress + ETA: the local pass can run for days on a big model (E8 on
+            # GLM-5.2 is ~50 h split across workers), and without this the loop is
+            # silent until it finishes. flush because stdout is a redirected file.
+            eta = ""
+            if fresh:
+                per = (_t.time() - t_start) / fresh
+                eta = f", ETA {per * (len(shards) - i) / 3600:.1f} h"
+            print(f"[{i + 1}/{len(shards)}] {key} ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
             out = {}
             convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
                           keep_mtp=a.mtp, keep_idx=a.indexer,

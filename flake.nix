@@ -55,7 +55,7 @@
 
           buildPhase = ''
             runHook preBuild
-            make -C c glm ARCH="$ARCH"
+            make -C c colibri ARCH="$ARCH"
             runHook postBuild
           '';
 
@@ -68,7 +68,7 @@
             # modules it imports (openai_server.py, resource_plan.py,
             # doctor.py), and tools/ all sit next to each other.
             mkdir -p $out/lib/colibri/tools $out/bin
-            cp c/glm             $out/lib/colibri/glm
+            cp c/colibri         $out/lib/colibri/colibri
             cp c/coli            $out/lib/colibri/coli
             chmod +x $out/lib/colibri/coli
             cp c/openai_server.py c/resource_plan.py c/doctor.py c/version.py \
@@ -76,14 +76,14 @@
             cp -r c/tools/*      $out/lib/colibri/tools/
 
             # $out/bin holds the user-facing entry points.
-            ln -s ../lib/colibri/glm $out/bin/glm
+            ln -s ../lib/colibri/colibri $out/bin/colibri
 
             # Wrap coli: point it at the bundled engine (COLI_ENGINE) so it is
             # found by default, and at the module dir (PYTHONPATH) so
             # `import openai_server` / `resource_plan` / `doctor` resolve.
             makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
               --add-flags "$out/lib/colibri/coli" \
-              --set-default COLI_ENGINE "$out/lib/colibri/glm" \
+              --set-default COLI_ENGINE "$out/lib/colibri/colibri" \
               --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
             runHook postInstall
           '';
@@ -117,9 +117,14 @@
             type = "app";
             program = pkgs.lib.getExe colibri;
           };
-          glm = {
+          # `nix run .#engine` runs the engine binary directly, skipping the
+          # coli launcher. Named "engine", not "colibri", so it doesn't shadow
+          # packages.colibri (whose mainProgram is coli). Replaces the old
+          # `.#glm`, which pointed at a share/colibri/ path the installPhase
+          # never produced (#595).
+          engine = {
             type = "app";
-            program = "${colibri}/share/colibri/glm";
+            program = "${colibri}/bin/colibri";
           };
         };
 
@@ -141,9 +146,9 @@
             echo "  gcc: $(gcc --version | head -1)"
             echo "  python: $(python3 --version)"
             echo ""
-            echo "Build the engine:   make -C c glm"
+            echo "Build the engine:   make -C c colibri"
             echo "Run the converter:  python c/coli convert --model /path/to/glm52_i4"
-            echo "Chat:               COLI_MODEL=/path/to/glm52_i4 ./c/glm ..."
+            echo "Chat:               COLI_MODEL=/path/to/glm52_i4 ./c/colibri ..."
           '';
         };
       }

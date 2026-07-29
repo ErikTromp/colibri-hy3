@@ -1,11 +1,11 @@
 """Integration tests for COLI_CUDA auto-enable and CUDA_EXPERT_GB auto-size.
 
-These tests run the compiled ``glm`` binary (via ``coli run``) and verify
+These tests run the compiled ``colibri`` binary and verify
 the three COLI_CUDA modes (unset / auto-detect, 0 / forced-CPU, 1 / hard-fail)
 and the CUDA_EXPERT_GB auto-size behavior.
 
 Prerequisites (tests skip gracefully when unmet):
-- Compiled ``coli`` / ``glm`` binary (any build — CUDA or CPU-only)
+- Compiled ``colibri`` binary (any build — CUDA or CPU-only)
 - nvidia-smi (for GPU-specific tests)
 """
 
@@ -20,16 +20,16 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent.parent
-GLM = HERE / ("glm.exe" if sys.platform == "win32" else "glm")
+COLIBRI = HERE / ("colibri.exe" if sys.platform == "win32" else "colibri")
 
 
 def _binary_has_cuda():
-    """Check whether the ``glm`` binary was compiled with CUDA support."""
-    if not GLM.exists():
+    """Check whether the ``colibri`` binary was compiled with CUDA support."""
+    if not COLIBRI.exists():
         return False
     try:
         result = subprocess.run(
-            [str(GLM), "1"],
+            [str(COLIBRI), "1"],
             env={**os.environ, "COLI_CUDA": "1",
                  "SNAP": str(HERE)},
             cwd=str(HERE), text=True, capture_output=True, timeout=10,
@@ -51,8 +51,8 @@ def _gpu_available():
         return False
 
 
-_HAS_GLM = GLM.exists()
-_HAS_CUDA_BINARY = _HAS_GLM and _binary_has_cuda()
+_HAS_BINARY = COLIBRI.exists()
+_HAS_CUDA_BINARY = _HAS_BINARY and _binary_has_cuda()
 _HAS_GPU = _gpu_available()
 
 
@@ -101,13 +101,13 @@ def _minimal_model(parent):
 
 
 class CudaStartupTest(unittest.TestCase):
-    """COLI_CUDA mode tests — call ``glm`` directly to exercise ``main()``
-    including the CUDA init block at c/glm.c."""
+    """COLI_CUDA mode tests — call ``colibri`` directly to exercise ``main()``
+    including the CUDA init block at c/colibri.c."""
 
     @classmethod
     def setUpClass(cls):
-        if not _HAS_GLM:
-            raise unittest.SkipTest("glm binary not found")
+        if not _HAS_BINARY:
+            raise unittest.SkipTest("colibri binary not found")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -115,8 +115,8 @@ class CudaStartupTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_glm(self, cap="1", env=None, timeout=30):
-        """Run the glm binary directly with a minimal model.
+    def _run(self, cap="1", env=None, timeout=30):
+        """Run the colibri binary directly with a minimal model.
 
         The binary will fail during model_init (fake weights) but CUDA
         init messages are emitted first.
@@ -124,7 +124,7 @@ class CudaStartupTest(unittest.TestCase):
         model = _minimal_model(self.tmp.name)
         merged = {**os.environ, "SNAP": str(model), **(env or {})}
         return subprocess.run(
-            [str(GLM), cap],
+            [str(COLIBRI), cap],
             env=merged, cwd=str(HERE), text=True, capture_output=True,
             timeout=timeout,
         )
@@ -133,20 +133,20 @@ class CudaStartupTest(unittest.TestCase):
 
     def test_cuda_zero_suppresses_all_cuda_output(self):
         """COLI_CUDA=0 must not emit any [CUDA] line to stderr."""
-        result = self._run_glm(env={"COLI_CUDA": "0"})
+        result = self._run(env={"COLI_CUDA": "0"})
         self.assertNotIn("[CUDA]", result.stderr or "")
 
     def test_cuda_zero_with_gpu_env_fails_guard(self):
-        """COLI_GPU with COLI_CUDA=0 exits non-zero (guard in glm.c).
+        """COLI_GPU with COLI_CUDA=0 exits non-zero (guard in colibri.c).
 
         On CPU-only binary the guard fires from the #else branch with a
         different message; both are valid and tested here.
         """
-        result = self._run_glm(env={"COLI_CUDA": "0", "COLI_GPU": "0"})
+        result = self._run(env={"COLI_CUDA": "0", "COLI_GPU": "0"})
         self.assertNotEqual(result.returncode, 0)
 
         if _HAS_CUDA_BINARY:
-            # CUDA build: guard at glm.c L6424 — COLI_GPU(S) requires COLI_CUDA=1
+            # CUDA build: guard at colibri.c — COLI_GPU(S) requires COLI_CUDA=1
             self.assertIn("COLI_GPU(S) requires COLI_CUDA=1", result.stderr)
         else:
             # CPU-only build: #else branch — CUDA was requested, but CPU-only
@@ -158,7 +158,7 @@ class CudaStartupTest(unittest.TestCase):
         """CPU-only binary: COLI_CUDA=1 → exit≠0, 'CPU-only' in stderr."""
         if _HAS_CUDA_BINARY:
             self.skipTest("binary has CUDA; CPU-only rejection not reachable")
-        result = self._run_glm(env={"COLI_CUDA": "1"})
+        result = self._run(env={"COLI_CUDA": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("CPU-only", result.stderr)
 
@@ -168,7 +168,7 @@ class CudaStartupTest(unittest.TestCase):
             self.skipTest("CPU-only binary; covered by cpu-only test")
         if _HAS_GPU:
             self.skipTest("GPU present; cannot simulate missing backend")
-        result = self._run_glm(env={"COLI_CUDA": "1"})
+        result = self._run(env={"COLI_CUDA": "1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("[CUDA] requested backend is unavailable", result.stderr)
 
@@ -180,7 +180,7 @@ class CudaStartupTest(unittest.TestCase):
             self.skipTest("CPU-only binary has no auto-detect path")
         if _HAS_GPU:
             self.skipTest("GPU present; cannot simulate auto-detect fallback")
-        result = self._run_glm()
+        result = self._run()
         self.assertNotEqual(result.returncode, 2)
         self.assertIn("auto-detect: backend unavailable", result.stderr)
 
@@ -190,7 +190,7 @@ class CudaStartupTest(unittest.TestCase):
             self.skipTest("CPU-only binary")
         if not _HAS_GPU:
             self.skipTest("no GPU available")
-        result = self._run_glm()
+        result = self._run()
         self.assertNotEqual(result.returncode, 2)
         self.assertIn("[CUDA] mode:", result.stderr)
 
@@ -200,7 +200,7 @@ class CudaStartupTest(unittest.TestCase):
         """Explicit CUDA_EXPERT_GB=0 — no auto-size message at startup."""
         if not _HAS_CUDA_BINARY:
             self.skipTest("CPU-only binary")
-        result = self._run_glm(env={"CUDA_EXPERT_GB": "0"})
+        result = self._run(env={"CUDA_EXPERT_GB": "0"})
         self.assertNotIn("auto-sized", result.stderr or "")
 
 
@@ -209,8 +209,8 @@ class CudaExpertBudgetTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not _HAS_GLM:
-            raise unittest.SkipTest("glm binary not found")
+        if not _HAS_BINARY:
+            raise unittest.SkipTest("colibri binary not found")
         if not _HAS_CUDA_BINARY:
             raise unittest.SkipTest("CPU-only binary — auto-size path not compiled in")
         if not _HAS_GPU:
@@ -222,25 +222,25 @@ class CudaExpertBudgetTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_glm(self, cap="1", env=None, timeout=60):
+    def _run(self, cap="1", env=None, timeout=60):
         model = _minimal_model(self.tmp.name)
         merged = {**os.environ, "SNAP": str(model), **(env or {})}
         return subprocess.run(
-            [str(GLM), cap],
+            [str(COLIBRI), cap],
             env=merged, cwd=str(HERE), text=True, capture_output=True,
             timeout=timeout,
         )
 
     def test_auto_size_prints_budget_when_expert_gb_unset(self):
         """CUDA enabled, CUDA_EXPERT_GB unset → 'auto-sized' in stderr."""
-        result = self._run_glm(env={"COLI_CUDA": "1"})
+        result = self._run(env={"COLI_CUDA": "1"})
         combined = (result.stderr or "") + (result.stdout or "")
         if "auto-sized" in combined:
             self.assertIn("expert budget auto-sized", combined)
 
     def test_explicit_expert_gb_zero_suppresses_auto_size_at_pin_time(self):
         """CUDA_EXPERT_GB=0 → no auto-size message even at pin time."""
-        result = self._run_glm(env={"COLI_CUDA": "1", "CUDA_EXPERT_GB": "0"})
+        result = self._run(env={"COLI_CUDA": "1", "CUDA_EXPERT_GB": "0"})
         combined = (result.stderr or "") + (result.stdout or "")
         self.assertNotIn("auto-sized", combined)
 

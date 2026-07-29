@@ -198,7 +198,7 @@ Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — **usa la
 versione con le teste MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
 disco che abbia lo spazio, meglio se veloce:
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
 > ⚠️ Il mirror originale contiene teste MTP int4 → accettazione dei draft allo 0%
 > ([#8](https://github.com/JustVugg/colibri/issues/8)). Verifica la tua versione:

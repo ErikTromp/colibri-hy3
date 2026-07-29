@@ -2,7 +2,7 @@
 
 Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying `glm` engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
 
-**Generated from `upstream/dev @ 6d3ed7e`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
+**Updated for the contribution based on `upstream/dev @ 21e7a35`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
 
 ---
 
@@ -21,7 +21,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `build` | Build/prepare the engine. |
 | `info` | Print model / build info. |
 | `plan` | Show the computed RAM/VRAM placement plan (`--json` for machine-readable). |
-| `doctor` | Environment/health check (`--json` for a versioned report). |
+| `doctor` | Environment/health check (`--json` report, `--deep` strict preflight). |
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
@@ -73,6 +73,11 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
 **`plan` / `doctor`**: `--json`.
+
+**`doctor`**: `--deep` strictly checks every safetensors header and tensor
+layout, filename-declared shard completeness, required core tensors, an
+optional model index, and runtime-equivalent size/header admission for
+`COLI_MODEL_MIRROR`. It does not hash tensor payloads or load the engine.
 
 ---
 

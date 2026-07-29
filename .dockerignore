@@ -1,0 +1,20 @@
+# The Docker build only needs c/ (engine sources + launcher). Everything else
+# is either huge, host-specific, or irrelevant to the image.
+.git
+web/node_modules
+web/dist
+site
+docs
+**/*.o
+**/*.exe
+c/colibri
+c/glm
+c/olmoe
+c/glm_tiny
+**/.coli_usage
+**/.coli_kv*
+**/__pycache__
+*.safetensors
+*.log
+CODEX-BRIEF.md
+wt-inc4

@@ -37,6 +37,10 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 
 /* CPU model + cores + RAM (GB); empty/zero where unavailable. */
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double *ram_avail){
     cpu[0]=0;
 #ifdef _WIN32
@@ -47,6 +51,8 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
       char *b=(char*)r; b[47]=0; while(*b==' ')b++;
       snprintf(cpu,cn,"%s",b); }
 #endif
+#elif defined(__APPLE__)
+    { size_t sl=cn; if(sysctlbyname("machdep.cpu.brand_string",cpu,&sl,NULL,0)) cpu[0]=0; }
 #else
     FILE *ci=fopen("/proc/cpuinfo","r");
     if(ci){ char ln[256];
@@ -65,6 +71,15 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
     *ram_total=*ram_avail=0;
 #ifdef _WIN32
     compat_meminfo(ram_total,ram_avail);
+#elif defined(__APPLE__)
+    { uint64_t ms=0; size_t sl=sizeof(ms);
+      if(!sysctlbyname("hw.memsize",&ms,&sl,NULL,0)) *ram_total=(double)ms/1e9;
+      int64_t pgsz=0; sl=sizeof(pgsz);
+      if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
+      vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
+      if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)==KERN_SUCCESS)
+          /* macOS analogue of Linux MemAvailable: free + inactive + purgeable */
+          *ram_avail=(double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9; }
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;

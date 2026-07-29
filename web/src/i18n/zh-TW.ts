@@ -47,6 +47,8 @@ const zhTW: Record<string, string> = {
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "插槽 {{n}}",
+  "topbar.truncated": "已截斷",
+  "topbar.truncatedHelp": "回應達到最大輸出 token 上限而被截斷。請提高「最大輸出 token 數」以查看完整答案。",
   "topbar.clear": "清除",
 
   "hero.title": "COLIBRÌ 引擎",

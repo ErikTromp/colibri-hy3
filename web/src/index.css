@@ -105,6 +105,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* ---- rich metrics badges & animations ---- */
 .badge-live { background: rgba(78,214,165,.15); border-color: rgba(78,214,165,.4); color: #4ed6a5; }
 .badge-speed { background: rgba(90,155,216,.12); border-color: rgba(90,155,216,.35); color: #5a9bd8; }
+.badge-warn { background: rgba(230,170,60,.14); border-color: rgba(230,170,60,.4); color: #e6aa3c; }
 .flash { animation: flash 0.6s ease infinite alternate; }
 @keyframes flash { from { opacity: 1; } to { opacity: 0.3; } }
 .top-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }

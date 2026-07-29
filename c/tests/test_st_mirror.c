@@ -83,6 +83,9 @@ int main(void) {
     CHECK(st_mirror_init(&S, DIR_B) == 1);
     int mfd = st_fd_rep(&S, t->fd, 1);
     CHECK(mfd >= 0 && mfd != t->fd);
+#ifdef _WIN32
+    CHECK(st_direct_fd_rep(&S, t->fd, 1) >= 0);
+#endif
     float a[8], b[8];
     CHECK(pread(t->fd, a, t->nbytes, t->off) == t->nbytes);
     CHECK(pread(mfd, b, t->nbytes, t->off) == t->nbytes);

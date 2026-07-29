@@ -30,8 +30,8 @@ BOOTSTRAP_REF = HERE / "ref_olmoe_bootstrap.json"
 
 PROMPT_IDS = [510, 5347, 273, 6181, 310]  # "The capital of France is"
 MAX_NEW = 12
-CACHE_SIZE = 32   # experts cached per layer
-QUANT_BITS = 8    # engine supports 2-8; 8 = int8 (lossless vs our quant)
+CACHE_SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 32   # experts cached per layer
+QUANT_BITS = int(sys.argv[2]) if len(sys.argv) > 2 else 8    # engine supports 2-8; 8 = int8 (lossless vs our quant)
 
 # ── Step 1: Write bootstrap ref with dummy full_ids = prompt_ids ──────────
 # olmoe.exe needs full_ids to know how many tokens to generate (nfull - np).

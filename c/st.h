@@ -169,7 +169,7 @@ static int st_mirror_init(shards *S, const char *dir) {
         S->mfds[i] = mfd;
 #ifdef O_DIRECT
         S->mdfds[i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(_WIN32)
         S->mdfds[i] = compat_open_direct(mp);
 #endif
         S->nmirror++;
@@ -271,7 +271,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 ndir, nf, snap_dir, c0);
     }
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
+        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; snprintf(tmp, sizeof(tmp), "%s", files[a]); snprintf(files[a], 1024, "%s", files[b]); snprintf(files[b], 1024, "%s", tmp); }
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
@@ -331,7 +331,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
-            if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
+            if (S->n == S->cap) {
+                S->cap *= 2;
+                st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
+                if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
+                S->t = nt;
+            }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
@@ -376,6 +381,71 @@ static st_tensor *st_find(shards *S, const char *name) {
     return NULL;
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
+
+/* A missing CORE tensor is almost never an engine bug: the converter writes the final
+ * norm and lm_head into the LAST shards, so a transfer that stopped early indexes
+ * nearly everything and then dies on the first tensor from the gap. Bare "missing
+ * model.norm.weight" gave the user no way to tell that apart from a wrong --model or a
+ * real bug (#586, #583). Report what was actually found, and let the filenames say
+ * whether shards are absent: the HF layout declares the total in `-of-NNNNN`, the
+ * converter layout at least reveals a truncated tail. */
+static void st_die_missing(shards *S, const char *name) {
+    fprintf(stderr, "missing %s\n\n", name);
+    if (S->nfd == 0 || S->n == 0) {
+        fprintf(stderr, "  No safetensors tensors were indexed at all. --model must point AT the\n"
+                        "  container directory -- the one holding the *.safetensors shards.\n");
+        exit(1);
+    }
+    int lo = -1, hi = -1, declared = 0, numbered = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        const char *b = strrchr(S->paths[i], '/');
+#ifdef _WIN32
+        const char *b2 = strrchr(S->paths[i], '\\');
+        if (b2 && (!b || b2 > b)) b = b2;
+#endif
+        b = b ? b + 1 : S->paths[i];
+        int idx, tot;
+        if (sscanf(b, "model-%d-of-%d", &idx, &tot) == 2) declared = tot;
+        else if (sscanf(b, "out-%d", &idx) != 1) continue;   /* out-mtp-* etc: not numbered */
+        numbered++;
+        if (lo < 0 || idx < lo) lo = idx;
+        if (idx > hi) hi = idx;
+    }
+    int complete = declared > 0 && numbered >= declared;
+    fprintf(stderr, "  indexed %d tensors from %d shard file(s)\n", S->n, S->nfd);
+    if (declared > 0 && numbered < declared)
+        fprintf(stderr, "  shard filenames declare %d shards, but only %d are here -- %d MISSING\n",
+                declared, numbered, declared - numbered);
+    else if (declared > 0)
+        fprintf(stderr, "  shard filenames declare %d shards and %d are here\n", declared, numbered);
+    else if (numbered > 0)
+        fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
+                numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
+    /* Follow the evidence: telling someone who already has every declared shard to
+     * re-download sends them round a loop that cannot help them. */
+    if (complete) {
+        fprintf(stderr,
+            "\n  '%s' is a core tensor the engine cannot run without, and every shard the\n"
+            "  filenames declare is present -- so this is NOT the usual truncated download.\n"
+            "  Either the container was built without this tensor, or the engine is looking\n"
+            "  for the wrong name. Please report it with this output.\n", name);
+        exit(1);
+    }
+    /* The final norm and lm_head sit at the END of the model, so an interrupted transfer
+     * loses them first -- worth saying, but only where it's true. */
+    if (strstr(name, "model.norm") || strstr(name, "lm_head"))
+        fprintf(stderr, "\n  '%s' is written into one of the LAST shards, so a container whose tail\n"
+                        "  never arrived indexes almost everything and then fails exactly here.\n", name);
+    else
+        fprintf(stderr, "\n  '%s' is a core tensor: the engine cannot run without it.\n", name);
+    fprintf(stderr,
+        "  An incomplete transfer is far more likely than a corrupt engine. Re-running the\n"
+        "  download resumes only the missing shards; the HF xet backend is known to stall\n"
+        "  mid-transfer (#452), so disable it:\n"
+        "      HF_HUB_DISABLE_XET=1 hf download <repo> --local-dir <model-dir>\n"
+        "  If your shard count is already complete, that IS a bug worth reporting.\n");
+    exit(1);
+}
 
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
@@ -433,7 +503,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (t->numel > cap) {
+    if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
     return st_read_f32(S, name, out, drop);
@@ -462,7 +532,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
-    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;

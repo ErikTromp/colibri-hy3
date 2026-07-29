@@ -47,6 +47,8 @@ const zhCN: Record<string, string> = {
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "槽位 {{n}}",
+  "topbar.truncated": "已截断",
+  "topbar.truncatedHelp": "回复达到最大输出 token 上限而被截断。请调高“最大输出 token 数”以查看完整回答。",
   "topbar.clear": "清空",
 
   "hero.title": "COLIBRÌ 引擎",

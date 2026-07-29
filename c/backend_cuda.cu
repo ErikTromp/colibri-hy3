@@ -88,13 +88,59 @@ static int select_ctx(DeviceContext *ctx) {
     return 1;
 }
 
+/* fmt=6 (E8/IQ3) geometry, mirroring quant.h. A super-block packs 256 weights
+ * into 98 bytes: 64 codebook indices, 8 words of (4x7 signs + 4-bit sub-scale),
+ * and one fp16 super-scale. Scales live INSIDE the block, so fmt=6 tensors carry
+ * no separate scale array (#452). */
+#define COLI_E8_QK      256
+#define COLI_E8_SUB      32
+#define COLI_E8_BBYTES   98
+
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 0) return (size_t)I * sizeof(float);
     if (fmt == 1) return (size_t)I;
     if (fmt == 2 || fmt == 4) return (size_t)(I + 1) / 2;   /* fmt=4: same packed int4 */
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
+    if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     return 0;
+}
+
+/* The E8 codebook, uploaded once per device from quant.h's e8_grid so the table
+ * has a single source of truth and cannot drift from the CPU decoder. */
+__constant__ uint8_t c_e8_grid[256][4];
+
+/* A super-block is 98 bytes, so nothing inside it is guaranteed 4- or 2-byte
+ * aligned: assemble the words byte-wise instead of dereferencing. */
+__device__ __forceinline__ uint32_t e8_ld_u32(const uint8_t *p){
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+/* Mirrors e8_fp16_to_f32 rather than calling __half2float, so the two decoders
+ * cannot disagree on subnormals. */
+__device__ __forceinline__ float e8_fp16(const uint8_t *p){
+    uint16_t h = (uint16_t)p[0] | ((uint16_t)p[1]<<8);
+    uint32_t sign=(uint32_t)(h&0x8000)<<16, exp=(h>>10)&0x1F, man=h&0x3FF, bits;
+    if (!exp)         bits = man ? (sign|((127u-15u+1u-1u)<<23)|(man<<13)) : sign;
+    else if (exp==31) bits = sign|0x7F800000u|(man<<13);
+    else              bits = sign|((exp+112u)<<23)|(man<<13);
+    float f; memcpy(&f,&bits,4); return f;
+}
+/* Expand one 32-weight sub-block; mirrors e8_expand_sub in quant.h. */
+__device__ __forceinline__ void e8_expand_sub_dev(const uint8_t *blk, int ib, float d, float *out){
+    uint32_t word = e8_ld_u32(blk + COLI_E8_QK/4 + ib*4);
+    float db = d * (0.5f + (float)((word>>28)&0xF)) * 0.5f;
+    const uint8_t *idx = blk + ib*8;
+    for (int l=0;l<4;l++){
+        uint32_t seven=(word>>(7*l))&0x7F;
+        const uint8_t *g0=c_e8_grid[idx[l*2+0]], *g1=c_e8_grid[idx[l*2+1]];
+        int par=0;
+        for (int j=0;j<8;j++){
+            int neg = j<7 ? (int)((seven>>j)&1) : 0;
+            if (j<7) par^=neg; else neg=par;        /* odd parity closes the block */
+            float mag = (j<4 ? (float)g0[j] : (float)g1[j-4]) * 0.5f;
+            out[l*8+j] = neg ? -mag*db : mag*db;
+        }
+    }
 }
 
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
@@ -134,7 +180,20 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
     float sum = 0.0f;
     size_t row = (size_t)o * rb;
     const float *xs = x + (size_t)s * I;
-    if (fmt == 4) {
+    if (fmt == 6) {
+        /* E8/IQ3: decode is per 32-weight sub-block, so threads stride over
+         * sub-blocks rather than elements -- expanding once per 32 weights
+         * instead of redoing the word/parity work for every element. */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        int nsub = (I + COLI_E8_SUB - 1) / COLI_E8_SUB;
+        for (int sb = threadIdx.x; sb < nsub; sb += blockDim.x) {
+            const uint8_t *blk = wrow + (size_t)(sb / (COLI_E8_QK/COLI_E8_SUB)) * COLI_E8_BBYTES;
+            float w[COLI_E8_SUB];
+            e8_expand_sub_dev(blk, sb % (COLI_E8_QK/COLI_E8_SUB), e8_fp16(blk+96), w);
+            int off = sb*COLI_E8_SUB, n = I-off < COLI_E8_SUB ? I-off : COLI_E8_SUB;
+            for (int k=0;k<n;k++) sum += xs[off+k]*w[k];
+        }
+    } else if (fmt == 4) {
         /* Grouped int4: one f32 scale per gs elements along I (ng groups per row).
          * Scale layout: scales[o*ng + g]. Each thread strides through I, applying
          * the appropriate group scale as it crosses group boundaries. This matches
@@ -158,7 +217,60 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = (fmt && fmt != 4) ? partial[0] * scales[o] : partial[0];
+        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6) ? partial[0] * scales[o] : partial[0];
+}
+
+/* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
+ * row; the power-of-two block is staged in shared memory, capping n at 4096
+ * floats -- which covers every block GLM produces (6144 -> 2048+4096, 1536 ->
+ * 512+1024). The sign stream is regenerated in-kernel from the same xorshift64*
+ * that quant.h's e8_signs uses, so no rotation data is stored or uploaded.
+ *
+ * Placement note: all routed experts of a layer share one gate/up input, so that
+ * rotation belongs to the CALLER (once per layer). This kernel exists for the
+ * down projection, whose input is the per-expert silu(gate)*up product and so
+ * cannot be shared -- mirroring colibri.c's split at moe(). */
+__global__ static void e8_rot_rows_kernel(float *rows, int dim, int off, int n){
+    extern __shared__ float sh[];
+    __shared__ uint8_t sbits[4096/8];
+    if (!threadIdx.x) {
+        uint64_t s = 417u + (uint64_t)n;
+        for (int i=0;i<(n+7)/8;i++){
+            s^=s>>12; s^=s<<25; s^=s>>27;
+            sbits[i] = (uint8_t)((s*2685821657736338717ULL)>>56);
+        }
+    }
+    __syncthreads();
+    float *row = rows + (size_t)blockIdx.x*dim + off;
+    for (int i=threadIdx.x;i<n;i+=blockDim.x){
+        float v=row[i];
+        sh[i] = (sbits[i>>3]>>(i&7)&1) ? -v : v;
+    }
+    __syncthreads();
+    for (int len=1;len<n;len<<=1){
+        for (int j=threadIdx.x;j<n/2;j+=blockDim.x){
+            int i = (j/len)*(len<<1) + (j%len);
+            float u=sh[i], v=sh[i+len];
+            sh[i]=u+v; sh[i+len]=u-v;
+        }
+        __syncthreads();
+    }
+    float sc=rsqrtf((float)n);
+    for (int i=threadIdx.x;i<n;i+=blockDim.x) row[i]=sh[i]*sc;
+}
+
+/* Rotate nr rows in place, tiling non-power-of-two dims block-diagonally exactly
+ * as e8_rot_rows does. Returns 0 if a block exceeds the shared-memory cap. */
+static int e8_rot_rows_dev(float *rows, int nr, int dim, cudaStream_t stream){
+    int off = 0;
+    while (off < dim) {
+        int rem = dim-off, b = rem & (-rem);
+        while (b > 4096) b >>= 1;
+        e8_rot_rows_kernel<<<(unsigned)nr, 256, (size_t)b*sizeof(float), stream>>>(rows, dim, off, b);
+        if (cudaGetLastError() != cudaSuccess) return 0;
+        off += b;
+    }
+    return 1;
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -320,7 +432,13 @@ __global__ static void grouped_hidden_w4_dual(float *gate,float *up,const float 
         int i=b*2;ga+=xs[i]*g0;ua+=xs[i]*u0;if(i+1<D){ga+=xs[i+1]*g1;ua+=xs[i+1]*u1;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
-    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0]*d.gs[o];up[z]=upv[0]*d.us[o];}
+    /* Fused epilogue: silu(gate)*up lands here instead of a third kernel —
+     * the exact silu_mul expression on the exact same inputs, so bit-identical,
+     * and the up[] round-trip through global memory disappears. up stays a
+     * param so the launch sites keep their signature. */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0]*d.gs[o],u=upv[0]*d.us[o];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 
 __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *desc,int D,int I){
@@ -354,7 +472,11 @@ __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float 
         if(i+1<D){ga+=xs[i+1]*g1*gv;ua+=xs[i+1]*u1*uv;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
-    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0];up[z]=upv[0];}
+    /* same epilogue fusion as the w4 dual above (per-group scales already
+     * applied inside the accumulation, so silu runs on the raw sums) */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0],u=upv[0];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *desc,int D,int I){
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
@@ -520,6 +642,20 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+/* Publish quant.h's E8 codebook to every configured device. __constant__ memory
+ * is per-device, so this walks the contexts; the engine calls it once after init
+ * rather than the backend carrying a second copy of the table that could drift
+ * from the CPU decoder's (#452). Safe to call before any fmt=6 upload only. */
+extern "C" int coli_cuda_e8_set_grid(const void *grid) {
+    if (!grid || g_nctx < 1) return 0;
+    for (int i = 0; i < g_nctx; i++) {
+        if (!select_ctx(&g_ctx[i])) return 0;
+        if (!cuda_ok(cudaMemcpyToSymbol(c_e8_grid, grid, sizeof(c_e8_grid)), "E8 codebook upload"))
+            return 0;
+    }
+    return 1;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
@@ -609,6 +745,16 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+/* #653: 1 when the device shares physical memory with the host (Grace-Blackwell /
+ * GB10, Jetson, integrated GPUs). On these the expert tier and the RAM cache draw
+ * from the same pool, so the RAM budget must account for the tier; on a discrete GPU
+ * VRAM is a separate pool and this returns 0. */
+extern "C" int coli_cuda_device_integrated(int device) {
+    cudaDeviceProp prop{};
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
+    return prop.integrated ? 1 : 0;
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
@@ -650,7 +796,9 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
+     * quantized format that legitimately arrives with scales == NULL. */
+    if (!rb || (fmt && fmt != 6 && !scales)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
@@ -665,16 +813,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
-    if (fmt) {
+    if (fmt && fmt != 6) {
         if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
         }
     }
+    if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + (fmt ? t->scale_count * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -690,7 +839,7 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || !weights || (tensor->fmt && !scales)) return 0;
+    if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
@@ -701,7 +850,9 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
     int ng = tensor->ng > 0 ? tensor->ng : 1;
-    return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
+    /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
+     * the fallback below would otherwise copy O floats out of a NULL host pointer. */
+    return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
         cudaMemcpyHostToDevice),"scale refresh");
 }
@@ -771,6 +922,10 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         up->fmt,S,D,I,row_bytes(up->fmt,D),up->gs,up->ng);
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    /* fmt=6: the down projection stores W@Q, so its input needs Q^T applied. This
+     * one is per-expert (the silu product is not shared), unlike the gate/up input
+     * rotation, which the caller does once per layer -- same split as moe(). */
+    if (down->fmt == 6 && !e8_rot_rows_dev(ctx->gate, S, I, 0)) return 0;
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
@@ -914,18 +1069,17 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
         if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        else{
+        else{   /* non-dual path has no fused epilogue: silu stays a kernel here */
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+            silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         }
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_q4&&any_g4){
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
-         * ride along as the ng=1 special case. */
+         * ride along as the ng=1 special case. silu fused in the dual epilogue. */
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — a fmt=4 group that slipped the
@@ -976,7 +1130,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
-    int device=first->device,D=first->I,I=first->O,total=0;
+    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -985,19 +1139,37 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
                  g->gs,u->gs,d->gs};
-        total+=rows[c];
+        all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return 0;
     std::memcpy(ctx->host_x,x,xb);
-    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
+                                cudaMemcpyHostToDevice,ctx->stream),
+                "expert group issue descriptors")||
+       !cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue upload")) return 0;
-    for(int c=0;c<count;c++){
+    if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
+        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
+        if(dual) grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        else {
+            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
+            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+            silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(
+                ctx->gate,ctx->up,(size_t)total*I);
+        }
+        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    } else for(int c=0;c<count;c++){
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
@@ -1208,7 +1380,11 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
         int ng = tensor->ng > 0 ? tensor->ng : 1;
-        size_t bytes = tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+        /* Must mirror the upload's accounting exactly: fmt=6 never charged for a
+         * scale buffer, and over-subtracting here trips the >= guard below, which
+         * silently leaves the tensor's bytes on the device counter forever. */
+        size_t bytes = tensor->weight_bytes +
+            ((tensor->fmt && tensor->fmt != 6) ? (size_t)tensor->O * ng * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -1496,8 +1672,7 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
     bcast_row<<<64,256,0,ctx->stream>>>(ctx->x,ctx->x,count,D);   /* row 0 -> rows 1..count-1 (in-place safe: row 0 rewritten with itself) */
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     dim3 hg((unsigned)I,1,(unsigned)count),og((unsigned)D,1,(unsigned)count);
-    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-    silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
+    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);  /* silu fused in epilogue */
     grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     weighted_sum_rows<<<48,256,0,ctx->stream>>>(partial_local,ctx->y,w_dev,count,D);
     if(!cuda_ok(cudaMemcpyPeerAsync(partial_slot_dev,home_device,partial_local,device,

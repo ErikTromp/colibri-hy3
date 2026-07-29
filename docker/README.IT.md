@@ -78,7 +78,7 @@ Il modello GLM 5.2 è circa **360 GB**. Scegli uno di questi metodi:
 
 2. **Scarica il modello** (apri il terminale nella cartella dove lo vuoi salvare):
    ```bash
-   hf_download mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp --local-dir .
+   hf_download mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp --local-dir .
    ```
    
    **Esempio**: se vuoi salvarlo in `C:\LLM\models\glm-5.2` (Windows):
@@ -89,7 +89,7 @@ Il modello GLM 5.2 è circa **360 GB**. Scegli uno di questi metodi:
 #### Metodo B: Senza Python (solo se necessario)
 
 Se sei su Windows e non riesci con Python:
-- Scarica manualmente da [Hugging Face](https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+- Scarica manualmente da [Hugging Face](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 - Decomprimi in una cartella (es. `C:\LLM\models\glm-5.2`)
 
 ---
@@ -347,7 +347,7 @@ Poi riprova il comando `hf_download`.
 
 **Soluzione**:
 1. Attendi e riprova il comando `hf_download`
-2. Se continua, scarica manualmente da [qui](https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+2. Se continua, scarica manualmente da [qui](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 3. Decomprimi il file ZIP nella cartella desiderata
 
 ---

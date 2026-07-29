@@ -33,6 +33,7 @@ typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
+typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
@@ -52,6 +53,7 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
+typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
@@ -105,6 +107,7 @@ static struct {
     fn_device_count    device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
+    fn_device_integrated device_integrated;
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
@@ -114,6 +117,7 @@ static struct {
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
+    fn_e8_set_grid     e8_set_grid;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -200,11 +204,24 @@ static int coli_cuda_load(void){
             fprintf(stderr, "[CUDA] coli_cuda.dll missing symbol coli_cuda_" #name "\n"); \
             FreeLibrary(g_cuda.dll); g_cuda.dll=NULL; return 0; }
 
+    /* Optional symbol: a DLL predating it leaves the pointer NULL and only that
+     * feature degrades (fmt=6 tensors stay CPU-side), instead of taking the whole
+     * GPU backend down over one missing entry point. */
+    #define RESOLVE_OPT(name, type) \
+        _Pragma("GCC diagnostic push") \
+        _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"") \
+        g_cuda.name = (type)GetProcAddress(g_cuda.dll, "coli_cuda_" #name); \
+        _Pragma("GCC diagnostic pop")
+
     RESOLVE(init,           fn_init)
     RESOLVE(shutdown,       fn_shutdown)
     RESOLVE(device_count,   fn_device_count)
     RESOLVE(device_at,      fn_device_at)
     RESOLVE(mem_info,       fn_mem_info)
+    /* Optional: a DLL predating #653 leaves this NULL; the wrapper then reports
+     * "not integrated" (0), so the RAM-budget correction simply doesn't apply
+     * rather than taking the whole GPU backend down over one missing symbol. */
+    RESOLVE_OPT(device_integrated, fn_device_integrated)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
@@ -214,6 +231,7 @@ static int coli_cuda_load(void){
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
+    RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -282,6 +300,11 @@ int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes){
     return g_cuda.mem_info(device, free_bytes, total_bytes);
 }
 
+int coli_cuda_device_integrated(int device){
+    if(!g_cuda.available || !g_cuda.device_integrated) return 0;
+    return g_cuda.device_integrated(device);
+}
+
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes){
     if(!g_cuda.available){ if(tensor_count)*tensor_count=0; if(tensor_bytes)*tensor_bytes=0; return; }
     g_cuda.stats(device, tensor_count, tensor_bytes);
@@ -339,6 +362,11 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
 int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs){
     if(!g_cuda.available || !g_cuda.tensor_upload_g){ return 0; }
     return g_cuda.tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs);
+}
+
+int coli_cuda_e8_set_grid(const void *grid){
+    if(!g_cuda.available || !g_cuda.e8_set_grid) return 0;   /* fmt=6 stays CPU-side */
+    return g_cuda.e8_set_grid(grid);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,

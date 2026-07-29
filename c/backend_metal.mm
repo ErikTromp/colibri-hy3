@@ -333,8 +333,20 @@ static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel Ope
 // g_resset_obj is a bare `id` (holds id<MTLResidencySet>) so the global's declared type
 // carries no availability annotation -- the protocol name only appears inside
 // @available(macOS 15.0, *) guards below, keeping -Wunguarded-availability clean.
+// @available is a runtime guard only: the compiler still resolves MTLResidencySet and its
+// selectors against the SDK headers, which don't declare them before macOS 15 (#596).
+// COLI_HAS_RESSET is the compile-time floor (helpers become no-ops below it); the @available
+// guards stay on top so a macOS 15 SDK build still runs right on macOS 14. -DCOLI_HAS_RESSET=0
+// forces the fallback branch on a modern SDK.
+#ifndef COLI_HAS_RESSET
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+#define COLI_HAS_RESSET 1
+#else
+#define COLI_HAS_RESSET 0
+#endif
+#endif
 static id g_resset_obj;
-static bool g_resset_enabled;   // COLI_METAL_RESSET=1, macOS 15+, and creation succeeded
+static bool g_resset_enabled;   // COLI_METAL_RESSET=1, macOS 15 SDK+OS, and creation succeeded
 static bool g_resset_dirty;     // addAllocation: calls pending commit; g_resset_mtx-guarded
 // Set mutations + dirty flag get their OWN mutex, never held together with g_slab_mtx: no
 // live Metal call may run under the slab lock the parallel OMP loader threads contend on
@@ -355,8 +367,12 @@ static double g_t_resset_flush;   // sec committing pending adds in moe_submit (
 // no separate counter for the add/remove side.
 static void resset_add(id<MTLBuffer> b) {
   if (!g_resset_enabled) return;
+#if COLI_HAS_RESSET
   std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj addAllocation:b]; g_resset_dirty = true; }
+#else
+  (void)b;
+#endif
 }
 // Remove + commit immediately, NOT deferred: the caller frees the underlying host memory
 // right after coli_metal_unregister returns, so the removal must be applied before that --
@@ -364,22 +380,28 @@ static void resset_add(id<MTLBuffer> b) {
 // risk the GPU could act on. Also runs outside g_slab_mtx (see g_resset_mtx above).
 static void resset_remove(id<MTLBuffer> b) {
   if (!g_resset_enabled) return;
+#if COLI_HAS_RESSET
   std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (@available(macOS 15.0, *)) {
     id<MTLResidencySet> rs = (id<MTLResidencySet>)g_resset_obj;
     [rs removeAllocation:b]; [rs commit];
   }
   g_resset_dirty = false;   // commit above also flushes any pending adds
+#else
+  (void)b;
+#endif
 }
 // Flush pending adds before moe_submit relies on the set alone for residency -- the only
 // caller that skips per-buffer useResource: (see moe_submit below). Takes g_resset_mtx
 // only, never g_slab_mtx; the happens-before argument lives at resset_add above.
 static void resset_flush() {
   if (!g_resset_enabled) return;
+#if COLI_HAS_RESSET
   std::lock_guard<std::mutex> lk(g_resset_mtx);
   if (!g_resset_dirty) return;
   if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj commit]; }
   g_resset_dirty = false;
+#endif
 }
 // Harness visibility for the flush cost, which sits OUTSIDE the moe_times setup/gpu
 // breakdown (timed around resset_flush in moe_submit, before ts_start). Returns whether
@@ -455,6 +477,7 @@ extern "C" int coli_metal_init(void) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
     // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
     if (getenv("COLI_METAL_RESSET") && atoi(getenv("COLI_METAL_RESSET"))) {
+#if COLI_HAS_RESSET
       if (@available(macOS 15.0, *)) {
         MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
         rd.initialCapacity = 4096;   // hint only (internal array presize), not a hard limit
@@ -471,6 +494,10 @@ extern "C" int coli_metal_init(void) {
       } else {
         fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but OS < macOS 15 -- stock per-CB residency path\n");
       }
+#else
+      fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but this binary was built against a "
+                      "macOS SDK < 15 (MTLResidencySet unavailable) -- stock per-CB residency path\n");
+#endif
     }
   }
   return 1;
@@ -543,9 +570,11 @@ extern "C" void coli_metal_spin_stop(void) { g_spin_run.store(false); }
 
 extern "C" void coli_metal_shutdown(void) {
   coli_metal_spin_stop();
+#if COLI_HAS_RESSET
   if (g_resset_enabled) {
     if (@available(macOS 15.0, *)) { [g_queue removeResidencySet:(id<MTLResidencySet>)g_resset_obj]; }
   }
+#endif
   g_resset_obj=nil; g_resset_enabled=false; g_resset_dirty=false;
   g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0;
 }
@@ -839,12 +868,37 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
     [e useResource:wb usage:MTLResourceUsageRead]; [e useResource:sb usage:MTLResourceUsageRead];
     [e setComputePipelineState:g_gemv];
     [e setBuffer:wb offset:woff atIndex:0]; [e setBuffer:sb offset:soff atIndex:1];
-    [e setBuffer:g_gx offset:0 atIndex:2]; [e setBuffer:g_gy offset:0 atIndex:3];
-    int NT=S*O;
-    [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+    [e setBytes:&I length:4 atIndex:5];
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
-    [e setBytes:&NT length:4 atIndex:8];
-    [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+    // Grid-size cap. One dispatch of NT=S*O output elements launches (NT+3)/4 threadgroups; past
+    // a device grid limit (observed on M-series: kv_b grid ~3.1e7 tg clean at S=4376, ~5.4e7 tg
+    // CORRUPT at S=7478) rows beyond the limit are silently never computed and the output keeps
+    // its prior contents -- fresh-zero standalone (nerr=1.0), stale scratch in-engine (the
+    // nondeterministic long-context corruption). Chunk over rows so each dispatch stays <=2^25
+    // elements (grid <=2^23 tg, ~4x under the observed-clean bound). Chunks write disjoint g_gy
+    // ranges. Offset alignment is STRUCTURAL, not shape-dependent (holds for any I,O -- a tiny
+    // oracle checkpoint or a future container with odd dims, not just GLM's shapes): g_gy is only
+    // ever written scalar (y[row]), so r0*O*4 needs just 4B; and the 16B float4 loads on g_gx
+    // execute only inside loops gated by I8=(I&7)?0:(I/8), i.e. only when I%8==0, where r0*I*4 is
+    // a multiple of 32. With I%8!=0, I8=0, x4 is never dereferenced and x is read scalar via xr[i].
+    // COLI_GEMM_CHUNK=0 disables chunking (one full dispatch = the buggy pre-fix behavior) so the
+    // fix can be A/B'd on a single binary. Default on.
+    static int chunk_on=-1;
+    if(chunk_on<0){ const char*e=getenv("COLI_GEMM_CHUNK"); chunk_on=(e&&e[0]=='0'&&!e[1])?0:1; }
+    const int64_t NT_MAX = chunk_on ? ((int64_t)1<<25) : ((int64_t)1<<62);
+    // Clamp in 64-bit BEFORE narrowing: with chunking off NT_MAX/O is ~1.6e14 for kv_b (O=28672),
+    // far past INT_MAX, so casting first is implementation-defined. Were it to truncate negative
+    // on some toolchain, CH=1 would make the disable path dispatch one row at a time and silently
+    // STOP reproducing the bug it exists to demonstrate. After the clamp CH <= S <= INT_MAX.
+    int64_t ch64=NT_MAX/O; if(ch64<1) ch64=1; if(ch64>S) ch64=S; int CH=(int)ch64;
+    for(int r0=0;r0<S;r0+=CH){
+      int ch=(S-r0<CH)?(S-r0):CH; int NT=ch*O;
+      [e setBuffer:g_gx offset:(size_t)r0*I*4 atIndex:2];
+      [e setBuffer:g_gy offset:(size_t)r0*O*4 atIndex:3];
+      [e setBytes:&ch length:4 atIndex:4];
+      [e setBytes:&NT length:4 atIndex:8];
+      [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+    }
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] gemm cmdbuf error (S=%d O=%d)\n",S,O); return 0; }
     memcpy(y,[g_gy contents],(size_t)S*O*4);

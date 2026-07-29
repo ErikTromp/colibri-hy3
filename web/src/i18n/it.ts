@@ -47,6 +47,8 @@ const it: Record<string, string> = {
   "topbar.tokens": "{{n}} token",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "slot {{n}}",
+  "topbar.truncated": "Troncato",
+  "topbar.truncatedHelp": "La risposta ha raggiunto il limite di token di output ed e' stata tagliata. Aumenta \"Token di output massimi\" per vedere la risposta completa.",
   "topbar.clear": "Pulisci",
 
   "hero.title": "MOTORE COLIBRÌ",

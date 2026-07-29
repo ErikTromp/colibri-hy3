@@ -144,6 +144,15 @@ def memory_available():
 
 
 def discover_gpus():
+    # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
+    # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
+    devices = _discover_nvidia_gpus()
+    if devices:
+        return devices
+    return _discover_amd_gpus()
+
+
+def _discover_nvidia_gpus():
     command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                "--format=csv,noheader,nounits"]
     try:
@@ -230,6 +239,53 @@ def discover_gpus():
              "total_bytes": item["total_bytes"],
              "free_bytes": max(0, item["total_bytes"] - item.get("used_bytes", 0))}
             for index, item in sorted(devices.items()) if "total_bytes" in item]
+
+
+def _discover_amd_gpus():
+    """ROCm/HIP discovery via rocm-smi (#662). Absent on non-AMD hosts, so this
+    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike nvidia-smi's
+    MiB), so no unit scaling. Column names drift across ROCm versions, so match them
+    by substring rather than position. VERIFY on AMD hardware (labelled
+    hardware-owner-needed) -- authored without a ROCm host to test against."""
+    command = ["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--csv"]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    import csv
+    rows = list(csv.DictReader(result.stdout.splitlines()))
+    if not rows:
+        return []
+
+    def find_col(row, *needles):
+        for key in row:
+            low = (key or "").lower()
+            if all(n in low for n in needles):
+                return key
+        return None
+
+    devices = []
+    for i, row in enumerate(rows):
+        dev = (row.get("device") or "").strip()
+        m = re.search(r"(\d+)", dev)
+        index = int(m.group(1)) if m else i
+        total_col = find_col(row, "vram", "total", "memory")
+        used_col = find_col(row, "vram", "used")
+        name_col = (find_col(row, "card", "series") or find_col(row, "card", "model")
+                    or find_col(row, "product"))
+        try:
+            total = int((row.get(total_col) or "0").strip())
+        except (ValueError, TypeError):
+            total = 0
+        try:
+            used = int((row.get(used_col) or "0").strip())
+        except (ValueError, TypeError):
+            used = 0
+        free = max(total - used, 0)
+        name = (row.get(name_col) or "").strip() if name_col else ""
+        devices.append({"index": index, "name": name or f"AMD GPU {index}",
+                        "total_bytes": total, "free_bytes": free})
+    return devices
 
 
 def _physical_cores_warn(message):

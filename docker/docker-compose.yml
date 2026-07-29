@@ -1,0 +1,33 @@
+# colibri — OpenAI-compatible server in one command.
+#
+#   MODEL_DIR=/nvme/glm52_i4 docker compose -f docker/docker-compose.yml up
+#
+# Then: curl http://localhost:5000/v1/chat/completions -d '{"model":"glm-5.2",
+#   "messages":[{"role":"user","content":"Hi"}]}'
+#
+# The model is bind-mounted read-only from MODEL_DIR on the host — keep it on
+# NVMe/ext4, never a network mount (expert streaming is latency-bound).
+services:
+  colibri:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.slim
+    image: colibri
+    ports:
+      - "5000:5000"
+    volumes:
+      - "${MODEL_DIR:?set MODEL_DIR to the int4 model directory}:/model:ro"
+    environment:
+      # RAM budget in GB: more cached experts = faster. Size to the host.
+      COLI_RAM: "${COLI_RAM:-24}"
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --model-id
+      - glm-5.2
+      - --ram
+      - "${COLI_RAM:-24}"
+    restart: unless-stopped
+    # Streaming a 744B model touches a lot of page cache; give it headroom.
+    shm_size: "2gb"

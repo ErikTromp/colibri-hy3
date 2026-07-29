@@ -52,11 +52,11 @@ Additionally: a **fast SSD** is essential. Colibrì uses the disk as additional 
 
 ### Software
 
-* **Docker Desktop** (Windows, Mac, Linux) — [download here](https://www.google.com/search?q=https://www.docker.com/products/docker-desktop/)
+* **Docker Desktop** (Windows, Mac, Linux) — [download here](https://www.docker.com/products/docker-desktop/)
 * **Python** (only if you want to download the model yourself)
-* Windows: [python.org](https://www.google.com/search?q=https://www.python.org) or Microsoft Store
+* Windows: [python.org](https://www.python.org) or Microsoft Store
 * Linux: `apt-get install python3 python3-pip`
-* Mac: [python.org](https://www.google.com/search?q=https://www.python.org) or Homebrew
+* Mac: [python.org](https://www.python.org) or Homebrew
 
 No build environment is needed. Everything happens inside the Docker container.
 
@@ -78,7 +78,7 @@ python -m pip install -U huggingface_hub[cli]
 On Linux, use `python3` instead of `python`.
 2. **Download the model** (open the terminal in the folder where you want to save it):
 ```bash
-hf_download mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp --local-dir .
+hf_download mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp --local-dir .
 ```
 
 **Example**: if you want to save it in `C:\LLM\models\glm-5.2` (Windows):
@@ -90,14 +90,14 @@ hf_download mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp --local-dir .
 
 If you are on Windows and cannot get it to work with Python:
 
-* Download manually from [Hugging Face](https://www.google.com/search?q=https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+* Download manually from [Hugging Face](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 * Unzip into a folder (e.g., `C:\LLM\models\glm-5.2`)
 
 ---
 
 ### Step 2: Download the Colibrì Dockerfile
 
-1. Go to: [https://github.com/JustVugg/colibri/blob/main/docker/Dockerfile](https://www.google.com/search?q=https://github.com/JustVugg/colibri/blob/main/docker/Dockerfile)
+1. Go to: [https://github.com/JustVugg/colibri/blob/main/docker/Dockerfile](https://github.com/JustVugg/colibri/blob/main/docker/Dockerfile)
 2. Click the **Download** button (⬇️ icon) in the top right
 3. Save the file in a folder (e.g., `C:\LLM\Colibrì`)
 
@@ -229,7 +229,7 @@ Now you are inside Linux. Type `exit` to leave.
 
 **Solution**:
 
-1. Reinstall [Docker Desktop](https://www.google.com/search?q=https://www.docker.com/products/docker-desktop/)
+1. Reinstall [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 2. Restart your computer
 3. Open a new terminal and try again
 
@@ -371,7 +371,7 @@ Then retry the `hf_download` command.
 **Solution**:
 
 1. Wait and retry the `hf_download` command
-2. If it continues, download manually from [here](https://www.google.com/search?q=https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+2. If it continues, download manually from [here](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 3. Unzip the ZIP file into the desired folder
 
 ---
@@ -392,7 +392,7 @@ If your disk is slow, the answers will be very slow even with a lot of RAM.
 
 ### Recommended default configuration for WLS on Windows
 
-If you have **exactly 32 GB of RAM** and are using Windows, it is very likely that WLS by default is set to consume no more than 16 GB of RAM. We need to increase this limit [Troubleshooting](https://www.google.com/search?q=#troubleshooting) . In my case I adopted this configuration:
+If you have **exactly 32 GB of RAM** and are using Windows, it is very likely that WLS by default is set to consume no more than 16 GB of RAM. We need to increase this limit [Troubleshooting](#troubleshooting) . In my case I adopted this configuration:
 
 ```ini
 [wsl2]
@@ -484,5 +484,49 @@ PS C:\quack\llm\colibri\docker> docker run --rm -it --name colibri-c -v "C:\quac
   │ ›
 
 ```
+
+---
+
+## Slim image (developers / production)
+
+The guide above uses `Dockerfile`, which clones the repo inside the image — one
+file to download, nothing else on your machine. For CI, servers, or anyone who
+already has the repo checked out, `Dockerfile.slim` is a multi-stage build that
+produces a **~115 MB** image (vs. the full toolchain the clone-in-image keeps
+around), runs as a **non-root** user, and compiles the engine with a
+**portable** ISA (`x86-64-v3`) so the image runs on any modern x86-64 host
+instead of only the machine that built it.
+
+Build it from the repo root (it needs the `c/` sources as context):
+
+```bash
+git clone https://github.com/JustVugg/colibri.git && cd colibri
+docker build -t colibri -f docker/Dockerfile.slim .
+```
+
+Run — the model is bind-mounted at `/model`, never baked in:
+
+```bash
+docker run --rm -v /nvme/glm52_i4:/model colibri info
+docker run --rm -it -v /nvme/glm52_i4:/model colibri chat --ram 24
+docker run --rm -p 5000:5000 -v /nvme/glm52_i4:/model colibri \
+    serve --host 0.0.0.0 --model-id glm-5.2 --ram 24
+```
+
+The entrypoint is `coli`, so the first argument is the subcommand (`info`,
+`chat`, `serve`, `run`, `plan`, `doctor`) — no `./coli` prefix. The container
+runs as UID 1000, so the model directory must be readable by that user
+(a directory you own already is; a root-owned one needs `chmod -R a+rX` or a
+matching `--user`).
+
+### One-command server (docker compose)
+
+```bash
+MODEL_DIR=/nvme/glm52_i4 COLI_RAM=24 docker compose -f docker/docker-compose.yml up
+```
+
+Serves the OpenAI-compatible API on `localhost:5000`. The converter (which
+needs PyTorch) is intentionally not in this image — convert from a source
+checkout, then point `MODEL_DIR` at the result.
 
 [source: 1]

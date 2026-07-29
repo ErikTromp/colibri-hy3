@@ -1,5 +1,5 @@
 /* int3-g64 (fmt=5) tests: pack layout, dequant round-trip vs plain-C reference,
- * matmul_i3 (NEON + scalar tail) vs reference dequant-matmul, per-row helpers,
+ * matmul_i3 (NEON/AVX-512 + scalar tail) vs reference dequant-matmul, per-row helpers,
  * the .qs-size format tag, and the quality claim in miniature (per-group int3
  * beats per-row int4 on rows with outliers — the #132 result this format ships). */
 #define main coli_glm_main_unused
@@ -11,7 +11,8 @@
 #include <math.h>
 
 static int fails = 0;
-#define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
+static int cur_I = 0, cur_S = 0;               /* shape under test, for failure triage */
+#define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s (I=%d S=%d O=%d)\n", __FILE__, __LINE__, #c, cur_I, cur_S, (int)O); fails++; } }while(0)
 
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 static float rndf(void){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
@@ -44,7 +45,7 @@ static void unpack_i3(const uint8_t *q3, const float *s, float *dq, int O, int I
 }
 
 int main(void){
-    const int Is[]={64,128,192,100,65,7168};   /* incl. short tail groups and one real GLM dim */
+    const int Is[]={64,128,192,100,65,33,7,7168}; /* incl. short tail groups, I<64 (scalar-only group), one real GLM dim */
     enum { O=7, MAXI=7168 };
     static float w[(int64_t)O*MAXI], dq_ref[(int64_t)O*MAXI], dq_pk[(int64_t)O*MAXI];
     static float x[4*MAXI], y_ref[4*O], y_ker[4*O];
@@ -52,7 +53,7 @@ int main(void){
     static float   sc[(int64_t)O*(MAXI/64+1)];
 
     for(unsigned c=0;c<sizeof Is/sizeof *Is;c++){
-        int I=Is[c];
+        int I=Is[c]; cur_I=I; cur_S=0;
         for(int64_t i=0;i<(int64_t)O*I;i++) w[i]=rndf()*0.05f;
         w[3]=1.7f; w[(int64_t)2*I+5]=-2.2f;                 /* outliers */
 
@@ -65,8 +66,8 @@ int main(void){
         CHECK(bad==0);
 
         /* 2. matmul_i3 == matmul over the dequantized reference (fp tolerance:
-         *    NEON fma order differs from the scalar reference loop) */
-        for(int S=1;S<=4;S+=3){
+         *    NEON/AVX-512 fma order differs from the scalar reference loop) */
+        for(int S=1;S<=4;S+=3){ cur_S=S;
             for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=rndf();
             matmul_i3(y_ker, x, q3, sc, S, I, O);
             for(int s=0;s<S;s++) for(int o=0;o<O;o++){
@@ -80,6 +81,7 @@ int main(void){
         }
 
         /* 3. QT plumbing: qt_alloc(bits=3) -> qt_fill -> matmul_qt & qt_bytes & helpers */
+        cur_S=1;
         QT t; qt_alloc(&t, O, I, 3);
         CHECK(t.fmt==5);
         qt_fill(&t, w, 3);
@@ -123,7 +125,7 @@ int main(void){
     /* 5. quality in miniature: on rows with outliers, per-group int3 must beat
      *    per-row int4 on reconstruction RMS (the #132 finding this format ships). */
     {
-        int I=1024;
+        int I=1024; cur_I=I; cur_S=1;
         for(int64_t i=0;i<(int64_t)O*I;i++) w[i]=rndf()*0.02f;
         for(int o=0;o<O;o++) w[(int64_t)o*I+(o*37)%I]=1.5f;    /* one outlier per row */
         ref_i3_dequant(w, dq_ref, O, I);

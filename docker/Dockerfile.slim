@@ -1,0 +1,54 @@
+# colibri — CPU inference image (multi-stage: build then a slim runtime)
+#
+# The engine is portable C with a Python launcher/gateway. This image ships
+# ONLY the inference path (chat/serve/run/info/plan/doctor) — the ~372 GB
+# model is mounted, never baked in, and the converter (which needs torch) is
+# deliberately out of scope; convert from a source checkout instead.
+#
+#   docker build -t colibri -f docker/Dockerfile.slim .
+#   docker run --rm -v /nvme/glm52_i4:/model colibri info
+#   docker run --rm -it -v /nvme/glm52_i4:/model colibri chat --ram 24
+#   docker run --rm -p 5000:5000 -v /nvme/glm52_i4:/model colibri \
+#       serve --host 0.0.0.0 --model-id glm-5.2
+#
+# --------------------------------------------------------------------------
+# Stage 1: build the engine. ARCH is x86-64-v3 (portable AVX2) via `make
+# portable`'s target, NOT native — a native build bakes in the builder CPU's
+# ISA and SIGILLs on a different host. Override ARCH at build time to pin one.
+FROM debian:stable-slim AS build
+ARG ARCH=x86-64-v3
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential make && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY c/ ./c/
+RUN make -C c colibri ARCH=${ARCH}
+
+# --------------------------------------------------------------------------
+# Stage 2: runtime. openai_server.py and the launcher use only the Python
+# standard library, so no pip install — just python3 + the built binary and
+# its support files. libgomp1 provides the OpenMP runtime the engine links.
+FROM debian:stable-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 libgomp1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 colibri
+WORKDIR /app
+
+# The engine binary plus the launcher and the files it resolves at runtime
+# (version.py, the gateway, resource planner, doctor, tokenizer headers, tools).
+COPY --from=build /src/c/colibri            ./colibri
+COPY c/coli c/version.py c/openai_server.py c/resource_plan.py c/doctor.py ./
+COPY c/tools/ ./tools/
+
+ENV COLI_MODEL=/model \
+    COLI_ENGINE=/app/colibri \
+    PYTHONUNBUFFERED=1
+# A bind-mounted model lands here; declaring the volume documents the contract.
+VOLUME ["/model"]
+# `coli serve` default port.
+EXPOSE 5000
+
+USER colibri
+ENTRYPOINT ["python3", "/app/coli"]
+CMD ["info"]

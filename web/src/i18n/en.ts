@@ -54,6 +54,8 @@ const en: Record<string, string> = {
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "slot {{n}}",
+  "topbar.truncated": "Truncated",
+  "topbar.truncatedHelp": "The response hit the max output tokens limit and was cut off. Raise \"Max output tokens\" to see the full answer.",
   "topbar.clear": "Clear",
 
   // hero / empty state
