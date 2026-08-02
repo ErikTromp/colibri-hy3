@@ -127,16 +127,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
       - name: Build hy3
         run: cd c && make hy3
-      - name: Tiny-model oracle (int4, 32/32 positions)
+      - name: Tiny-model fixture + teacher-forcing oracle (fp32, 32/32 positions)
         run: |
           cd c
-          if [ -d hy3_tiny ] && [ -f ref_hy3.json ]; then
-            SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
-          else
-            echo "hy3_tiny fixtures missing — skipping oracle"
-          fi
+          # Random-init HYV3ForCausalLM via HF transformers (see make_hy3_oracle.py).
+          # Weights are not committed (*.safetensors is gitignored); regenerate here
+          # like inkling-oracle does for tiny_inkling/.
+          python3 tools/make_hy3_oracle.py
+          SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
 
   engine-hip-syntax:
     name: HIP syntax check

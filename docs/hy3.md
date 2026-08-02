@@ -117,7 +117,8 @@ These are **not** the full Hy3 model (~142 GB). They are a 5-layer random `hy_v3
 
 | Path | In git? | Purpose |
 |------|---------|---------|
-| `c/hy3_tiny/` | **yes** | fp32 teacher-forcing oracle — `setup.sh` and CI expect **32/32** |
+| `c/hy3_tiny/config.json` (+ `generation_config.json`) | **yes** | model config only; weight shards are **not** committed (`*.safetensors` is gitignored) |
+| `c/hy3_tiny/*.safetensors` | **no** | ~3 MB fp32 weights — regenerate with `make_hy3_oracle.py` (CI does this automatically) |
 | `c/ref_hy3.json` | **yes** | expected prompt/full token IDs and TF logits from the HF reference run |
 | `c/hy3_tiny_i4/` | **no** | int4 Colibri container derived from `hy3_tiny`; tests the converter + int4 load path |
 
@@ -329,7 +330,7 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 **Working today**
 
 - FP8 → int4 conversion (full 80-layer model)
-- `hy3_tiny` oracle **32/32** (committed); `hy3_tiny_i4` oracle **32/32** (regenerate locally)
+- `hy3_tiny` oracle **32/32** (weights regenerated in CI via `make_hy3_oracle.py`); `hy3_tiny_i4` oracle **32/32** (regenerate locally)
 - Full-model chat (coherent output with `IDOT=0`, fixed serve KV alloc)
 - MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default; optional `TREE_DRAFT=1`)
 - Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention
