@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>colibri — a 744B model on hardware you own</title>
-<meta name="description" content="Run GLM-5.2, a 744-billion-parameter Mixture-of-Experts model, on hardware you already own — pure C, zero dependencies, experts streamed from disk.">
-<meta property="og:title" content="colibri — a 744B model on hardware you own">
-<meta property="og:description" content="A 744B MoE on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
+<title>colibri — frontier MoE models on hardware you own</title>
+<meta name="description" content="Run frontier Mixture-of-Experts models — 744B to 2.8T parameters — on hardware you already own. Pure C, zero dependencies, experts streamed from disk.">
+<meta property="og:title" content="colibri — frontier MoE models on hardware you own">
+<meta property="og:description" content="Frontier MoE models on consumer hardware, from 744B to 2.8T: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
@@ -179,10 +179,12 @@ footer li a:hover{color:var(--on-dark)}
 
 <header class="hero" id="top">
   <div class="wrap hero-grid">
-    <h1>A <u>744-billion-parameter</u> model, running on <u>hardware you own</u></h1>
+    <h1>These models do not fit in your machine. <u>They run in it anyway.</u></h1>
     <div class="aside">
-      GLM-5.2 is a 744B Mixture-of-Experts model. colibri runs it in pure C, with zero dependencies,
-      by streaming its experts from disk — no cluster, no cloud, no API key.
+      A Mixture-of-Experts token touches a small fraction of the weights, so colibri keeps that part
+      resident and streams the rest from disk as it is needed. Four families run today — GLM-5.2
+      (744B), Inkling (975B), Kimi K3 (2.8T) and OLMoE (7B) — in pure C, with zero dependencies.
+      No cluster, no cloud, no API key.
       <div class="cta">
         <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
         <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
@@ -226,15 +228,15 @@ footer li a:hover{color:var(--on-dark)}
       <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse — quantization A/Bs and quality ablations run here first.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">7B MoE · Live</span></div></div>
         <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
-      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE — mixed-precision staging under test to fit a consumer box.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Planned</span></div></div>
-        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE, running today. An int4 dense container brings the resident set to 15.3 GB, so it fits a 25 GB box.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it →</a></div>
       <div class="card"><h3>DeepSeek</h3><p class="desc">A widely-studied frontier MoE family — the tiered engine's next large-scale target.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">671B–1T MoE · Planned</span></div></div>
         <a class="btn soon">On the roadmap</a></div>
-      <div class="card"><h3>Kimi K2</h3><p class="desc">The next scale step: a trillion-parameter model on the same tiered engine.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">1T MoE · Planned</span></div></div>
-        <a class="btn soon">On the roadmap</a></div>
+      <div class="card"><h3>Kimi K3</h3><p class="desc">The largest model here, running today — its QAT-trained MXFP4 experts are streamed straight from the original checkpoint, with no conversion.</p>
+        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">2.8T MoE · Live</span></div></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it →</a></div>
       <div class="card"><h3>Qwen3 MoE</h3><p class="desc">The most widely-deployed open family — broad hardware coverage meets broad adoption.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">MoE · Planned</span></div></div>
         <a class="btn soon">On the roadmap</a></div>
@@ -296,7 +298,7 @@ footer li a:hover{color:var(--on-dark)}
       </ul></div>
       <div><h4>Models</h4><ul>
         <li><a href="#models">GLM-5.2</a></li><li><a href="#models">OLMoE</a></li>
-        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">Kimi K3</a></li>
       </ul></div>
       <div><h4>Project</h4><ul>
         <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>

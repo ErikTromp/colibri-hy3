@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -157,6 +158,50 @@ class DoctorTest(unittest.TestCase):
             "CUDA runtime library is missing",
         )
         self.assertEqual(report["status"], "error")
+
+    # #379: doctor surfaces the cached F_NOCACHE probe read-only (S4) -- it
+    # never re-measures storage itself, only reflects what colibri.c already wrote.
+    def test_ssd_probe_check_skips_when_not_yet_cached(self):
+        checks = self.checks_by_id(self.report())
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
+
+    def test_ssd_probe_check_passes_and_reports_cached_value(self):
+        # byte-exact (write_bytes): Windows text mode would CRLF-translate and the
+        # strict reader would (correctly) reject the fixture as garbage
+        (self.model / ".coli_ssd").write_bytes(f"v2 14.3 {os.stat(self.model).st_dev}\n".encode("ascii"))
+        checks = self.checks_by_id(self.report())
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "pass")
+        self.assertEqual(checks["storage.ssd_probe"]["details"]["gbs"], 14.3)
+
+    def test_ssd_probe_wording_names_why_a_cache_is_pending(self):
+        # #386 r2, F10: "no cached probe yet" is a lie when a file exists --
+        # each untrusted state names what will actually happen instead.
+        cases = (  # byte-exact fixtures: no text-mode CRLF on Windows
+            (b"14.3\n", "legacy cache pending engine upgrade"),
+            (f"v2 14.3 {os.stat(self.model).st_dev + 1}\n".encode("ascii"), "cache from another volume"),
+            (b"not-a-number\n", "unreadable cache"),
+        )
+        for content, expected in cases:
+            (self.model / ".coli_ssd").write_bytes(content)
+            check = self.checks_by_id(self.report())["storage.ssd_probe"]
+            self.assertEqual(check["status"], "skip", content)
+            self.assertIn(expected, check["summary"], content)
+            self.assertNotIn("no cached probe yet", check["summary"], content)
+        (self.model / ".coli_ssd").unlink()
+        check = self.checks_by_id(self.report())["storage.ssd_probe"]
+        self.assertIn("no cached probe yet", check["summary"])
+
+    def test_ssd_probe_check_never_emits_json_infinity(self):
+        # float("inf") used to sail through the old reader; json.dumps renders
+        # it as the bare literal Infinity, which is not JSON -- machine
+        # consumers of `coli doctor --json` would then fail to parse the whole
+        # report. The strict v2 grammar bans inf/nan outright (#386 fix round).
+        (self.model / ".coli_ssd").write_bytes(b"inf\n")
+        report = self.report()
+        checks = self.checks_by_id(report)
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
+        encoded = json.dumps(report, indent=2, allow_nan=False)  # raises on inf/nan
+        json.loads(encoded)
 
     def test_text_format_contains_checks_plan_and_result(self):
         output = format_doctor(self.report())

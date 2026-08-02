@@ -27,16 +27,25 @@ void coli_metal_stats(size_t *tensor_count, size_t *tensor_bytes);
 int  coli_metal_mem_info(size_t *used_bytes, size_t *total_bytes);
 
 /*
- * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o].
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4(packed), 3=int2(packed).
- * The first successful call wraps W and its row scales in GPU-visible buffers;
- * later calls reuse them (weights are assumed stable at the same address).
+ * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
+ * PER-GROUP scale into the accumulation -- see the shader comment in backend_metal.mm.
+ * fmt=8 (fp8 passthrough -- see colibri.c) likewise folds its per-128x128-block
+ * scale into the accumulation.
+ * fmt matches QT in colibri.c: 0=f32, 1=int8, 2=int4(packed), 3=int2(packed),
+ * 4=int4(packed, same layout as 2)+per-group scale (gs = group size along I; scale
+ * array is [O, ceil(I/gs)] floats instead of [O]),
+ * 8=fp8-e4m3 (one raw byte/element, same layout as fmt=1) + per-128x128-
+ * block scale (scale array is [ceil(O/128),ceil(I/128)] floats; no group-size
+ * parameter needed -- the block is a fixed 128x128, not caller-configurable).
+ * gs is ignored for fmt!=4 (pass 0).
+ * The first successful call wraps W and its scales in GPU-visible buffers (sized from
+ * fmt+gs); later calls reuse them (weights are assumed stable at the same address).
  * Returns 1 on success, 0 if Metal is unavailable or fmt is invalid.
  */
 int coli_metal_matmul(ColiMetalTensor **tensor,
                       float *y, const float *x,
                       const void *weights, const float *scales,
-                      int fmt, int S, int I, int O);
+                      int fmt, int S, int I, int O, int gs);
 
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
@@ -68,14 +77,14 @@ void coli_metal_unregister(void *base);
  */
 int coli_metal_layer_decode(float *x,
     const float *in_ln, const float *post_ln,
-    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
-    const void *qb_w, const float *qb_s, int qb_fmt,
-    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
+    const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
     const void *kvb_w, const float *kvb_s, int kvb_fmt,
-    const void *o_w, const float *o_s, int o_fmt,
-    const void *shg_w, const float *shg_s, int shg_fmt,
-    const void *shu_w, const float *shu_s, int shu_fmt,
-    const void *shd_w, const float *shd_s, int shd_fmt,
+    const void *o_w, const float *o_s, int o_fmt, int o_gs,
+    const void *shg_w, const float *shg_s, int shg_fmt, int shg_gs,
+    const void *shu_w, const float *shu_s, int shu_fmt, int shu_gs,
+    const void *shd_w, const float *shd_s, int shd_fmt, int shd_gs,
     const float *router_w, const float *router_bias,
     int E, int K, int Ksel, float topp, int normk, float rscale,
     float *Lc, float *Rc, int S, int pos_base, int st0,
@@ -83,7 +92,7 @@ int coli_metal_layer_decode(float *x,
     float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
 
 int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
-                    int fmt, int S, int I, int O);   /* large-batch sync GEMM; 0 -> CPU */
+                    int fmt, int S, int I, int O, int gs);   /* large-batch sync GEMM; 0 -> CPU. gs: fmt=4 group size (0 otherwise) */
 /* Parallel top-8 expert selection (r_top8_par): run ONE top-8 selection kernel standalone
  * on host arrays — par=0 the serial r_top8, par=1 the parallel exact-match replica gated
  * in the engine by COLI_RTOP8 (default ON; COLI_RTOP8=0 opts out to the serial kernel).
@@ -104,11 +113,11 @@ int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E,
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
-    const void *qa_w, const float *qa_s, int qa_fmt, const float *qa_ln,
-    const void *qb_w, const float *qb_s, int qb_fmt,
-    const void *kva_w, const float *kva_s, int kva_fmt, const float *kva_ln,
+    const void *qa_w, const float *qa_s, int qa_fmt, int qa_gs, const float *qa_ln,
+    const void *qb_w, const float *qb_s, int qb_fmt, int qb_gs,
+    const void *kva_w, const float *kva_s, int kva_fmt, int kva_gs, const float *kva_ln,
     const void *kvb_w, const float *kvb_s, int kvb_fmt,
-    const void *o_w, const float *o_s, int o_fmt,
+    const void *o_w, const float *o_s, int o_fmt, int o_gs,
     float *Lc, float *Rc, int S, int pos_base, int st0, float eps, float theta, float ascale, float *out);
 
 /* Diagnostics: GPU blocks executed, CPU-fallback blocks, experts run on GPU. */
@@ -129,7 +138,11 @@ int coli_metal_resset_stats(double *flush_s);
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
  *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts)
+ *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
+ *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
+ *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
+ *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
+ *                extending the batched routed-expert path is future work (see PR_BODY.md).
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target

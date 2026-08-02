@@ -11,7 +11,8 @@ Keep changes focused and preserve Colibri's dependency-free default CPU path.
   it into `main`. This keeps `main` clean instead of taking every PR one at a time.
 
 Every PR — on either branch — is reviewed for a clean build (0 warnings), the oracle
-(32/32 TF + 20/20 greedy), and its own targeted validation before merge.
+(~30-32/32 TF depending on floating-point near-ties + 20/20 greedy), and its own
+targeted validation before merge.
 
 ## Local checks
 

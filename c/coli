@@ -8,15 +8,14 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
   coli run "prompt"         one-shot generation
   coli info                 model, RAM, disk, and configuration status
   coli plan                 Disk / RAM / VRAM resource plan
-  coli rocm-plan            GGUF KV-aware whole-layer ROCm plan
+  coli mirror               Plan, stage, or verify a learned partial mirror
   coli doctor               installation and execution-plan diagnostics
   coli bench [task...]      quality benchmarks (MMLU/HellaSwag/...)
   coli convert              convert GLM-5.2-FP8 to int4, one shard at a time
   coli build                build the engine
 
 Configuration through environment variables or flags (also valid after the subcommand):
-  COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
-  COLI_PYTHON=<bin>  Python for convert/bench tools (needs numpy, torch, safetensors)
+  COLI_MODEL=<dir>   model directory (required; or pass --model <dir>)
   COLI_MODEL_MIRROR=<dir>  second copy of the model on another drive: expert reads
                      are split across both SSDs (COLI_DISK_WEIGHTS=9,3 sets the
                      primary,mirror bandwidth ratio; default: measured at startup)
@@ -24,7 +23,6 @@ Configuration through environment variables or flags (also valid after the subco
   --repin N          adapt RAM/VRAM experts every N tokens
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
-  --verbose          pass engine stderr through (or COLI_VERBOSE=1)
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
@@ -61,7 +59,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
-# support modules (resource_plan.py, doctor.py, openai_server.py) and
+# support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
 # tools/ all live next to this script — unchanged from before.
 #
 # Installed layout ("make install"): this script is $(PREFIX)/bin/coli,
@@ -73,86 +71,26 @@ _EXE = ".exe" if sys.platform == "win32" else ""
 _LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
 _here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
-_here_hy3 = os.path.join(HERE, "hy3" + _EXE)
 
 if os.environ.get("COLI_ENGINE"):
     GLM = os.environ["COLI_ENGINE"]
-    HY3 = os.environ.get("COLI_HY3_ENGINE", os.path.join(os.path.dirname(GLM), "hy3" + _EXE))
     TOOLS = os.path.join(os.path.dirname(GLM), "tools")
-elif os.path.exists(_here_colibri) or os.path.exists(_here_hy3):
-    GLM = _here_colibri if os.path.exists(_here_colibri) else _here_glm
-    HY3 = _here_hy3
+elif os.path.exists(_here_colibri):
+    GLM = _here_colibri
     TOOLS = os.path.join(HERE, "tools")
 elif os.path.exists(_here_glm):
     GLM = _here_glm
-    HY3 = _here_hy3
     TOOLS = os.path.join(HERE, "tools")
 else:
     GLM = os.path.join(_LIBEXEC, "colibri" + _EXE)
-    HY3 = os.path.join(_LIBEXEC, "hy3" + _EXE)
     TOOLS = os.path.join(_LIBEXEC, "tools")
     sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
 
-DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
-
-def python_for_tools():
-    """Pick Python for offline tools (convert, bench). Needs numpy + torch + safetensors."""
-    override = os.environ.get("COLI_PYTHON")
-    if override and os.path.isfile(override):
-        return override
-    mio = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    if os.path.isfile(mio):
-        return mio
-    bindir = "Scripts" if sys.platform == "win32" else "bin"
-    for envkey in ("CONDA_PREFIX", "VIRTUAL_ENV"):
-        base = os.environ.get(envkey)
-        if not base:
-            continue
-        for name in ("python", "python3"):
-            cand = os.path.join(base, bindir, name)
-            if os.path.isfile(cand):
-                return cand
-    for cand in (sys.executable, shutil.which("python"), shutil.which("python3")):
-        if not cand or not os.path.isfile(cand):
-            continue
-        try:
-            subprocess.run([cand, "-c", "import numpy"], capture_output=True, check=True, timeout=15)
-            return cand
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            continue
-    return sys.executable
-
-def model_config(model):
-    path=os.path.join(model,"config.json")
-    if not os.path.isfile(path): return {}
-    try: return json.load(open(path,encoding="utf-8"))
-    except (OSError,json.JSONDecodeError): return {}
-
-def engine_for(model):
-    forced=os.environ.get("COLI_ENGINE","").lower()
-    if forced in ("hy3","glm"): return HY3 if forced=="hy3" else GLM
-    cfg=model_config(model)
-    return HY3 if cfg.get("model_type")=="hy_v3" else GLM
-
-def engine_name(model):
-    return "hy3" if engine_for(model)==HY3 else "glm"
-
-def model_config(model):
-    try:
-        with open(os.path.join(model, "config.json")) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-def is_hy3_repo(repo):
-    if os.path.isdir(repo):
-        return model_config(repo).get("model_type") == "hy_v3"
-    r = repo.lower()
-    return "hy3" in r or repo.startswith("tencent/Hy")
-
-def engine_argv(model, cap):
-    """Hy3 int4 containers need explicit ebits/dbits; GLM auto-detects from shard layout."""
-    return [str(cap), "4", "8"] if engine_for(model) == HY3 else [str(cap)]
+# No invented default: a path from whoever's machine this was written on is worse than
+# no path at all, because every downstream error then names a directory the user never
+# chose and cannot act on (#724). None here, and each command says so in its own voice.
+DEF_MODEL = os.environ.get("COLI_MODEL")
+NO_MODEL_HINT = "pass --model <dir>, or set COLI_MODEL=<dir>"
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 
@@ -199,33 +137,21 @@ def sprite_lines():
         out.append(row+"\033[0m")
     return out
 
-def model_tag(model=None):
-    tier="streaming CPU"
-    if model and os.path.isdir(model):
-        try:
-            with open(os.path.join(model,"config.json")) as f:
-                cfg=json.load(f)
-            if cfg.get("model_type")=="hy_v3":
-                if cuda_binary(HY3): tier="streaming CPU+GPU"
-                return f"{C.gray}Hy3 · 295B MoE · int4 · {tier}{C.r}"
-        except (OSError,json.JSONDecodeError): pass
-    if cuda_binary(GLM): tier="streaming CPU+GPU"
-    return f"{C.gray}GLM-5.2 · 744B MoE · int4 · {tier}{C.r}"
-
-def engine_label(model=None):
-    if model and os.path.isdir(model):
-        try:
-            with open(os.path.join(model,"config.json")) as f:
-                if json.load(f).get("model_type")=="hy_v3": return "Hy3 295B"
-        except (OSError,json.JSONDecodeError): pass
-    return "GLM-5.2 744B"
-
 def banner(sub="", model=None):
     sp=sprite_lines()
+    tag = f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}"
+    if model and os.path.isdir(model):
+        arch = model_arch(model)
+        if arch == "hy3":
+            tag = f"{C.gray}Hy3 · 295B MoE · int4 · streaming CPU{C.r}"
+        elif arch == "inkling":
+            tag = f"{C.gray}Inkling · 975B MoE · int4 · streaming CPU{C.r}"
+        elif arch == "kimi":
+            tag = f"{C.gray}Kimi K3 · 2.8T MoE · MXFP4 · streaming CPU{C.r}"
     txt=[
         f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
-        model_tag(model),
+        tag,
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
     ]
@@ -240,103 +166,122 @@ def hline(w): return f"{C.dgray}{'─'*w}{C.r}"
 # ---------- util ----------
 def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
-def need_model(model):
+def model_arch(model):
+    try:
+        with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
+            model_type = (json.load(f).get("model_type") or "").lower()
+    except (OSError, ValueError, TypeError):
+        return "glm"
+    if model_type == "hy_v3" or "hy_v3" in model_type:
+        return "hy3"
+    if "inkling" in model_type:
+        return "inkling"
+    if "kimi" in model_type:
+        return "kimi"
+    return "glm"
+
+_ENGINE_NAMES = {"inkling": "inkling", "kimi": "kimi_k3", "hy3": "hy3"}
+
+def engine_for(model):
+    arch = model_arch(model)
+    if arch == "glm" or os.environ.get("COLI_ENGINE"):
+        return GLM
+    name = _ENGINE_NAMES[arch]
+    local = os.path.join(HERE, name + _EXE)
+    return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
+
+def argv_for_arch(arch, cap):
+    """Engine argv tail after the executable path."""
+    cap = cap_for_arch(arch, cap)
+    if arch == "hy3":
+        return [str(cap), "4", "8"]
+    return [str(cap)]
+
+def model_config(model):
+    path = os.path.join(model, "config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def is_hy3_repo(repo):
+    if os.path.isdir(repo):
+        return model_config(repo).get("model_type") == "hy_v3"
+    r = repo.lower()
+    return "hy3" in r or repo.startswith("tencent/Hy")
+
+def need_model(model, engine=None):
+    if not model:
+        sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     if not os.path.isdir(model):
         sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
     if not os.path.exists(os.path.join(model,"tokenizer.json")):
         sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
-    eng=engine_for(model)
-    if not os.path.exists(eng):
-        sys.exit(f"{C.yel}engine is not built ({os.path.basename(eng)}).{C.r} Run: coli build")
-
-def cuda_binary(engine=None):
-    engine = engine or GLM
+    engine = engine or engine_for(model)
     if not os.path.exists(engine):
-        return False
-    if sys.platform == "win32":
-        try:
-            with open(engine,"rb") as stream:
-                data = stream.read()
-            if b"amdhip64.dll" in data.lower():
-                return True
-            built = (b"[CUDA] mode: routed experts" in data or
-                     b"[ROCm] mode: routed experts" in data)
-        except OSError:
-            return False
-        return built and os.path.exists(os.path.join(os.path.dirname(engine),"coli_cuda.dll"))
-    if sys.platform != "linux": return False
-    try:
-        linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
-        return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
-                   for line in linked.stdout.splitlines())
-    except (OSError,subprocess.SubprocessError): return False
+        arch = model_arch(model)
+        target = _ENGINE_NAMES.get(arch, "colibri")
+        sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
+def cap_for_arch(arch, cap):
+    """Cap-sentinel shim shared with openai_server.py."""
+    if cap is not None:
+        return cap
+    return 0 if arch == "glm" else 8
+
+def env_for_engine(a, arch):
+    if arch == "glm":
+        return env_for(a)
+    env = os.environ.copy()
+    if arch == "hy3" and "IDOT" not in env:
+        env["IDOT"] = "0"
+    if a.ngen:
+        env["NGEN"] = str(a.ngen)
+    if a.temp is not None:
+        env["COLI_TEMP"] = str(a.temp)
+    return env
+
+def cuda_binary():
+    if not os.path.exists(GLM): return False
+    if sys.platform == "linux":
+        try:
+            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
+            return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
+                       for line in linked.stdout.splitlines())
+        except (OSError,subprocess.SubprocessError): return False
+    if sys.platform == "win32":
+        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
+        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
+        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
+        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        try:
+            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+        except OSError: return False
+        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+    return False
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("ROCM_EXPERT_GB",env.get("CUDA_EXPERT_GB",0)))
+    def num(v):
+        try: return float(v)
+        except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
+    ram=a.ram or num(env.get("RAM_GB",0))
+    vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
     gpu=a.gpu
     if gpu is None:
-        gpu=env.get("ROCM_GPUS",env.get("ROCM_GPU",
-            env.get("COLI_GPUS",env.get("COLI_GPU","auto"))))
+        gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
     devices=None if gpu=="auto" else ([] if gpu=="none" else
         [int(value) for value in gpu.split(",")])
     return ram,ctx,devices,vram
 
-def normalize_rocm_env(e):
-    """Accept ROCm-native names while keeping the engine ABI backward compatible."""
-    gpu=e.get("ROCM_GPU")
-    gpus=e.get("ROCM_GPUS")
-    if gpu is not None and "COLI_GPU" not in e and "COLI_GPUS" not in e:
-        e["COLI_CUDA"] = "0" if gpu == "none" else "1"
-        if gpu not in ("none", "auto"): e["COLI_GPU"] = gpu
-    elif gpus is not None and "COLI_GPU" not in e and "COLI_GPUS" not in e:
-        e["COLI_CUDA"] = "1"
-        e["COLI_GPUS"] = gpus
-    if "ROCM_EXPERT_GB" in e:
-        e.setdefault("COLI_CUDA", "1")
-        e.setdefault("CUDA_EXPERT_GB", e["ROCM_EXPERT_GB"])
-    if "ROCM_DENSE" in e:
-        e.setdefault("COLI_CUDA", "1")
-        e.setdefault("CUDA_DENSE", e["ROCM_DENSE"])
-    if "ROCM_ATTN" in e:
-        e.setdefault("COLI_CUDA", "1")
-        e.setdefault("CUDA_ATTN", e["ROCM_ATTN"])
-    return e
-
-def apply_accel_env(e, a, engine):
-    """Pass --gpu/--vram to the engine without requiring --auto-tier."""
-    if a.gpu is None and not a.vram:
-        return e
-    has_cuda = cuda_binary(engine)
-    eng = os.path.basename(engine)
-    if a.gpu == "none":
-        e["COLI_CUDA"] = "0"
-        e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
-        e.pop("CUDA_EXPERT_GB", None); e.pop("CUDA_DENSE", None)
-        return e
-    if a.gpu is not None:
-        e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
-        if a.gpu != "none":
-            if not has_cuda:
-                sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make {eng} CUDA=1 or ROCM=1 (this binary is CPU-only)")
-            e.setdefault("COLI_CUDA", "1")
-            if a.gpu != "auto":
-                devices = [int(v) for v in a.gpu.split(",")]
-                key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
-                e[key] = a.gpu
-            e.setdefault("CUDA_DENSE", "1")
-    if a.vram and a.gpu != "none":
-        if not has_cuda:
-            sys.exit(f"{C.yel}--vram needs a GPU build:{C.r} make {eng} CUDA=1 or ROCM=1 (this binary is CPU-only)")
-        e.setdefault("COLI_CUDA", "1")
-        e["CUDA_EXPERT_GB"] = str(a.vram)
-    return e
-
 def env_for(a):
+    explicit_env = set(os.environ)
     e = dict(os.environ, SNAP=a.model)
-    normalize_rocm_env(e)
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -366,8 +311,8 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
-    if engine_for(a.model) == HY3 and "IDOT" not in e:
-        e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
+    if model_arch(a.model) == "hy3" and "IDOT" not in e:
+        e["IDOT"] = "0"
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -392,14 +337,34 @@ def env_for(a):
             plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
-        has_cuda=cuda_binary(engine_for(a.model))
+        has_cuda=cuda_binary()
         e=environment_for_plan(plan,e,has_cuda)
+        if not getattr(a, "no_tune_profile", False):
+            from autotune import apply_profile, load_profile
+            profile=load_profile(plan,a.model,GLM)
+            if profile:
+                e=apply_profile(e,profile,explicit_env)
+                gain=100.0*profile["gain"]
+                print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% calibration throughput{C.r}",
+                      file=sys.stderr)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
-        e = apply_accel_env(e, a, engine_for(a.model))
-        # Windows: auto-enable CUDA when a GPU build and nvidia-smi are present.
+        # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
+        # run CPU-only, even on a CUDA build with a GPU present — cuda_binary()
+        # returned False on Windows (see above), and nothing set COLI_CUDA without
+        # an explicit flag. Now that detection works, auto-enable the GPU when one
+        # is detected so `coli chat` Just Works. Scoped to Windows: Linux already
+        # has working detection + the explicit-flag UX, and changing bare-chat
+        # semantics there is out of scope. Falls back to CPU with a warning if
+        # nvidia-smi is missing (discover_gpus can't size VRAM without it).
+        # An explicit COLI_CUDA=0 in the environment must win over the implicit
+        # auto-enable: before this check, a Windows user setting COLI_CUDA=0 for
+        # a CPU baseline silently got a ~12.6 GB VRAM expert tier anyway (the
+        # engine's "CPU" rows were GPU-assisted). --gpu none remains the
+        # canonical hard off-switch (works on every platform, also clears the
+        # CUDA_* sizing vars).
         if (sys.platform == "win32" and a.gpu is None and not a.vram
                 and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
@@ -408,6 +373,9 @@ def env_for(a):
                 if gpus:
                     e["COLI_CUDA"]="1"
                     e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
+                    # Reuse the planner so the expert-tier VRAM budget is the real
+                    # free VRAM minus the 2 GB reserve — not a guess. Same machinery
+                    # as --auto-tier, just without requiring the user to pass it.
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
                         plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
@@ -417,33 +385,36 @@ def env_for(a):
                         print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
                               f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
                     except (OSError,ValueError,json.JSONDecodeError) as error:
+                        # Plan failed (e.g. model dir unreadable): don't block the
+                        # run, just leave the unsized COLI_CUDA=1 and let the engine
+                        # pick its own budget. Engine handles a missing budget.
                         print(f"  {C.yel}[GPU] auto-enable: could not size VRAM ({error}); "
                               f"using engine default{C.r}", file=sys.stderr)
                 else:
                     print(f"  {C.yel}[GPU] coli_cuda.dll present but nvidia-smi not found on PATH "
                           f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
                           f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
+            # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
         elif e.get("COLI_CUDA") == "0":
+            # honoured off-switch: also drop stale device/sizing vars so the
+            # engine can't be re-enabled by leftovers (same as --gpu none).
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+        # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
+        # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             if a.gpu=="none":
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
-                if not cuda_binary(engine_for(a.model)):
-                    eng=os.path.basename(engine_for(a.model))
-                    sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make {eng} CUDA=1 or HIP=1 (this binary is CPU-only)")
+                if not cuda_binary():
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
-                if a.gpu!="auto":
-                    devices=[int(v) for v in a.gpu.split(",")]
-                    key="COLI_GPU" if len(devices)==1 else "COLI_GPUS"
-                    e[key]=a.gpu
+                if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
-            if not cuda_binary(engine_for(a.model)):
-                eng=os.path.basename(engine_for(a.model))
-                sys.exit(f"{C.yel}--vram needs a GPU build:{C.r} make {eng} CUDA=1 or HIP=1 (this binary is CPU-only)")
+            if not cuda_binary():
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -554,22 +525,6 @@ class Spinner:
         if self.th: self.th.join(timeout=0.4)
         if TTY: sys.stdout.write("\r\033[K"); sys.stdout.flush()
 
-def verbose_chat(a):
-    return getattr(a, "verbose", False) or os.environ.get("COLI_VERBOSE") == "1"
-
-def tail_errlog(path, max_lines=40, max_chars=4000):
-    try:
-        with open(path) as f:
-            text = f.read()[-max_chars:]
-        lines = [l for l in text.splitlines() if l.strip()]
-        if not lines:
-            return
-        print(f"\n  {C.yel}engine stderr (last {min(len(lines), max_lines)} lines):{C.r}")
-        for l in lines[-max_lines:]:
-            print(f"  {C.dgray}{l}{C.r}")
-    except OSError:
-        pass
-
 def engine_diag(p, errlog=None):
     """Lo stdout del motore ha chiuso: il processo e' morto. Dire PERCHE'.
     Un SIGKILL dell'OOM-killer del kernel e' altrimenti invisibile — niente errore,
@@ -598,7 +553,6 @@ def engine_diag(p, errlog=None):
             if tail: print(f"  {C.dgray}" + "\n  ".join(tail.splitlines()[-6:]) + f"{C.r}")
         except Exception: pass
 
-
 def stream_turn(p, sentinel, on_bytes):
     """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT.
     Il PRIMO Ctrl-C durante lo stream non chiude la sessione: il motore (handler SIGINT)
@@ -620,11 +574,9 @@ def stream_turn(p, sentinel, on_bytes):
         if pend.endswith(sentinel):
             rest=pend[:-len(sentinel)]
             if rest: on_bytes(rest)
-            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss [prompt truncated decode_tps]
-            m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)(?: (\S+) (\S+) (\S+))?", line)
-            if not m: return {}
-            st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))}
-            if m.group(7) is not None: st["decode_tps"]=float(m.group(7))
+            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
+            m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
+            st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
             if interrupted: st["interrupted"]=True
             return st
         if len(pend)>len(sentinel):
@@ -637,21 +589,19 @@ def cmd_build(a):
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
-    command=["make","-C",HERE,"colibri","hy3"]
-    backend=os.environ.get("COLI_BACKEND","").lower()
-    if backend in ("rocm","hip"):
-        command.append("HIP=1")
-    sys.exit(subprocess.call(command))
+    sys.exit(subprocess.call(["make","-C",HERE,"colibri","hy3"]))
 
 def cmd_info(a):
-    banner("info")
+    banner("info", a.model)
+    if not a.model:
+        sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     cfgp=os.path.join(a.model,"config.json")
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
         row("model", a.model)
         row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
-                    f"{c.get('num_experts', c.get('n_routed_experts'))} expert/layer · top-{c.get('num_experts_per_tok')}")
+                    f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -668,8 +618,7 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    eng=engine_for(a.model)
-    row("engine", f"{engine_name(a.model)} {'ready ✓' if os.path.exists(eng) else 'not built (coli build)'}")
+    row("engine", "ready ✓" if os.path.exists(engine_for(a.model)) else f"not built (make -C c {_ENGINE_NAMES.get(model_arch(a.model), 'colibri')})")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -679,6 +628,8 @@ def cmd_info(a):
 
 def cmd_plan(a):
     from resource_plan import build_plan, format_plan
+    if not a.model:
+        sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
@@ -691,53 +642,20 @@ def cmd_plan(a):
         return
     banner("plan · Disk / RAM / VRAM")
     print(textwrap.indent(format_plan(plan),"  "))
-
-def cmd_rocm_plan(a):
-    """Print a whole-layer GGUF plan for llama.cpp on one ROCm GPU."""
-    from rocm_tune import llama_server_args, read_gguf_header, recommend_layers
-    from resource_plan import discover_gpus, GB
-
-    header = read_gguf_header(a.model)
-    if a.vram > 0:
-        vram = int(a.vram * GB)
-    else:
-        gpus = discover_gpus()
-        if not gpus:
-            sys.exit(f"{C.yel}no ROCm GPU detected:{C.r} pass --vram N")
-        vram = int(gpus[0]["free_bytes"])
-    plan = recommend_layers(
-        header, vram, context=a.ctx or 2048, target_mib=a.target_mib,
-        compute_mib=a.compute_mib, cache_type_k=a.cache_type_k,
-        cache_type_v=a.cache_type_v, sequences=a.sequences,
-    )
-    plan["architecture"] = header["architecture"]
-    plan["model"] = header["path"]
-    plan["command"] = llama_server_args(a.model, plan, a.host, a.port)
-    if a.json:
-        print(json.dumps(plan, indent=2))
-        return
-    print(f"architecture  {plan['architecture']}")
-    print(f"VRAM          {plan['vram_bytes'] / GB:.2f} GB")
-    print(f"KV cache      {plan['kv_cache_bytes'] / (1024 * 1024):.1f} MiB total, "
-          f"{plan['gpu_kv_cache_bytes'] / (1024 * 1024):.1f} MiB VRAM, "
-          f"{plan['host_kv_cache_bytes'] / (1024 * 1024):.1f} MiB RAM "
-          f"({plan['cache_type_k']} K / {plan['cache_type_v']} V, "
-          f"context {plan['context']})")
-    print(f"whole layers  {plan['gpu_layers']}/{plan['total_layers']}")
-    print(f"headroom      {plan['target_margin_bytes'] / (1024 * 1024):.0f} MiB target + "
-          f"{plan['compute_reserve_bytes'] / (1024 * 1024):.0f} MiB compute")
-    print("llama-server  " + subprocess.list2cmdline(plan["command"]))
     print()
 
 def cmd_doctor(a):
     from doctor import exit_code, format_doctor, run_doctor
     try:
+        # doctor reports rather than exits, so a missing model is a failed check and not
+        # a sys.exit like everywhere else — it is exactly the thing doctor exists to say.
+        if not a.model: raise ValueError(f"no model directory given: {NO_MODEL_HINT}")
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if ram<0: raise ValueError("--ram cannot be negative")
         if vram<0: raise ValueError("--vram cannot be negative")
     except ValueError as error:
-        report={"schema_version":1,"status":"error","model":os.path.abspath(a.model),
+        report={"schema_version":1,"status":"error","model":os.path.abspath(a.model) if a.model else None,
                 "mode":"deep" if a.deep else "standard",
                 "checks":[{"id":"config.arguments","status":"fail","summary":str(error)}],
                 "plan":None}
@@ -750,19 +668,60 @@ def cmd_doctor(a):
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
+def cmd_tune(a):
+    """Measure this exact model/hardware pair and persist the fastest safe path."""
+    need_model(a.model)
+    if a.tokens < 4:
+        sys.exit(f"{C.yel}--tokens must be at least 4{C.r}")
+    if a.timeout < 1:
+        sys.exit(f"{C.yel}--timeout must be positive{C.r}")
+    if not 0.0 <= a.min_gain <= 1.0:
+        sys.exit(f"{C.yel}--min-gain must be between 0 and 1{C.r}")
+    from autotune import run_tune
+    from resource_plan import build_plan
+    try:
+        ram,ctx,devices,vram=resource_request(a,os.environ)
+        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy)
+    except (OSError,ValueError,json.JSONDecodeError) as error:
+        sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
+    a.auto_tier=True
+    a.no_tune_profile=True
+    base_env=env_for(a)
+    prompt=f"[gMASK]<sop><|user|>{a.prompt}<|assistant|><think></think>"
+    banner("tune · measured execution profile")
+    print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+    print("  only quality-preserving scheduling knobs are eligible\n")
+    try:
+        profile,path=run_tune(
+            GLM,a.cap,base_env,plan,a.model,prompt,tokens=a.tokens,
+            repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
+            profile_dir=a.profile_dir,
+            progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
+        )
+    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
+        sys.exit(f"{C.yel}tuning failed:{C.r} {error}")
+    if profile["accepted"]:
+        winner=profile["winner"]
+        baseline=profile["validation"]["baseline"]["tok_s"]
+        print(f"\n  {C.grn}✓ accepted{C.r} {winner['name']}: "
+              f"{baseline:.2f} → {winner['tok_s']:.2f} tok/s "
+              f"(+{100*profile['gain']:.1f}%)")
+        print(f"  env: {' '.join(f'{key}={value}' for key,value in winner['env'].items())}")
+    else:
+        print(f"\n  {C.grn}✓ baseline retained{C.r}: no candidate cleared the "
+              f"{100*a.min_gain:.1f}% gain and safety gates")
+    print(f"  profile: {path}\n")
+
 def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
-    eng=engine_for(a.model)
-    banner("run", a.model)
-    e=env_for(a)
-    if eng==HY3:
-        e["PROMPT"]=prompt
-        e["CHAT_TEMPLATE"]="0"
-    else:
-        tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
-        e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
-    sys.exit(subprocess.call([eng, *engine_argv(a.model, a.cap)], env=e))
+    banner("run")
+    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
+    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
+    # <think> open so the engine emits its reasoning block; the default stays nothink.
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
+    sys.exit(subprocess.call([GLM, str(a.cap if a.cap is not None else 0)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
     """Is a coli serve alive at `base`? Returns its model_id, or None.
@@ -889,12 +848,45 @@ def cmd_chat(a):
             chat_attached(a, base, mid); return
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
+    arch=model_arch(a.model)
+    if arch!="glm":
+        engine=engine_for(a.model)
+        need_model(a.model,engine)
+        model_id = {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
+                    "hy3": "hy3-colibri"}.get(arch, "glm-5.2-colibri")
+        banner(f"chat · {model_id} · local server", a.model)
+        import openai_server
+        # --cap rides along so an explicit `coli chat --cap N` reaches the
+        # engine (it was silently eaten for years -- disclosed behavior
+        # change); absent stays absent, and openai_server translates the
+        # missing flag per model arch (cap_for_arch, #379: non-glm gets the
+        # legacy 8, an explicit value -- 0 included -- passes verbatim).
+        cmd=[sys.executable,openai_server.__file__,"--model",a.model,
+             "--engine",engine,"--arch",arch,"--model-id",model_id,
+             "--host","127.0.0.1","--port","8000","--max-tokens",str(a.ngen)]
+        if a.cap is not None: cmd+=["--cap",str(a.cap)]
+        if a.api_key: cmd+=["--api-key",a.api_key]
+        p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+        try:
+            sp=Spinner(f"loading {model_id}…"); sp.start()
+            for _ in range(1800):
+                if p.poll() is not None:
+                    sp.stop(); sys.exit(f"{model_id} server exited while loading")
+                if server_probe("http://127.0.0.1:8000",a.api_key,timeout=1.0):
+                    sp.stop()
+                    chat_attached(a,"http://127.0.0.1:8000",model_id)
+                    return
+                time.sleep(1)
+            sp.stop(); sys.exit(f"timed out loading {model_id}")
+        finally:
+            if p.poll() is None:
+                p.terminate()
+                try: p.wait(timeout=10)
+                except subprocess.TimeoutExpired: p.kill()
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}", a.model)
-    eng=engine_for(a.model)
-    verbose=verbose_chat(a)
+    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
     kv_resume_notice(a.model)
-    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False) if not verbose else None
+    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
@@ -905,42 +897,40 @@ def cmd_chat(a):
     # once the READY sentinel arrives, so the status-line display below works
     # exactly as before. (Do NOT add a concurrent stderr drain thread: on
     # Windows, reading two child pipes simultaneously deadlocks CPython's IO.)
-    p=subprocess.Popen([eng, *engine_argv(a.model, a.cap)], env=e, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE if not verbose else sys.stderr,
-                       bufsize=0)
-    sp=Spinner(f"waking the giant ({engine_label(a.model)})…"); sp.start()
+    p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    sp=Spinner("waking the giant (744B)…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        if not verbose:
-            try: errlog.write(p.stderr.read().decode("utf-8","replace"))
-            except (OSError, ValueError): pass
-            errlog.seek(0); print(errlog.read()[-1500:])
-        engine_diag(p, errlog)
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
+        errlog.flush(); errlog.seek(0); print(errlog.read()[-1500:])
+        engine_diag(p)        # perche' e' morto (OOM-kill compreso); errlog e' gia' stampato sopra
         sys.exit("the engine exited while loading")
     p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
                           # left unread it leaks into the first answer's text
-    if not verbose:
-        # READY received. Drain the child's stderr into errlog without blocking:
-        # the engine is still alive (blocked on stdin), so a plain read() would
-        # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
-        # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
-        _drain_box={"done":False}
-        def _drain():
-            try: errlog.write(p.stderr.read().decode("utf-8","replace"))
-            except (OSError, ValueError): pass
-            _drain_box["done"]=True
-        threading.Thread(target=_drain, daemon=True).start()
-        for _ in range(20):           # up to ~1s for the load-status lines
-            if _drain_box["done"]: break
-            time.sleep(0.05)
-        errlog.flush()
+    # READY received. Drain the child's stderr into errlog without blocking:
+    # the engine is still alive (blocked on stdin), so a plain read() would
+    # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
+    # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
+    _drain_box={"done":False}
+    def _drain():
+        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        except (OSError, ValueError): pass
+        _drain_box["done"]=True
+    threading.Thread(target=_drain, daemon=True).start()
+    _drain_box["th"]=threading.current_thread()
+    for _ in range(20):           # up to ~1s for the load-status lines
+        if _drain_box["done"]: break
+        time.sleep(0.05)
+    errlog.flush()
     try:
-        elog=open(errlog.name).read() if not verbose else ""
+        elog=open(errlog.name).read()
         mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
         if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[CUDA]","[ROCm]","[MTP]","[USAGE]","[DSA]","[KV]")):
+            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
@@ -985,9 +975,7 @@ def cmd_chat(a):
             print(f"\n  {C.teal}◆ colibri{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
-            def prefill_tick(path=None if verbose else errlog.name):
-                if not path:
-                    return ""
+            def prefill_tick(path=errlog.name):
                 try:
                     with open(path) as f:
                         f.seek(max(0, os.path.getsize(path)-1500)); tail=f.read()
@@ -1009,17 +997,10 @@ def cmd_chat(a):
             st=stream_turn(p, END, echo)
             if not raw: md.close()
             sp2.stop()
-            if st is None:
-                if not verbose:
-                    tail_errlog(errlog.name)
-                engine_diag(p, errlog)
-                print(f"\n  {C.yel}[engine terminated]{C.r}"); break
+            if st is None: engine_diag(p, errlog); break
             el=time.time()-t0
             if st.get("tok"):
-                rate=f"{st['tps']:.2f} tok/s"
-                if st.get("decode_tps") is not None:
-                    rate=f"{st['tps']:.2f} tok/s total · {st['decode_tps']:.2f} tok/s decode"
-                print(f"\r  {C.dgray}└─ {st['tok']} tok · {rate} · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
+                print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st.get("interrupted"):
                     print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
                 elif st["tok"]>=a.ngen:
@@ -1033,26 +1014,31 @@ def cmd_chat(a):
     finally:
         try: p.stdin.close(); p.terminate()
         except Exception: pass
-        if errlog:
-            try: os.unlink(errlog.name)
-            except Exception: pass
+        try: os.unlink(errlog.name)
+        except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 
 def cmd_serve(a):
-    need_model(a.model)
-    eng=engine_for(a.model)
-    from openai_server import serve, default_model_id
-    model_id=a.model_id or os.environ.get("COLI_MODEL_ID") or default_model_id(a.model)
+    arch=model_arch(a.model)
+    engine=engine_for(a.model)
+    need_model(a.model,engine)
+    if arch!="glm" and a.kv_slots!=1:
+        sys.exit(f"{arch} currently supports exactly one KV slot")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
+    # EN: pidfile so `coli stop` can shut everything down without manual pkill.
     try:
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
+    import openai_server
+    openai_server.ARCH=arch
+    model_id=a.model_id or {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
+                            "hy3": "hy3-colibri"}.get(arch, "glm-5.2-colibri")
     try:
-        serve(a.model, a.host, a.port, model_id, a.api_key,
-              a.cap,a.ngen,eng,env_for(a),a.cors_origin,
-              a.max_queue,a.queue_timeout,a.kv_slots)
+        openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
+              a.cap,a.ngen,engine,env_for_engine(a,arch),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
@@ -1080,7 +1066,7 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("colibri","glm","exe","olmoe"):
+            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","hy3"):
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
@@ -1129,7 +1115,8 @@ def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    py = python_for_tools()
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
+    py = venv_py if os.path.exists(venv_py) else sys.executable
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
@@ -1156,22 +1143,24 @@ def cmd_bench(a):
 
 def cmd_convert(a):
     banner("convert")
-    py = python_for_tools()
+    if not a.model:
+        sys.exit(f"{C.yel}no output directory given.{C.r}\n"
+                 f"  --model <dir> is where the converted model is written")
+    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
+    py = venv_py if os.path.exists(venv_py) else sys.executable
     is_hy3 = is_hy3_repo(a.repo)
     script = "convert_hy3.py" if is_hy3 else "convert_fp8_to_int4.py"
-    local = os.path.isdir(a.repo) and os.path.exists(os.path.join(a.repo, "config.json"))
-    n_layers = str(model_config(a.repo).get("num_hidden_layers", 80 if is_hy3 else 78)) if local else ("80" if is_hy3 else "78")
     base=[py, os.path.join(TOOLS, script),
-          "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
-          "--n-layers", n_layers]
-    if not is_hy3:
-        base += ["--group-size", str(a.group_size)]
-    if local:
-        base += ["--indir", os.path.abspath(a.repo)]
-    else:
-        base += ["--repo", a.repo]
-    if a.xbits: base+=["--xbits",str(a.xbits)]
-    print(f"  {C.dim}[1/2] model ({script}): {' '.join(base)}{C.r}")
+          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
+          "--group-size", str(a.group_size)]
+    if a.xbits:
+        base += ["--xbits", str(a.xbits)]
+    if is_hy3:
+        n_layers = str(model_config(a.repo).get("num_hidden_layers", 80)) if os.path.isdir(a.repo) else "80"
+        base += ["--n-layers", n_layers]
+        print(f"  {C.dim}Hy3 convert: {' '.join(base)}{C.r}")
+        sys.exit(subprocess.call(base))
+    print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
     if a.no_mtp: sys.exit(0)
@@ -1179,10 +1168,33 @@ def cmd_convert(a):
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
+
+def cmd_mirror(a):
+    if not a.mirror:
+        sys.exit("mirror path required: pass --mirror or set COLI_MODEL_MIRROR")
+    command = [sys.executable, os.path.join(TOOLS, "mirror_plan.py"), a.action,
+               "--model", a.model, "--mirror", a.mirror]
+    source_dirs = list(a.source_dir)
+    configured = os.environ.get("COLI_MODEL_DIRS", "")
+    if configured:
+        source_dirs.extend(part.strip() for part in re.split(r"[;,]", configured)
+                           if part.strip())
+    for directory in source_dirs:
+        command += ["--source-dir", directory]
+    if a.usage:
+        command += ["--usage", a.usage]
+    if a.action != "verify":
+        command += ["--budget-gib", str(a.budget_gib),
+                    "--reserve-gib", str(a.reserve_gib)]
+    return subprocess.call(command)
+
+
 def main():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
+    common.add_argument("--no-tune-profile",action="store_true",
+                        help="ignore a saved measured tuning profile")
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
@@ -1190,30 +1202,43 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
-    common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
+    # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
+    # (8 historically; 1 on Metal+darwin+fast SSD, #379 -- an honest F_NOCACHE probe
+    # measures "fast", cached in <model>/.coli_ssd), while non-glm arches get the
+    # legacy 8 (openai_server.cap_for_arch). An explicit --cap N -- 0 included --
+    # reaches the engine verbatim; see colibri.c's coli_resolve_cap().
+    common.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
+    common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
-    common.add_argument("--verbose", action="store_true",
-                        help="pass engine stderr through (or set COLI_VERBOSE=1)")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
     ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
-    rp=sub.add_parser("rocm-plan",parents=[common])
-    rp.add_argument("--target-mib",type=int,default=512)
-    rp.add_argument("--compute-mib",type=int,default=256)
-    rp.add_argument("--cache-type-k",default="q8_0")
-    rp.add_argument("--cache-type-v",default="q8_0")
-    rp.add_argument("--sequences",type=int,default=1)
-    rp.add_argument("--host",default="127.0.0.1")
-    rp.add_argument("--port",type=int,default=8088)
-    rp.add_argument("--json",action="store_true")
+    pm=sub.add_parser("mirror", parents=[common],
+                      help="plan, stage, or verify a usage-ranked partial model mirror")
+    pm.add_argument("action", choices=("plan", "stage", "verify"))
+    pm.add_argument("--mirror", default=os.environ.get("COLI_MODEL_MIRROR"))
+    pm.add_argument("--source-dir", action="append", default=[])
+    pm.add_argument("--usage")
+    pm.add_argument("--budget-gib", type=float, default=0)
+    pm.add_argument("--reserve-gib", type=float, default=10)
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pd.add_argument("--deep",action="store_true",
                     help="strictly check every tensor layout, model index, and configured mirror")
+    pt=sub.add_parser("tune",parents=[common],
+                      description="measure and save the fastest quality-preserving execution profile",
+                      help="measure and save the fastest quality-preserving execution profile")
+    pt.add_argument("--prompt",default="Explain why fixed-token replay makes a benchmark reproducible.")
+    pt.add_argument("--tokens",type=int,default=16,help="calibration continuation length")
+    pt.add_argument("--repeats",type=int,choices=range(1,6),default=2)
+    pt.add_argument("--timeout",type=int,default=900,help="seconds allowed for each engine run")
+    pt.add_argument("--min-gain",type=float,default=0.03,
+                    help="minimum fractional throughput gain required to accept a candidate")
+    pt.add_argument("--profile-dir",default=None,help=argparse.SUPPRESS)
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
     pc=sub.add_parser("chat", parents=[common])
     pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
@@ -1225,22 +1250,28 @@ def main():
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=None)
+    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    ps.add_argument("--allowed-host",action="append",
+        default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS","").split(",") if h.strip()],
+        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed")
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
-                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
                    ("--cors-origin",dict(action="append",default=None)),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
-                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1"))))):
+                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),
+                   ("--allowed-host",dict(action="append",
+                       default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS","").split(",") if h.strip()],
+                       help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
@@ -1257,7 +1288,8 @@ def main():
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
-    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"rocm-plan":cmd_rocm_plan,"doctor":cmd_doctor,
+    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
+             "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)

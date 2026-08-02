@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Convert OLMoE HuggingFace checkpoint to colibri int4 format.
 
+DEPRECATED: produces the split gate_proj/up_proj/down_proj tensor layout. The
+current engine (olmoe.c) only loads the merged 'merged_weight' format — use
+convert_olmoe_merged.py instead.
+
 Downloads or converts a local OLMoE checkpoint (e.g., allenai/OLMoE-1B-7B-0125-Instruct).
 Dense weights stay as-is (engine reads BF16/F16 → F32 on load).
 Expert weights get row-wise symmetric quantization to --ebits bits (default 4)
@@ -15,6 +19,12 @@ Usage:
 
 import argparse, json, math, os, struct, sys
 from pathlib import Path
+
+sys.exit(
+    "convert_olmoe.py is deprecated: it produces the split gate_proj/up_proj/down_proj\n"
+    "tensor layout, but the current engine (olmoe.c) only loads the merged 'merged_weight'\n"
+    "format. Use convert_olmoe_merged.py instead."
+)
 
 # Windows: force UTF-8 output
 if sys.platform == "win32":

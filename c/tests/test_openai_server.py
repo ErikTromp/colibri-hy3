@@ -14,9 +14,10 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, conversation_cache_slot, generation_options,
-                           parse_tool_calls, read_engine_turn,
-                           render_chat, serve, split_thinking_reply, stop_policy)
+                           _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
+                           generation_options, parse_tool_calls, read_engine_turn,
+                           render_chat, render_chat_kimi, serve,
+                           split_thinking_reply, stop_policy)
 
 
 class FakeEngine:
@@ -77,6 +78,37 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(
             render_chat([{"role": "user", "content": "Hi"}], True, "high"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
+        )
+
+    def test_kimi_payload_preserves_utf8_lengths_and_turns(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        self.assertEqual(
+            prompt,
+            "K3CHAT1\n"
+            "M system 11\nBe precise."
+            "M user 11\n你好\nKimi"
+            "A 0 9\n你好。"
+            "M user 8\nContinue"
+            "G 1\n",
+        )
+
+    def test_kimi_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_kimi([{"role": "user", "content": "Hi"}],
+                             tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_kimi([{"role": "tool", "content": "result"}])
+
+    def test_kimi_preserves_prior_reasoning_channel(self):
+        self.assertEqual(
+            render_chat_kimi([{"role": "assistant", "reasoning_content": "why",
+                               "content": "answer"}], enable_thinking=True),
+            "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
 
     def test_validates_generation_limits(self):
@@ -560,6 +592,84 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
 
 
+class CapSentinelShimTest(unittest.TestCase):
+    # #379 cap-sentinel shim, arch-keyed (#386 r2, F3): an absent cap is
+    # "platform-auto" only for the glm engine (colibri.c coli_resolve_cap);
+    # inkling reads cap <= 0 as "fit the expert LRU to all available RAM"
+    # (inkling.c), so leaking the sentinel to a non-glm arch silently changes
+    # its memory behavior. The key is the MODEL's config.json model_type, not
+    # the engine binary's file name -- COLI_ENGINE users package the glm
+    # engine as glm52/colibri-1.2/glm-metal, and basename keying disabled the
+    # platform default for exactly them (and an inkling binary someone names
+    # `glm` would get the leak back). Engine() is the one funnel every launch
+    # passes through, so the translation is pinned at the argv it emits, over
+    # the full matrix: arch x arbitrary executable name x cap absent/explicit.
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _model(self, model_type):
+        model = Path(self.tmp.name) / f"model-{model_type}"
+        model.mkdir(exist_ok=True)
+        (model / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return str(model)
+
+    def _spawn_argv(self, executable, model, **kwargs):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine(executable, model, **kwargs)
+            engine.close()
+        return popen.call_args[0][0]
+
+    def test_matrix_arch_times_engine_name_times_cap(self):
+        # COLI_ENGINE axis: the executable name carries no information; only
+        # the model arch and the explicitness of cap may matter.
+        executables = ("colibri", "glm", "glm52", "colibri-1.2", "glm-metal",
+                       "/opt/custom/inkling", "kimi_k3.exe")
+        cases = (  # (model_type, cap kwargs, expected argv cap)
+            ("glm_moe_dsa", {}, "0"),          # absent -> glm sentinel
+            ("inkling", {}, "8"),              # absent -> legacy 8
+            ("kimi_k3", {}, "8"),              # absent -> legacy 8
+            ("glm_moe_dsa", {"cap": 5}, "5"),  # explicit -> verbatim
+            ("inkling", {"cap": 5}, "5"),
+            ("kimi_k3", {"cap": 5}, "5"),
+            ("glm_moe_dsa", {"cap": 0}, "0"),  # explicit 0 -> verbatim
+            ("inkling", {"cap": 0}, "0"),      # upstream RAM-auto, by request
+            ("kimi_k3", {"cap": 0}, "0"),
+        )
+        for model_type, kwargs, want in cases:
+            model = self._model(model_type)
+            for executable in executables:
+                self.assertEqual(
+                    self._spawn_argv(executable, model, **kwargs),
+                    [executable, want],
+                    f"arch={model_type} exe={executable} kwargs={kwargs}")
+
+    def test_missing_or_unreadable_config_is_glm(self):
+        # historic default: anything that cannot be classified is glm
+        self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
+                         ["engine", "0"])
+        model = Path(self.tmp.name) / "model-broken"
+        model.mkdir()
+        (model / "config.json").write_text("{not json")
+        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+
+    def test_cap_for_arch_is_the_single_translation_point(self):
+        self.assertEqual(cap_for_arch("glm", None), 0)
+        self.assertEqual(cap_for_arch("inkling", None), 8)
+        self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("glm", 3), 3)
+        self.assertEqual(cap_for_arch("inkling", 3), 3)
+        self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
+        self.assertEqual(cap_for_arch("glm", 0), 0)
+
+    def test_model_arch_reads_model_type(self):
+        self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
+        self.assertEqual(model_arch(self._model("inkling")), "inkling")
+        self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
+        self.assertEqual(model_arch("/nonexistent"), "glm")
+
+
 class HTTPTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -637,6 +747,28 @@ class HTTPTest(unittest.TestCase):
         self.assertIsNotNone(queue_wait)
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
+
+    def test_kimi_chat_completion_uses_multiturn_wire_payload(self):
+        with patch("openai_server.ARCH", "kimi"):
+            with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "你好"},
+                    {"role": "assistant", "content": "你好。"},
+                    {"role": "user", "content": "Continue"},
+                ],
+                "enable_thinking": False,
+            }) as response:
+                body = json.load(response)
+        self.assertEqual(body["choices"][0]["message"]["content"], "Héllo")
+        self.assertEqual(
+            self.engine.calls[-1][0],
+            "K3CHAT1\n"
+            "M user 6\n你好"
+            "M assistant 9\n你好。"
+            "M user 8\nContinue"
+            "G 0\n",
+        )
 
     def test_chat_completion_stops_across_engine_chunks(self):
         before = self.engine.stop_requests

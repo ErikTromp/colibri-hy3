@@ -59,8 +59,8 @@ static int run_gemm(int fmt, int O, int I, int S, const char *name) {
   for(auto&v:x) v=((rand()%2000)-1000)/1000.f;
 
   cpu_ref(fmt, W, Sc, x.data(), yr.data(), S, I, O);
-  int ok1 = coli_metal_gemm(yg.data(),  x.data(), W, Sc, fmt, S, I, O);
-  int ok2 = coli_metal_gemm(yg2.data(), x.data(), W, Sc, fmt, S, I, O);
+  int ok1 = coli_metal_gemm(yg.data(),  x.data(), W, Sc, fmt, S, I, O, 0);  /* gs=0: per-row scales */
+  int ok2 = coli_metal_gemm(yg2.data(), x.data(), W, Sc, fmt, S, I, O, 0);
 
   // GPU vs CPU: max normalized error + first diverging element.
   double maxabs=0, ymax=0; long badidx=-1;

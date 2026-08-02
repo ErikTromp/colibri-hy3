@@ -1,374 +1,513 @@
-# colibrì × Tencent Hy3
+<p align="center">
+  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
+</p>
 
-**Run [Tencent Hy3](https://huggingface.co/tencent/Hy3) (295B MoE, 21B active) on a consumer PC** — pure C, disk-streaming experts. The always-resident dense stack is ~5 GB RAM; the rest streams from disk (and optionally GPU VRAM).
+<p align="center">
+  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
+  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+</p>
 
-This repository is a **Hy3 port** of [colibrì](https://github.com/JustVugg/colibri) (the engine that streams GLM-5.2 from disk). It adds:
+<p align="center">
+  <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
+  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
+</p>
 
-- `c/hy3.c` — Hy3 (`hy_v3`) inference engine (GQA attention, sigmoid MoE router, expert streaming)
-- `c/tools/convert_hy3.py` — FP8/BF16 → Colibri int4 container
-- `coli` integration — chat, serve, convert, plan, doctor
+**Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
+parameters** — on consumer and heterogeneous hardware, in pure C with zero
+engine dependencies, by treating storage, RAM, and VRAM as one inference
+hierarchy.
 
-Upstream GLM support in this tree is unchanged; Hy3 is auto-detected from `config.json` (`model_type: hy_v3`).
+Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
+`coli serve` / `coli web` front end. **Hy3** (Tencent, 295B) is also supported
+as a sibling engine. [Full roster ↓](#other-supported-models)
 
-## Pre-converted weights (Hugging Face)
+> **Colibrì is an inference engine you can run today, and an open research
+> platform.** Its primary goal is to pursue inference-side performance across
+> the entire software/hardware boundary — model formats, memory hierarchy,
+> storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
+> overlap — so large models depend less on scarce hardware and cost less to run.
 
-**https://huggingface.co/UnderstandLing/Hy3-colibri-int4**
+Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
+deliberately a place to test aggressive systems ideas — so there is **no SLA on
+speed, and a hard guarantee on semantics**: experiments must earn their place
+through reproducible end-to-end measurements, and the default policy **never
+silently changes model precision or router semantics**. Insufficient fast memory
+may reduce speed; it must not quietly redefine the model.
 
-~142 GB int4 Colibri container (107 main shards + 6 MTP shards). **Not** GGUF / AWQ / vLLM — only loads in this engine.
+```
+$ ./coli chat
+  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  ✓ ready in 32s · resident 9.9 GB
+  › ciao!
+  ◆ Ciao! 😊 Come posso aiutarti oggi?
+```
+
+## See it running
+
+<p align="center">
+  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
+</p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model at <strong>4 tok/s, TTFT 1.6 s, disk 0</strong> —
+full expert residency on 6× RTX 5090, with live token metrics, the per-turn time breakdown,
+the VRAM/RAM/disk tier bar and the live mini-brain in the corner.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
+</p>
+<p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
+brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
+<a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-atlas.png" width="900" alt="the Atlas page — the measured expert atlas as a 3-D galaxy">
+</p>
+<p align="center"><em>The <strong>Atlas</strong> page: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a>
+as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
+(poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
+
+## The research mission
+
+Frontier inference should not require datacenter-class hardware by default.
+Colibrì's research target is simple: **reduce the hardware dependency and total
+cost of inference by optimizing every part of the inference path that evidence
+shows is limiting it**.
+
+That includes changing how weights are represented and moved, deciding what
+lives in VRAM, RAM, or storage, overlapping heterogeneous compute, reducing
+launch and synchronization overhead, exploiting sparsity and reuse, and testing
+new decoding algorithms. Nothing is protected merely because it is conventional;
+nothing is adopted merely because a microbenchmark looks fast. The deciding
+result is end-to-end inference on real machines, with correctness and quality
+measured alongside throughput, latency, memory, and cost.
+
+The practical consequence is accessibility: run a 744B-parameter model on
+hardware you already own, watch every expert fire in real time, and change the
+code that does it. Not renting intelligence behind an API — *holding* it:
+probing it, measuring it, improving it. The engine is deliberately small enough
+that the next useful optimization can come from anyone willing to measure it.
+
+## Core techniques and measured findings
+
+- **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
+  tiers for the same weights; limited fast memory changes speed, not model semantics.
+- **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
+  pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
+  It wins on repeatable workloads; history can overfit, and lookahead can lose on
+  some hosts, so both remain measurable policies rather than promises.
+- **I/O is part of the engine.** Batched expert unions, overlapped reads and
+  compute, `O_DIRECT`, and weighted dual-SSD striping attack the streaming path
+  rather than pretending storage latency is free. `O_DIRECT` is drive-dependent,
+  and dual-SSD still needs broader end-to-end community A/Bs.
+- **Heterogeneous execution.** CPU, CUDA, Metal, NUMA memory, and partial or full
+  expert residency share one runtime and can be combined according to the machine;
+  the profitable combination depends on compute, bandwidth, residency, and workload.
+- **Compressed state without a different model.** Token-exact forward validation,
+  57× smaller MLA KV state, persistent warm conversations, and faithful DSA keep
+  optimization tied to correctness. These are memory, latency, and correctness
+  properties — not a blanket throughput claim.
+- **Speculation that must earn its keep.** Native MTP and grammar-forced drafts
+  are measured end to end and can be disabled when acceptance does not repay verification.
+
+## Open hypotheses, experiments, and how to help
+
+Colibrì treats an optimization as a hypothesis until a controlled end-to-end A/B
+shows otherwise. These are the main questions now:
+
+| hypothesis | evidence so far | experiment still needed |
+|---|---|---|
+| Routing history can place experts better than plain LRU | learned pins improve repeated workloads, but can overfit a prompt | held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
+| Multiple SSDs can turn independent bandwidth into decode speed | weighted mirror/split routing is implemented and validated; the bandwidth model is sound | cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
+| A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
+| Lossless or quality-bounded representations can reduce weight movement enough to matter | format and quantization ablations exist, with correctness/quality gates | reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
+| Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
+| CPU/GPU overlap can hide transfer and synchronization rather than merely move the bottleneck | CUDA and Metal wins exist, but fast CPUs and low residency can erase them | per-stage profiles and one-variable A/Bs across PCIe, unified-memory, and full-resident machines |
+
+Want to help? Pick one row and publish the negative results too. Record the
+hardware, commit, model/container, exact command, prompt, cache state, throughput,
+TTFT, expert hit rate, bytes read, and quality check; change one variable, repeat
+the run, and attach raw logs. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md), compare against
+[the benchmark protocol](docs/benchmarks.md), then
+[open an experiment issue](https://github.com/JustVugg/colibri/issues/new).
+A well-controlled failure is more valuable here than an unexplained fast number.
+
+## The idea
+
+A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
+only ~11 GB of those change from token to token (the routed experts):
+
+<p align="center">
+  <img src="docs/media/sparse.png" width="880" alt="only ~5.4% of parameters are active per token">
+</p>
+
+So the model doesn't need to *fit* in fast memory — it needs to be **placed**:
+
+- the **dense part** (attention, shared experts, embeddings — ~17B params) stays
+  **resident in RAM at int4** (~9.9 GB);
+- the **19,456 routed experts** (75 MoE layers × 256 + the MTP head, ~19 MB each
+  at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a
+  per-layer LRU cache, a learned pinned hot-store, and an optional VRAM tier.
+
+Think of the core algorithm as **a JIT, but for weights**. A compiler JIT never
+compiles the whole program — it watches what actually runs and compiles the hot
+paths, just in time. colibrì makes the same bet about a 744B parameter space:
+parameters are not resident state to be held, they are **data to be staged**
+across a heterogeneous storage hierarchy (VRAM / RAM / NVMe), exactly when the
+router proves they are needed. Measured routing heat decides which experts earn
+which tier, the router runs a layer ahead so prefetch hides the staging latency,
+and — like a JIT — the engine learns your workload: the more you run, the hotter
+the right experts get. It works because routing has measurable structure (see
+the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
+structure is cacheable.
+
+The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
+at runtime, no GPU required.
+
+## How it works
+
+### The per-token path
+
+<p align="center">
+  <img src="docs/media/token-path.png" width="880" alt="route → union → place → overlap → learn">
+</p>
+
+Every layer of every token walks the same five steps. The design goal is that
+**placement only ever decides speed** — the router's decisions and the weights'
+precision are the same whether an expert answered from VRAM or from disk.
+
+### One memory hierarchy instead of one memory requirement
+
+<p align="center">
+  <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe three-tier expert residency">
+</p>
+
+### Dual-SSD: two copies of the model, twice the read bandwidth
+
+Decode is disk-bound on most machines, and expert reads are read-only — so if you have a **second SSD**, put a full copy of the model on it and let the engine stream from both drives at once:
 
 ```bash
-hf download UnderstandLing/Hy3-colibri-int4 --local-dir /path/to/hy3_i4
+COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
+COLI_DISK_WEIGHTS=9,3 ...   # optional: primary,mirror bandwidth ratio (else measured at startup)
 ```
 
-## Quick start
+Each expert is routed to one drive by a deterministic hash, weighted by the two drives' measured (or declared) bandwidth, so readahead/PILOT prefetch and the demand read always hit the same drive and nothing is cached twice. The aggregate bandwidth is the sum of both drives — a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive alone, and the OMP-parallel pin/warmup load streams from both. Details worth knowing:
+
+- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files silently stay on the primary, so a **partial mirror is fine** — a smaller second SSD holding only some shards still helps;
+- the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay on the primary;
+- a read error on the mirror falls back to the primary (one warning, no crash), so unplugging the second drive mid-run degrades instead of killing the server;
+- routing never changes tokens — both copies are byte-identical, and the per-run `MIRROR:` stats line shows GB served per drive.
+
+The same engine spans the whole range: on a 25 GB laptop everything streams from
+disk (slow but correct); on a large host the entire expert set becomes resident
+(`CUDA_EXPERT_GB=auto PIN_GB=all`) and disk drops out of the decode path
+entirely. Between the tiers sits a **learning cache**: the engine records which
+experts *your* workload routes to (`.coli_usage`, updated every turn) and pins
+the hottest ones automatically — colibrì literally gets faster the more you use
+it. On multi-socket hosts, `COLI_NUMA=1` interleaves the resident weights across
+memory controllers ([#82](https://github.com/JustVugg/colibri/issues/82)).
+
+For a second drive that cannot hold the whole model, Colibri can rank a partial
+mirror from the expert history it already learns. Run a few representative
+prompts first so `.coli_usage` reflects the workload, then plan, stage, and
+verify the mirror:
 
 ```bash
-cd c
-./setup.sh          # build hy3 + run hy3_tiny oracle self-test (32/32)
-
-# download or convert model (see below), then:
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14
+./c/coli mirror plan  --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror stage --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror verify --model /fast/glm52_i4 --mirror /second/glm52_i4
 ```
 
-First reply on a **cold cache** is slow (minutes). Stay in the same session for faster follow-ups. Use `--verbose` to see engine stderr.
+The planner reads safetensors headers directly, follows split-model directories
+from `COLI_MODEL_DIRS`, and prioritizes shards that can serve the hottest routed
+experts. Staging never changes the primary model: it copies through temporary
+files, preserves the requested free-space reserve, verifies every shard with
+SHA-256, never deletes an existing mirror shard, and atomically publishes a
+receipt only after the selected mirror is ready.
 
-## Memory profiles
+### Never wait for the disk twice
 
-Hy3 does **not** load 295B parameters into RAM. Only the dense “active” stack (~5 GB) stays resident; MoE experts live on disk and are fetched per token. More RAM/VRAM = larger hot caches = fewer disk reads = faster — not a hard requirement.
+Misses are expensive, so the engine spends most of its cleverness avoiding and
+overlapping them: each expert's three matrices are stored adjacent and read in
+one `pread`; a bounded async I/O pool (`PIPE=1`, default) loads missing experts
+while resident ones compute; batched positions read each unique expert once
+(**batch-union**); and a router-lookahead thread (`PILOT=1`) prefetches the next
+layer's experts — routing is measurably **71.6% predictable one layer ahead**.
+On GPUs, the resident pipeline (`COLI_CUDA_PIPE=2`) keeps the residual stream
+on-device across layers so the CPU expert loop runs uninterrupted; on Apple
+Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
+math on the unified-memory GPU; and a [Vulkan backend](docs/vulkan.md) brings
+the expert tier, dense projections, and the MLA attention core to any GPU with
+a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (the only backend for
+cards the vendor stacks no longer support, like the RX 580, and competitive
+with ROCm on RDNA4 — see [the benchmarking notes](docs/vulkan.md)).
 
-### Lean — 16 GB system RAM + ~16 GB VRAM GPU (recommended demo)
+> **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
+> often a large win on drives with DRAM cache and bandwidth headroom (+34%
+> decode measured with `PIPE=1` on a Blackwell/Windows box; 4.25→9.69 GB/s in
+> iobench on a GB10) — but it is drive-dependent: QLC/DRAM-less or virtualised
+> disks can be neutral to negative. Try it first; keep what your hardware
+> rewards.
 
-Proves the point: a laptop-class machine runs a 295B MoE without 64 GB of system memory.
+### Faithful model, compressed state
+
+The forward pass is validated against a `transformers` oracle (teacher-forcing
+typically 30-32/32; two tiny-oracle positions are floating-point near-ties and
+toolchain-dependent). MLA attention stores a compressed KV state — 576
+floats/token instead of 32,768 (**57× smaller**) — and persists it across
+restarts (`.coli_kv`): conversations reopen warm with zero re-prefill,
+byte-identical to an uninterrupted session. DSA sparse attention (GLM-5.2's
+lightning indexer) is implemented faithfully and validated by forcing full-key
+selection to reproduce dense attention exactly.
+
+### Speculative decoding, honestly
+
+GLM-5.2's native MTP head drafts tokens that the main model verifies in one
+batched forward — 2.2–2.8 tokens/forward when it pays. Two hard-won rules ship
+as defaults: the MTP head must be **int8** (int4 heads collapse to 0–4%
+acceptance, [#8](https://github.com/JustVugg/colibri/issues/8)), and draft and
+verify must compute **the same function** — `SPEC_PIN=1` pins both to one
+kernel family ([#163](https://github.com/JustVugg/colibri/issues/163) is the
+full forensic story). Grammar-forced drafts
+([`GRAMMAR=file.gbnf`](docs/grammar-draft.md)) add ~free acceptance on
+constrained JSON output. Whether speculation is a net win depends on your
+cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
+
+## What it achieves
+
+<p align="center">
+  <img src="docs/media/ladder.png" width="880" alt="measured decode speed by hardware class">
+</p>
+
+Same engine, same int4 container — the hardware only changes where the experts
+live. Highlights from the [full benchmark tables](docs/benchmarks.md):
+
+- **6× RTX 5090, full residency:** 5.8–6.8 tok/s decode, TTFT ~13 s
+  ([experiment log](docs/experiments/glm52-6x5090-2026-07-12.md));
+- **128 GB CPU-only desktop:** ~1.8 tok/s warm ([#200](https://github.com/JustVugg/colibri/issues/200));
+- **single RTX 5070 Ti laptop-class box:** 1.07 tok/s via the GPU-resident
+  pipeline ([#273](https://github.com/JustVugg/colibri/issues/273));
+- **25 GB dev box:** 0.05–0.1 tok/s cold — the proven floor where this project
+  started, and still the honest baseline.
+
+Quality is measured, not assumed: the int4 container's quantization cost and the
+scale-granularity/rotation ablations live in
+[docs/benchmarks.md](docs/benchmarks.md#quality-benchmark) and
+[#108](https://github.com/JustVugg/colibri/issues/108)/[#81](https://github.com/JustVugg/colibri/issues/81).
+
+## Get started
+
+You need two things: **the program** (a few hundred KB) and **the model**
+(372 GB). Step-by-step for every platform in the
+[Quick Start guide](docs/quickstart.md).
+
+### 1. Get colibri
+
+**Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
+Take the archive for your platform from
+[Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
 
 ```bash
-cd c && make hy3 CUDA=1
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14 --auto-tier
+mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+python3 coli info                         # engine ready ✓
 ```
 
-Typical footprint with this budget:
+Inside you get the engine (`colibri`, `colibri.exe` on Windows), the `coli`
+launcher and its Python helpers. Nothing to rename or configure — `coli` finds
+the engine next to itself. You only need
+[Python 3](https://www.python.org/downloads/) installed: the launcher and the
+API gateway are Python scripts, while the engine itself is pure C with zero
+dependencies.
 
-| Tier | What | Size |
-|------|------|------|
-| **RAM (always)** | Dense weights (embed, attn, norms, lm_head, 1 dense layer) | **~5 GB** |
-| **RAM (runtime)** | KV cache + attention scratch (grows with `--ctx`) | **~2–3 GB** at 4k context |
-| **RAM (pin)** | Hot experts in RAM backing store (autopin from `.coli_usage`) | **~1–3 GB** (budget-limited) |
-| **VRAM (optional)** | Same hot experts uploaded for GPU matmul | up to `--vram` |
-| **Disk** | Full int4 container | **~142 GB** on NVMe |
-
-At startup you should see something like:
-
-```
-[CUDA] mode: routed experts only (resident dense on CPU)
-[PIN] hot store: N experts in RAM (… GB)
-[CUDA] hot expert tier: N experts, VRAM … GB
-[RAM_GB=12.0] cap=…/layer (peak ~12–14 GB)
-```
-
-Use `coli plan` and `coli doctor` before a long run:
+**Or build from source** — needs `gcc` (or clang) with OpenMP:
 
 ```bash
-COLI_MODEL=/path/to/hy3_i4 ./coli plan --ram 12 --gpu 0 --vram 14
-COLI_MODEL=/path/to/hy3_i4 ./coli doctor --ram 12 --gpu 0 --vram 14
+git clone https://github.com/JustVugg/colibri && cd colibri/c
+./setup.sh                                # checks gcc/OpenMP, builds, self-tests
 ```
 
-### Comfortable — 32–62 GB system RAM (faster, less disk)
+Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
+engine still lives in `c/` — an editable install from the clone, not a wheel).
+
+### 2. Get the model
+
+A pre-converted **GLM-5.2 int4** container is on Hugging Face — use the
+**group-scaled (gs64)** build with the **int8 MTP head**. It is about **372 GB**,
+so put it on a disk with the room, ideally a fast one:
+
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+> ⚠️ Use the **gs64** container above, not the older per-row int4 mirrors
+> (`mateogrgic/…`, `jlnsrk/…`): those measure ~9pp worse on quality and are the
+> root cause of the original think-mode loops and never-terminating generations
+> in [#455](https://github.com/JustVugg/colibri/issues/455). The gs64 container
+> fixed those controlled per-row A/Bs, but it is not a general repetition or
+> EOS-starvation guard. The MTP head must also be **int8, not int4**
+> (int4 → 0% draft acceptance, [#8](https://github.com/JustVugg/colibri/issues/8)):
+> `ls -l <model>/out-mtp-*` — int8 (correct) is `3527131672 / 5366238584 / 1065950496`.
+
+Or convert from the FP8 source yourself — one resumable command that never needs
+the full 756 GB on disk at once:
 
 ```bash
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 56 --gpu 0 --vram 16 --auto-tier --temp 0.7
+./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
 ```
 
-- **`--ram 56`** — large expert LRU (51+ slots/layer vs a handful on lean)
-- Autopin can keep **hundreds** of frequent experts in RAM/VRAM (e.g. ~6 GB hot tier)
-- Still only ~5 GB dense resident — the extra RAM is **cache**, not “loading the full model”
+#### Other supported models
 
-### CPU-only (no GPU)
+GLM-5.2 is the reference model, but the same streaming approach runs three more
+families. Each is a **sibling engine** — one C file, its own architecture, the same
+`coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
+the model's `config.json`):
+
+| Family | Total / active | Weights | Build | Docs |
+|---|---|---|---|---|
+| **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
+| **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
+| **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
+| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+| **Hy3** (Tencent) | 295B / 21B | [UnderstandLing/Hy3-colibri-int4](https://huggingface.co/UnderstandLing/Hy3-colibri-int4) (~142 GB) | `make -C c hy3` | [hy3.md](docs/hy3.md) |
+
+Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
+the original Hugging Face shards, and the bf16 dense set is quantized at load time.
+Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a host
+that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
+the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
+trade-off written down.
+
+### 3. Run it
 
 ```bash
-make hy3    # no CUDA
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12
+COLI_MODEL=/nvme/glm52_i4 ./coli chat     # RAM budget, cache and MTP auto-detected
+COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk placement
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
+COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
+./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
+./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
 ```
 
-Works on 16 GB RAM; experts matmul on CPU. Slower decode, same memory story.
+On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
+The engine at runtime is pure C — python is only used by the one-time converter
+and the optional API gateway.
 
-## Tuning knobs
+#### The same commands run any of the models
 
-| Flag / env | Effect |
-|------------|--------|
-| **`--ram N`** | Engine memory budget (GB). Caps LRU slots/layer and autopin size. On a 16 GB machine use **12–14** (leave headroom for the OS). |
-| **`--gpu 0`** / **`COLI_GPU`** | Enable CUDA on device 0. Requires `make hy3 CUDA=1`. |
-| **`--vram N`** / **`CUDA_EXPERT_GB`** | VRAM budget for hot pinned experts. Try **12–14** on a 16 GB GPU. |
-| **`--auto-tier`** | Runs `coli plan` and applies RAM/VRAM/device env vars automatically. |
-| **`--ctx N`** | Max context (default 4096). Lower (e.g. 2048) saves KV RAM on tight machines. |
-| **`AUTOPIN=0`** | Disable learning-based RAM pin (debug only; usually keep on). |
-| **`PIN_GB=N`** | Cap manual/autopin hot store size in GB. |
-| **`REPIN=N`** | Live swap of cold VRAM/RAM pins every N emitted tokens. |
-| **`CUDA_DENSE=1`** | Upload resident dense tensors to GPU (small win on Hy3: 1 dense layer). |
-| **`CUDA_ATTN=1`** | Run GQA attention on GPU during decode (float KV only; incompatible with `KV_I8=1`). |
-| **`DIRECT=1`** | `O_DIRECT` disk reads on NVMe. |
-| **`PIPE=1`** | Async expert prefetch via thread pool (helps when cache is small). |
-| **`PIPE=2`** | io_uring expert reads (needs `make hy3 IOURING=1`; falls back to `PIPE=1`). |
-| **`KV_I8=1`** | int8 KV cache (~4× smaller KV RAM; float in-flight row for current position). |
-| **`PERF=1`** | Every 100 emitted tokens, print `[perf] attn=…% disk=…% expert_mm=…% head=…%` on stderr. |
-| **`TREE_DRAFT=1`** | Tree MTP speculative decode (needs `out-mtp-*.safetensors`; default linear draft otherwise). |
-| **`--verbose`** | Show `[CUDA]` / `[PIN]` / `[RAM_GB]` engine lines in the terminal. |
-
-**Trade-offs on 16 GB RAM:** smaller `--ram` → fewer LRU slots and fewer pinned experts → more disk reads per token → slower, but peak RSS stays near **~10–14 GB** instead of 50+ GB. Pair with GPU VRAM so the experts you *do* pin run matmul on the card during **decode** (not during prefill layer progress).
-
-Model path on **native ext4** (WSL: use `/home/...`, not `/mnt/c`).
-
-## Tiny oracle fixtures
-
-These are **not** the full Hy3 model (~142 GB). They are a 5-layer random `hy_v3` checkpoint (~3 MB) used to validate `hy3.c` and `convert_hy3.py` without downloading Tencent weights.
-
-| Path | In git? | Purpose |
-|------|---------|---------|
-| `c/hy3_tiny/` | **yes** | fp32 teacher-forcing oracle — `setup.sh` and CI expect **32/32** |
-| `c/ref_hy3.json` | **yes** | expected prompt/full token IDs and TF logits from the HF reference run |
-| `c/hy3_tiny_i4/` | **no** | int4 Colibri container derived from `hy3_tiny`; tests the converter + int4 load path |
-
-`hy3_tiny_i4` is intentionally **not** committed (regenerable in seconds). Add `c/hy3_tiny_i4/` to your local `.gitignore` if you like.
-
-### Regenerate `hy3_tiny` (+ `ref_hy3.json`)
-
-Run from `c/` if the fixture is missing or you need to refresh the oracle:
+`coli` reads the model's `config.json`, picks the matching engine binary, and
+renders that family's chat template — so **nothing about the command line
+changes between models**. Build the engine you want once, then just point
+`COLI_MODEL` at the right directory:
 
 ```bash
-cd c
-pip install 'transformers>=5.6.0' torch safetensors
-python3 tools/make_hy3_oracle.py   # writes hy3_tiny/ and ref_hy3.json
-make hy3
-SNAP=./hy3_tiny TF=1 ./hy3 64 16 16    # expect 32/32 positions
+make -C c glm                                     # GLM-5.2
+make -C c inkling                                 # Inkling
+make -C c kimi_k3                                 # Kimi K3
+make -C c hy3                                     # Hy3
+
+COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
+COLI_MODEL=/nvme/inkling_i4    ./coli chat
+COLI_MODEL=/nvme/kimi_k3       ./coli chat
+COLI_MODEL=/nvme/hy3_i4        ./coli chat
+
+./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/kimi_k3
+./coli serve --model /nvme/inkling_i4             # API only
 ```
 
-Greedy generate (no teacher forcing):
+For the non-GLM engines `coli chat` starts the gateway locally and attaches the
+TUI to it, so the TUI, the API and the dashboard all go through the same
+arch-aware chat template — you never have to pass the template yourself.
 
-```bash
-SNAP=./hy3_tiny ./hy3 64 16 16         # expect 20/20 new tokens vs ref_hy3.json
+Two things that differ per model, both documented in the per-model page:
+
+- **Inkling on a RAM-tight host** needs the int4 dense container and a small
+  expert cache: `./coli chat --model /nvme/inkling_i4 --cap 2`
+  (see [inkling.md](docs/inkling.md) — the default `--cap 8` wants ~14 GB of
+  cache on top of the resident set).
+- **Kimi K3** streams its MXFP4 experts from the original checkpoint, so there
+  is nothing to convert — but the snapshot is ~1.6 TB
+  (see [kimi_k3.md](docs/kimi_k3.md)).
+
+### 4. Go deeper
+
+| topic | doc |
+|---|---|
+| Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
+| Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
+| Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
+| CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
+| Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
+| Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
+| OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
+| Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
+| Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+
+## What's next
+
+- **Inference-systems research is the product.** The current hierarchy is LRU +
+  a learned pin set; active work spans model formats, compression, placement,
+  scheduling, I/O, CPU/GPU kernels, heterogeneous overlap, KV state, and
+  routing-aware speculation. The objective is lower hardware requirements and
+  lower cost per useful token. Everything lands the way this project works:
+  measured end to end, reviewed, and developed in the open.
+- **More open models.** The tiering algorithm is model-agnostic: any MoE with
+  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
+  support for more open-weight families — **Kimi K2** (Moonshot AI),
+  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+
+## Supporting the project
+
+colibrì started as a one-person project on a 12-core laptop with 25 GB of RAM;
+today its numbers come from a community of real machines. If it's useful to you:
+
+- ⭐ star the repo and share it;
+- 🐛 open issues with benchmark numbers from your hardware — datapoints move
+  this project more than anything else;
+- 💬 join the [Discord community](https://discord.gg/fpQxKnRb) to discuss
+  experiments, hardware results, and research directions;
+- 💬 reach out via GitHub issues to sponsor development or donate hardware.
+
+## Repo layout
+
+```
+Makefile                  root build/check entry point
+c/
+├── glm.c                 single-file GLM engine
+├── st.h, tok.h, json.h   runtime headers
+├── backend_cuda.*        optional CUDA tier
+├── Makefile              build and local checks
+├── coli                  user-facing CLI
+├── openai_server.py      OpenAI-compatible HTTP gateway
+├── setup.sh              one-command local setup
+├── tools/                offline conversion, fixtures and benchmarks
+├── scripts/              long-running conversion helpers
+└── tests/                dependency-free C and Python tests
+web/                      browser UI (pure OpenAI-API client)
+desktop/                  Tauri v2 desktop shell wrapping the web UI
+docs/                     reference docs, experiments, media
 ```
 
-Use **`64 16 16`** on fp32 `hy3_tiny`. Running `./hy3 64 4 4` quantizes fp32 weights on load and **breaks** the oracle.
+The runtime path intentionally stays flat and readable: `glm.c` plus its small
+headers. From the repository root, `make`, `make check`, and `make clean`
+delegate to the engine Makefile.
 
-### Regenerate `hy3_tiny_i4` (local only)
+## Why "colibrì"
 
-After `hy3_tiny` exists:
+The hummingbird weighs a few grams, hovers in place, and visits a thousand
+flowers a day. This engine keeps a 744-billion-parameter giant alive on
+hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of disk patience.
 
-```bash
-cd c
-./coli convert --repo ./hy3_tiny --model ./hy3_tiny_i4
-# or: python3 tools/convert_hy3.py --indir hy3_tiny --outdir hy3_tiny_i4 --ebits 4
+## Acknowledgements
 
-SNAP=./hy3_tiny_i4 TF=1 ./hy3 64 4 8    # expect 32/32 positions
-```
+colibrì is an engine; the minds it runs are a gift. Thank you to the teams
+releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
+(Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
+contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
+This project is proof of what open weights make possible.
 
-Use **`64 4 8`** for the int4 tiny fixture (4-bit weights, 8-bit scales).
+## License
 
-## Convert Hy3 yourself
-
-From Hugging Face FP8 (resumable, never needs full checkpoint on disk):
-
-```bash
-pip install torch safetensors huggingface_hub numpy
-./coli convert --repo tencent/Hy3-FP8 --model /path/to/hy3_i4
-```
-
-To smoke-test conversion on the tiny fixture before a full Hy3 run, see [Tiny oracle fixtures](#tiny-oracle-fixtures) (`hy3_tiny` → `hy3_tiny_i4`).
-
-## Requirements
-
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| **RAM** | **16 GB** (dense ~5 GB + small cache; lean profile) | **32–62 GB** for large LRU / many pinned experts |
-| **VRAM** | none (CPU path) | **8–16 GB** NVIDIA GPU + `make hy3 CUDA=1` |
-| **Disk** | ~150 GB model + fast NVMe | ext4, not WSL 9p `/mnt/c` |
-| **CPU** | gcc, OpenMP, **AVX2** | more cores help CPU matmul when cache is cold |
-
-Check your machine:
-
-```bash
-# lean laptop profile
-COLI_MODEL=/path/to/hy3_i4 ./coli plan --ram 12 --gpu 0 --vram 14
-COLI_MODEL=/path/to/hy3_i4 ./coli doctor --ram 12 --gpu 0 --vram 14
-
-# comfortable desktop profile
-COLI_MODEL=/path/to/hy3_i4 ./coli plan --ram 56 --gpu 0 --vram 16
-COLI_MODEL=/path/to/hy3_i4 ./coli doctor --ram 56
-```
-
-**What actually sits in RAM:** ~**5 GB** dense weights (the always-active parameters) + KV/runtime (~2–3 GB at 4k ctx) + optional expert cache/pin (the rest of your `--ram` budget). The 295B MoE weights stay on **disk** unless cached.
-
-## Performance (honest)
-
-Hy3 cold decode reads **~5–6 GB of experts per token** from disk (79 MoE layers × 8 experts). Expect:
-
-| Phase | Lean (16 GB RAM + GPU) | Comfortable (56 GB RAM + GPU) |
-|-------|------------------------|-------------------------------|
-| First prompt (cold) | ~0.05–0.15 tok/s | ~0.05–0.15 tok/s |
-| Warm cache | ~0.1–0.3 tok/s | ~0.2–0.5 tok/s |
-| Same chat session, turn 2+ | faster as `.coli_usage` + LRU warm up | often several× faster |
-
-Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to the card; autopin/PIN from `.coli_usage`; `DIRECT=1` on NVMe; `PIPE=1` or `PIPE=2` (io_uring); optional `CUDA_ATTN=1`, `KV_I8=1`, `PERF=1`.
-
-**Throughput numbers:** mid-stream `[t=N] … tok/s` and the chat footer’s **decode** rate measure generation only (from first emitted token). The footer’s **total** rate includes prefill for that turn (full prompt on turn 1, incremental new tokens on follow-ups). Example: `└─ 38 tok · 0.10 tok/s total · 0.24 tok/s decode · …`.
-
-### ROCm / AMD GPU (optional)
-
-ROCm builds use the HIP runtime and keep the existing accelerator ABI and
-`--gpu` / `--vram` interface. On Linux/WSL, keep the model on a native
-ext4/NVMe path. On Windows, use the AMD HIP SDK and make sure `hipcc` is on
-`PATH` (or set `ROCM_HOME`/`HIP_PATH`). `gfx1101` is the default target for an
-RX 7800 XT; override `ROCM_ARCH` for another AMD GPU.
-
-    cd c
-    make hy3 ROCM=1 ROCM_ARCH=gfx1101
-    make rocm-test ROCM=1 ROCM_ARCH=gfx1101
-
-    COLI_MODEL=/home/me/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14 --auto-tier --verbose
-
-Windows HIP SDK example (PowerShell; native builds also need GNU make and
-MinGW gcc for the C host objects):
-
-    $env:HIP_PATH = 'C:\Program Files\AMD\ROCm\7.1'
-    $env:ROCM_PATH = $env:HIP_PATH
-    $env:ROCM_HOME = $env:HIP_PATH
-    make hy3 ROCM=1 ROCM_ARCH=gfx1101
-    make rocm-test ROCM=1 ROCM_ARCH=gfx1101
-
-The ROCm path disables the NVIDIA-only WMMA kernel and uses the generic packed
-int4 path, preserving correctness while leaving room for an AMD-specific
-MFMA/rocWMMA optimization later. `coli doctor` and the resource planner also
-recognize `libamdhip64`; Linux GPU discovery uses `rocm-smi`, while the
-Windows HIP SDK fallback uses `hipInfo`.
-
-For the 295B `hy_v3` GGUF distribution, keep the GGUF under the LM Studio model
-directory, but use a current upstream `llama.cpp` ROCm build for inference.
-The bundled LM Studio AMD runtime may index `hy_v3` while still reporting
-`unknown model architecture: 'hy_v3'` at load time. `c/rocm_tune.py` reads the
-GGUF tensor table and calculates whole-layer offload after reserving the KV
-cache, compute buffers, and a safety margin. This avoids the frequent
-host/device transfers produced by fractional MoE-layer fitting:
-
-    python c/rocm_tune.py `
-      --model "$env:USERPROFILE\.lmstudio\models\AngelSlim\Hy3-GGUF\Hy3-IQ1_M.gguf" `
-      --vram-gib 15.98 --context 2048 --target-mib 512 --compute-mib 256 `
-      --cache-type-k q8_0 --cache-type-v q8_0
-
-The printed command uses the recommended integer `-ngl`, `--fit off`, and
-q8_0 K/V cache. The output separates the total KV cache from its VRAM and RAM
-parts. The same plan is available as `coli rocm-plan --model ...`.
-The standalone tool's `--vram-gib` is binary GiB; the existing `coli --vram`
-flag is decimal GB, so pass the value appropriate to the tool you use.
-The speed-oriented default reserves 512 MiB of free VRAM; use
-`--target-mib 1024` when a larger desktop/allocator margin is preferred.
-The upstream `llama.cpp --fit on` mode remains useful as a safe fallback, but
-it may select partial MoE layers for maximum occupancy rather than maximum
-decode speed. KV offload is enabled by default in llama.cpp; q8_0 K/V is a
-practical RX 7800 XT starting point at 2K context (Hy3's measured cache is
-about 340 MiB for one sequence).
-
-For this RX 7800 XT / 96 GB RAM machine, the context trade-off is:
-
-| Context | KV type | Recommended `-ngl` | KV total | Note |
-|---:|---|---:|---:|---|
-| 2K | q8_0 | 14 | 340 MiB | fastest measured: 2.21 decode tok/s |
-| 64K | q8_0 | 12 | 10.6 GiB | tested successfully: 1.83 decode tok/s |
-| 128K | q8_0 | 11 | 21.25 GiB | tested successfully, but 1.23 decode tok/s |
-| 128K | q4_0 | 12 | 11.25 GiB | lower KV precision; more VRAM/RAM headroom |
-
-For 64K or 128K, pass the desired context to `rocm_tune.py`; do not reuse the
-2K `-ngl 14` setting. A large context can fit in capacity while making prefill
-very slow, especially when q8_0 KV keeps most of the cache in host RAM.
-
-### CUDA expert tier (optional)
-
-Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts can run GPU matmul during **token generation** (not during `[prefill] layer …` progress, which is mostly CPU attention + disk I/O).
-
-```bash
-cd c
-make hy3 CUDA=1                    # requires nvcc + NVIDIA driver
-make hy3 CUDA=1 IOURING=1          # + io_uring for PIPE=2 expert loads
-
-# lean: 16 GB system RAM + 16 GB GPU
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14 --auto-tier
-
-# fast: large RAM cache + GPU + optional perf knobs
-COLI_VERBOSE=1 DIRECT=1 PIPE=2 CUDA_ATTN=1 \
-  COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 56 --gpu 0 --vram 14 --auto-tier --verbose
-```
-
-Or set env vars directly: `COLI_CUDA=1`, `COLI_GPU=0`, `CUDA_EXPERT_GB=14`, plus autopin from `.coli_usage`.
-At startup, confirm you see `[CUDA] hot expert tier: N experts, VRAM … GB` — if that line is missing, CUDA is not active (rebuild with `CUDA=1` and pass `--gpu` / `--vram`).
-Optional `CUDA_DENSE=1` uploads resident dense weights to GPU (uses VRAM; leaves less room for expert tier). `CUDA_ATTN=1` offloads GQA attention to GPU (best with float KV; do not combine with `KV_I8=1`). `REPIN=N` swaps cold VRAM pins for hot experts during chat.
-
-## OpenAI-compatible API
-
-```bash
-COLI_MODEL=/path/to/hy3_i4 ./coli serve --ram 12 --gpu 0 --vram 14 --host 127.0.0.1 --port 8000
-```
-
-Model id: `hy3-colibri`.
-
-## What we contribute (vs upstream Hy3)
-
-| Piece | Description |
-|-------|-------------|
-| **Colibri int4 format** | `out-*.safetensors` + per-row `.qs` scales — incompatible with GGUF/AWQ |
-| **`convert_hy3.py`** | Hy3-FP8 per-tensor `weight_scale` dequant, `shared_mlp` → `shared_experts` naming |
-| **`hy3.c`** | GQA, sigmoid+bias router, route norm, batch-union MoE, LRU/pin cache |
-| **Chat template** | Hunyuan `｜` delimiters, `coli chat` + `coli serve` |
-
-Base model: [tencent/Hy3](https://huggingface.co/tencent/Hy3) / [Hy3-FP8](https://huggingface.co/tencent/Hy3-FP8) (Apache 2.0).  
-Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4), applied to Hy3.
-
-## Architecture (Hy3 vs GLM in colibrì)
-
-| | GLM-5.2 | Hy3 |
-|--|---------|-----|
-| Attention | MLA (compressed KV) | **GQA** (64Q / 8KV) |
-| Experts | 256 × 75 layers | **192 × 79 layers** |
-| Expert size (int4) | ~19 MB | **~9 MB** |
-| Dense prefix | 3 layers | **1 layer** |
-| Disk container | ~370 GB | **~142 GB** |
-
-## Status & roadmap
-
-**Working today**
-
-- FP8 → int4 conversion (full 80-layer model)
-- `hy3_tiny` oracle **32/32** (committed); `hy3_tiny_i4` oracle **32/32** (regenerate locally)
-- Full-model chat (coherent output with `IDOT=0`, fixed serve KV alloc)
-- MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default; optional `TREE_DRAFT=1`)
-- Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention
-- `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
-
-**Not yet**
-
-- KV disk persistence (GQA layout)
-- int8 IDOT fast path (disabled by default until oracle-clean on all shapes)
-
-## Build
-
-```bash
-cd c && make hy3
-# optional CUDA build (Linux + nvcc):
-make hy3 CUDA=1
-# optional io_uring expert loads (PIPE=2):
-make hy3 IOURING=1
-# both:
-make hy3 CUDA=1 IOURING=1
-# optional self-test (requires hy3_tiny/ — see Tiny oracle fixtures):
-SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
-# MTP smoke test (full converted weights with out-mtp-*.safetensors):
-# SNAP=/path/to/hy3-int4 TEMP=0 DRAFT=3 PROMPT=1 ./hy3 64 8 4
-# Expect stderr: [MTP] active: native speculative decoding (draft=3)
-# and ~2+ tokens/forward in the speculation stats line
-```
-
-## Provenance & license
-
-- Engine fork: colibrì ([MIT](https://github.com/JustVugg/colibri))
-- Hy3 weights: [Tencent Hy3](https://huggingface.co/tencent/Hy3) (Apache 2.0)
-- This port's converted weights: [UnderstandLing/Hy3-colibri-int4](https://huggingface.co/UnderstandLing/Hy3-colibri-int4) (Apache 2.0 derivative)
-
-## Citation
-
-Credit [Tencent Hy3](https://huggingface.co/tencent/Hy3) for the base model and [colibrì](https://github.com/JustVugg/colibri) for the streaming engine.
+Apache 2.0. GLM-5.2 weights are released by Z.ai under MIT.

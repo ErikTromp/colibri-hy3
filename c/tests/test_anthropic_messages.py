@@ -11,6 +11,7 @@ is the reference client from the issue — not merely that the handler returns 2
   - the Anthropic error envelope, which is not the OpenAI one.
 """
 import json
+import re
 import threading
 import unittest
 from urllib.error import HTTPError
@@ -102,10 +103,15 @@ class TranslationTest(unittest.TestCase):
         self.assertEqual(anthropic_tools({"tool_choice": {"type": "any"}})[1], "required")
         self.assertEqual(anthropic_tools({"tool_choice": {"type": "auto"}})[1], "auto")
 
-    def test_rejects_system_role_in_messages(self):
+    def test_system_role_rejection_triggers_claude_code_fallback(self):
         with self.assertRaises(APIError) as caught:
             anthropic_to_openai({"messages": [{"role": "system", "content": "no"}]})
-        self.assertIn("system", caught.exception.message)
+        error = caught.exception
+        self.assertEqual(error.status, 400)
+        # Claude Code 2.1.212 retries without its model-gated mid-conversation
+        # system turn only when the upstream rejection matches this contract.
+        self.assertIn("not supported", error.message)
+        self.assertRegex(error.message, re.compile(r"role .{0,2}system", re.IGNORECASE))
 
 
 class MessagesHTTPTest(unittest.TestCase):

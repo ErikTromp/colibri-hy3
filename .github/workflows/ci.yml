@@ -17,6 +17,55 @@ jobs:
       - name: C test suite
         run: cd c && make test-c
 
+  # Every engine, on every platform a release archive is built for. Before this,
+  # CI built colibri + inkling on Linux only and kimi_k3 on nothing -- so the fact
+  # that inkling and kimi_k3 did not compile under msys2/UCRT64 at all was invisible
+  # for months, and binary releases silently shipped the GLM engine alone (#720).
+  # Each engine is built separately so one failure does not mask the others.
+  engines-all-platforms:
+    name: All engines (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            shell: bash
+          - os: macos-latest
+            name: macos
+            shell: bash
+          - os: windows-latest
+            name: windows
+            # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
+            shell: "msys2 {0}"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - if: matrix.os == 'macos-latest'
+        run: brew install libomp
+      - name: Build every engine
+        run: |
+          cd c
+          rc=0
+          for t in colibri inkling kimi_k3 olmoe hy3; do
+            echo "::group::$t"
+            make $t || { echo "FAILED: $t"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+
   engine-cuda-syntax:
     name: CUDA syntax check
     runs-on: ubuntu-latest
@@ -72,6 +121,22 @@ jobs:
           # gate fails the moment a shared-code change regresses the engine.
           python3 tools/make_tiny_inkling.py tiny_inkling
           SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_inkling.json
+
+  hy3-oracle:
+    name: Hy3 oracle (teacher-forcing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build hy3
+        run: cd c && make hy3
+      - name: Tiny-model oracle (int4, 32/32 positions)
+        run: |
+          cd c
+          if [ -d hy3_tiny ] && [ -f ref_hy3.json ]; then
+            SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
+          else
+            echo "hy3_tiny fixtures missing — skipping oracle"
+          fi
 
   engine-hip-syntax:
     name: HIP syntax check

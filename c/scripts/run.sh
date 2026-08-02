@@ -5,7 +5,7 @@
 #     (3) compila il motore, (4) genera testo restando nel budget RAM.
 set -euo pipefail
 
-DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"          # modello int4 su ext4 (NON /mnt/c!)
+DIR="${COLI_MODEL:?set COLI_MODEL to the model directory (int4, on a native fs — NOT /mnt/c)}"
 REPO="${COLI_REPO:-zai-org/GLM-5.2-FP8}"
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RAM_GB="${RAM_GB:-15}"

@@ -208,12 +208,19 @@ static int test_fmt6(int dev) {
     if (!relative_rms(got_e, want_e, S*I, 2e-4f)) {
         std::fprintf(stderr,"fmt=6 expert_mlp mismatch (device-side rotation?)\n"); return 0;
     }
+    ColiCudaTensor *eg6[2]={tg6,tg6},*eu6[2]={tu6,tu6},*ed6[2]={td6,td6};
+    int erows[2]={1,1};
+    float *group_e=(float*)std::malloc((size_t)S*I*sizeof(float));
+    if (!coli_cuda_expert_group(eg6,eu6,ed6,erows,2,group_e,x) ||
+        !relative_rms(group_e,want_e,S*I,2e-4f)) {
+        std::fprintf(stderr,"fmt=6 expert_group mismatch\n"); return 0;
+    }
 
     coli_cuda_tensor_free(t6); coli_cuda_tensor_free(tg6);
     coli_cuda_tensor_free(tu6); coli_cuda_tensor_free(td6);
     std::free(q); std::free(qu); std::free(qd); std::free(x); std::free(want);
     std::free(got); std::free(wrow); std::free(wr2); std::free(g); std::free(u);
-    std::free(want_e); std::free(got_e);
+    std::free(want_e); std::free(got_e); std::free(group_e);
     return 1;
 }
 

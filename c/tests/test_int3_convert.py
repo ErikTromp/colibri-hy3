@@ -13,7 +13,7 @@ except ImportError:
     raise unittest.SkipTest("numpy not installed")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-from convert_fp8_to_int4 import quant_int3_g64
+from convert_fp8_to_int4 import quant_int3_g64, source_label
 
 
 def decode(packed, scales, O, I, group=64):
@@ -42,6 +42,14 @@ def reference(w, group=64):
 
 
 class Int3ConvertTest(unittest.TestCase):
+    def test_source_label_allows_standalone_selftests(self):
+        class Args:
+            selftest = False
+            selftest_nvfp4 = True
+            indir = None
+            repo = None
+        self.assertEqual(source_label(Args()), "selftest")
+
     def test_round_trip(self):
         rng = np.random.default_rng(7)
         for I in (64, 128, 100, 65, 7168):

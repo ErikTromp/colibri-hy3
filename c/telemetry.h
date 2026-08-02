@@ -180,25 +180,13 @@ static void hits_emit(Model *m){
     printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
 }
 
-static void stats_dump_q(Model *m, const char *path, int quiet){
-    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
-    Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
-        for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
-}
+/* The history format lives in route_trace.h so every engine writes the same bytes;
+ * these keep the Model-shaped call sites unchanged. */
+static void stats_dump_q(Model *m, const char *path, int quiet){ (void)m; rt_save(path,quiet); }
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
 static char g_usage_path[2100]="";
-static int64_t usage_load(Model *m, const char *path){
-    FILE *f=fopen(path,"r"); if(!f) return 0;
-    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
-    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
-    fclose(f); return tot;
-}
+static int64_t usage_load(Model *m, const char *path){ (void)m; return rt_load(path); }
 static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
 
 #endif /* TELEMETRY_H */

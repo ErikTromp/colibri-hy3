@@ -1,0 +1,82 @@
+# .coli_ssd cache-grammar vectors (#379/#386) -- the SINGLE source of truth for
+# the strict grammar both readers must implement byte-for-byte:
+#   C:      colibri.c  coli_ssd_cache_parse()   (chewed by tests/test_ssd_probe.c)
+#   Python: resource_plan.py  parse_ssd_cache() (chewed by tests/test_resource_plan.py)
+# Add a vector here and BOTH suites pick it up; a reader change that is not
+# mirrored in the other language fails its half of the suite.
+#
+# Format, tab-separated fields:
+#   v2	<gbs>	<st_dev>	<payload>     payload must parse as v2 with these values
+#   legacy	<gbs>	<payload>     payload must parse as the legacy bare number
+#   garbage	<payload>             payload must be rejected (re-probe / None)
+# Payload escapes: \n newline, \r CR, \t tab, \0 NUL, \s space, \\ backslash.
+# Spaces may also appear literally except at the payload's edges.
+
+# --- valid v2 -----------------------------------------------------------
+v2	9.742	16777233	v2 9.742 16777233\n
+v2	9.742	16777233	v2 9.742 16777233
+v2	0.001	0	v2 0.001 0\n
+v2	999.999	18446744073709551615	v2 999.999 18446744073709551615\n
+v2	8	42	v2 8 42\n
+v2	9.5	7	v2 0009.500 0000007\n
+
+# --- valid legacy (recognized, but the engine still re-probes + upgrades) ---
+legacy	22.139	22.139\n
+legacy	9.742	9.742
+legacy	8	8\n
+legacy	0.5	0.5\n
+# 63 digits + newline = 64 bytes, exactly at the length cap
+legacy	9	000000000000000000000000000000000000000000000000000000000000009\n
+
+# --- garbage: empty / whitespace ----------------------------------------
+garbage
+garbage	\n
+garbage	\s9.5\n
+garbage	9.5\s\n
+garbage	9.5\t\n
+garbage	9.5\r\n
+garbage	9.5\n\n
+# CRLF is not a line ending here -- the format is exact bytes, and a Windows
+# text-mode writer once smuggled \r into fixtures (CI, 2026-07): pinned forever
+garbage	v2 14.322 123\r\n
+# --- garbage: strtod-isms the strict grammar bans ------------------------
+garbage	inf\n
+garbage	-inf\n
+garbage	nan\n
+garbage	INF\n
+garbage	1e3\n
+garbage	0x8\n
+garbage	+9.5\n
+garbage	-9.5\n
+# --- garbage: malformed numbers ------------------------------------------
+garbage	5.\n
+garbage	.5\n
+garbage	9,5\n
+garbage	9.5.1\n
+garbage	9.5 junk\n
+# --- garbage: out-of-range gbs -------------------------------------------
+garbage	0\n
+garbage	0.000\n
+garbage	1000\n
+garbage	1000.0\n
+garbage	v2 0 1\n
+garbage	v2 1000 1\n
+garbage	v2 inf 1\n
+# --- garbage: malformed v2 ------------------------------------------------
+garbage	v2 9.5\n
+garbage	v2 9.5 \n
+garbage	v2 9.5 16777233 extra\n
+garbage	v2\s\s9.5 1\n
+garbage	V2 9.5 1\n
+garbage	v2\t9.5\t1\n
+garbage	v2 9.5 -1\n
+garbage	v2 9.5 1.5\n
+garbage	v2 9.5 1e3\n
+garbage	v2 9.5 1\n\n
+# --- garbage: st_dev beyond unsigned 64-bit or beyond 20 digits -----------
+garbage	v2 9.5 18446744073709551616\n
+garbage	v2 9.5 99999999999999999999\n
+garbage	v2 9.5 123456789012345678901\n
+# --- garbage: length cap (64 digits + newline = 65 bytes) and NULs ---------
+garbage	0000000000000000000000000000000000000000000000000000000000000009\n
+garbage	9.5\0junk\n

@@ -54,6 +54,37 @@ coli run --auto-tier --policy quality "Explain MoE offloading"
 coli run --policy experimental-fast --topk 4 "Benchmark prompt"
 ```
 
+## Measured machine profiles
+
+`coli plan` chooses a safe starting point from capacity and topology.
+`coli tune` measures the remaining scheduling choices on the actual model and
+machine, then saves a hardware/model/engine-specific profile:
+
+```bash
+coli tune --model /models/glm52_i4
+coli run --model /models/glm52_i4 --auto-tier "Explain MoE offloading"
+```
+
+The calibration prompt is generated once. Every candidate then teacher-forces
+the same continuation, so answer length and sampling do not contaminate the
+comparison. The bounded sweep only includes execution knobs such as OpenMP
+thread count, NUMA placement, I/O overlap, direct I/O, and CUDA pipelining. It
+never changes weights, quantization, router decisions, `TOPK`, `TOPP`, or
+sampling.
+
+A candidate is saved only when median throughput improves by at least 3% while
+expert hit rate remains within 0.5 percentage points and p99 latency stays
+within 20% of the baseline. The winner is then rerun before a final baseline;
+this reverse-order gate gives the baseline any remaining warm-cache advantage
+and rejects startup drift. Otherwise the baseline is recorded and no override
+is applied. Saved profiles are loaded by `--auto-tier`; explicit environment
+variables always win. Use `--no-tune-profile` to bypass a saved profile.
+
+Profiles live under `$XDG_CONFIG_HOME/colibri/tuning` (normally
+`~/.config/colibri/tuning`) or `%LOCALAPPDATA%\colibri\tuning` on Windows. A
+change to the engine binary, model metadata, CPU topology, or GPU inventory
+produces a new fingerprint instead of reusing stale measurements.
+
 Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output quality
 does not.
@@ -85,6 +116,11 @@ If you benchmarked colibrì before that date, rerun — your numbers were capped
 decaying session heat map replaces cold pinned experts with hotter streamed
 experts. A 25% hysteresis and a four-swap limit prevent tier thrashing.
 Persistent `.coli_usage` remains the long-term signal and is not decayed.
+
+The history's on-disk format, what happens when one engine is handed another
+engine's history, and how `PIN=<file>` differs from `PIN=auto` in how much it
+trusts a file are documented in
+[routing-telemetry.md](routing-telemetry.md).
 
 ## Router-lookahead prefetch (`PILOT=1`, experimental)
 

@@ -6,7 +6,7 @@ Richiede `datasets`:  pip install --break-system-packages datasets   (o in una v
 USO:
   python3 tools/fetch_benchmarks.py --out ./bench --tasks hellaswag,arc_challenge,arc_easy,mmlu,winogrande,piqa,openbookqa --limit 300
 Poi:
-  python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --limit 40 --ram 15
+  python3 tools/eval_glm.py --snap /path/to/glm52_i4 --data ./bench --tasks mmlu --limit 40 --ram 15
 """
 import os, sys, json, time, argparse, random
 
