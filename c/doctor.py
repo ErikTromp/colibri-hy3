@@ -8,7 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from resource_plan import GB, build_plan, discover_gpus, format_plan, memory_available
+from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
+                           memory_available)
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
@@ -528,11 +529,27 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
             checks.append(_check("placement.plan", "warn", "; ".join(plan["warnings"])))
         else:
             checks.append(_check("placement.plan", "pass", "tier placement has no warnings"))
+        # #379: read-and-display only -- the cached value colibri.c already measured
+        # (F_NOCACHE probe) on a Metal+darwin startup, never re-probed here. A cache
+        # that exists but is not trusted says WHY (#386 r2, F10) -- "no cached probe
+        # yet" would be a lie with a file sitting right there.
+        ssd_gbs = plan.get("ssd_probe_gbs")
+        ssd_state = plan.get("ssd_probe_state")
+        if ssd_gbs is not None:
+            checks.append(_check("storage.ssd_probe", "pass",
+                                 f"F_NOCACHE probe: {ssd_gbs:.1f} GB/s (cached, .coli_ssd)", gbs=ssd_gbs))
+        elif ssd_state in SSD_PROBE_PENDING:
+            checks.append(_check("storage.ssd_probe", "skip",
+                                 SSD_PROBE_PENDING[ssd_state], state=ssd_state))
+        else:
+            checks.append(_check("storage.ssd_probe", "skip",
+                                 "no cached probe yet; measured on the first Metal+darwin engine start"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
         checks.append(_check("memory.ram", "skip", "RAM projection requires a valid model"))
         checks.append(_check("placement.plan", "skip", "placement requires a valid model"))
+        checks.append(_check("storage.ssd_probe", "skip", "probe surfacing requires a valid model"))
 
     if deep:
         try:
@@ -580,7 +597,8 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
 def format_doctor(report):
     icons = {"pass": "ok", "warn": "warn", "fail": "fail", "skip": "skip"}
-    lines = [f"colibri doctor · {report['model']}"]
+    # model is null in the JSON when none was given (#724); say that rather than "None"
+    lines = [f"colibri doctor · {report['model'] or '(no model given)'}"]
     for check in report["checks"]:
         lines.append(f"[{icons[check['status']]:>4}] {check['id']:<18} {check['summary']}")
     if report["plan"]:

@@ -6,7 +6,7 @@
 #  - esce da solo quando tutti i 141 shard sono fatti
 # uso da c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
 set -u
-DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"
+DIR="${COLI_MODEL:?set COLI_MODEL to the model directory}"
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOTAL="${TOTAL_SHARDS:-141}"
 STALL_S=180          # secondi senza crescita del download -> riavvio

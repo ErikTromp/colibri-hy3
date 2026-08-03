@@ -3,19 +3,36 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
-**Motore piccolo, modello immenso.** Esegui **GLM-5.2 (744 miliardi di parametri, MoE)** su un computer consumer con ~25 GB di RAM — in C puro, zero dipendenze, caricando gli expert dal disco in streaming.
+**Motore piccolo, modello immenso.** Esegui **modelli MoE di frontiera — da 744
+miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogeneo,
+in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
+un'unica gerarchia di inferenza.
 
-Colibrì è un runtime MoE leggero e che preserva la qualità: tratta VRAM, RAM e
-disco come un'unica gerarchia di memoria gestita. Se la memoria veloce non basta
-il modello rallenta, ma la policy predefinita **non cambia mai silenziosamente la
-precisione del modello né la semantica del router**.
+Oggi girano quattro famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia `coli chat` /
+`coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+
+> **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
+> ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di
+> inferenza lungo l'intero confine software/hardware — formati dei modelli,
+> gerarchia di memoria, I/O dello storage, piazzamento, scheduling, kernel,
+> speculazione e sovrapposizione CPU/GPU — affinché i grandi modelli dipendano
+> meno da hardware raro e costino meno.
+
+Colibrì è intenzionalmente un luogo dove verificare idee di sistema aggressive —
+quindi **nessuno SLA sulla velocità, e una garanzia dura sulla semantica**: gli
+esperimenti devono dimostrare il proprio valore con misure end-to-end riproducibili;
+la policy predefinita **non cambia mai silenziosamente la precisione del modello né
+la semantica del router**. Una memoria veloce insufficiente può ridurre la velocità,
+ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.4.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -45,6 +62,71 @@ tematica misurata</a> dell'expert.</em></p>
 misurato degli expert</a> come una galassia 3D — 13.260 expert caratterizzati, 1.041 specialisti
 replicabili che si raggruppano per argomento (poesia, legge, cinese, SQL…). La posizione deriva
 dall'affinità di routing misurata, non da un embedding appreso. Trascinare per ruotare.</em></p>
+
+## La missione di ricerca
+
+L'inferenza di frontiera non dovrebbe richiedere per forza hardware da datacenter.
+L'obiettivo di Colibrì è semplice: **ridurre la dipendenza dall'hardware e il costo
+totale dell'inferenza, ottimizzando ogni parte del percorso che le misure indicano
+come limitante**.
+
+Questo comprende cambiare il modo in cui i pesi sono rappresentati e spostati,
+decidere cosa risiede in VRAM, RAM o storage, sovrapporre calcolo eterogeneo,
+ridurre i costi di avvio e sincronizzazione, sfruttare sparsità e riuso e verificare
+nuovi algoritmi di decoding. La convenzione non protegge una tecnica; un microbenchmark
+veloce non basta ad adottarla. Decide l'inferenza end-to-end su macchine reali,
+misurando correttezza e qualità insieme a throughput, latenza, memoria e costo.
+
+Il risultato pratico è l'accessibilità: eseguire un modello da 744B sull'hardware
+che già possiedi, osservare ogni expert in tempo reale e modificare il codice che
+lo rende possibile. Non noleggiare intelligenza dietro un'API, ma possederla,
+analizzarla, misurarla e migliorarla. Il motore resta volutamente abbastanza piccolo
+perché la prossima ottimizzazione utile possa arrivare da chiunque sia disposto a misurarla.
+
+## Tecniche fondamentali e risultati misurati
+
+- **Una gerarchia, non una soglia di memoria.** VRAM, RAM e NVMe sono livelli di
+  piazzamento degli stessi pesi; poca memoria veloce cambia la velocità, non il modello.
+- **Un JIT per i pesi.** Il calore di routing misurato alimenta una LRU per layer,
+  un hot-store appreso e il prefetch del layer successivo senza caricare tutti gli expert.
+  Aiuta sui carichi ripetibili, ma la cronologia può sovradattarsi e il prefetch può
+  perdere su alcuni host: sono policy da misurare, non promesse.
+- **L'I/O fa parte del motore.** Unione degli expert per batch, letture sovrapposte
+  al calcolo, `O_DIRECT` e striping pesato su due SSD ottimizzano direttamente lo
+  streaming. `O_DIRECT` dipende dal disco e il doppio SSD richiede più A/B end-to-end.
+- **Esecuzione eterogenea.** CPU, CUDA, Metal, memoria NUMA e residenza parziale o
+  completa degli expert condividono un runtime; la combinazione utile dipende da
+  calcolo, banda, residenza e carico.
+- **Stato compresso senza cambiare modello.** Validazione token-exact, stato MLA KV
+  57× più piccolo, conversazioni persistenti e DSA fedele vincolano l'ottimizzazione
+  alla correttezza. Sono proprietà di memoria, latenza e correttezza, non una
+  promessa generale di throughput.
+- **La speculazione deve meritarsi il costo.** MTP nativo e draft vincolati da
+  grammatica sono misurati end-to-end e si disattivano quando l'accettazione non
+  ripaga la verifica.
+
+## Ipotesi aperte, esperimenti e partecipazione
+
+Colibrì considera ogni ottimizzazione un'ipotesi finché un A/B end-to-end
+controllato non dimostra il contrario. Le domande principali sono:
+
+| ipotesi | evidenza attuale | esperimento ancora necessario |
+|---|---|---|
+| La cronologia di routing può piazzare gli expert meglio di una semplice LRU | i pin appresi migliorano carichi ripetuti, ma possono sovradattarsi al prompt | A/B cross-session su set esclusi: codice, chat, multilingua e contesti lunghi |
+| Più SSD possono trasformare banda indipendente in velocità di decode | routing pesato mirror/split implementato e validato; il modello di banda è solido | GLM-5.2 a cache fredda, uno contro due dischi su controller indipendenti reali |
+| Un planner hardware-aware può avvicinarsi automaticamente alla configurazione migliore | oggi rileva budget RAM/VRAM e diversi backend | confrontare il piano generato con sweep controllati su laptop, workstation, NUMA e multi-GPU |
+| Rappresentazioni lossless o a qualità limitata possono ridurre abbastanza il movimento dei pesi | esistono ablation di formato e quantizzazione con gate di qualità | riprodurre insieme qualità, byte mossi, latenza e costo per token utile, non solo il rapporto di compressione |
+| La speculazione routing-aware può convenire prima della residenza quasi completa | MTP e draft grammaticali funzionano, ma MTP ha anche perso il 32% intorno all'85% di expert hit | mappare il pareggio tra accettazione, hit rate, batch union e profondità del draft |
+| La sovrapposizione CPU/GPU può nascondere trasferimenti e sincronizzazione | esistono risultati positivi CUDA e Metal, ma CPU veloci e bassa residenza possono annullarli | profili per fase e A/B a variabile singola su PCIe, memoria unificata e piena residenza |
+
+Per contribuire, scegli una riga e pubblica anche i risultati negativi. Registra
+hardware, commit, container del modello, comando esatto, prompt, stato cache,
+throughput, TTFT, expert hit, byte letti e controllo qualità; cambia una sola
+variabile, ripeti e allega i log grezzi. Parti da
+[CONTRIBUTING.md](CONTRIBUTING.md), confronta il
+[protocollo di benchmark](docs/benchmarks.md), quindi
+[apri una issue di esperimento](https://github.com/JustVugg/colibri/issues/new).
+Un fallimento controllato vale più di un numero veloce senza spiegazione.
 
 ## L'idea
 
@@ -194,14 +276,20 @@ resta in `c/` — è un'installazione editabile dal clone, non un wheel).
 
 ### 2. Scarica il modello
 
-Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — **usa la
-versione con le teste MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
+Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — usa la build
+**group-scaled (gs64) con la testa MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
 disco che abbia lo spazio, meglio se veloce:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
-> ⚠️ Il mirror originale contiene teste MTP int4 → accettazione dei draft allo 0%
-> ([#8](https://github.com/JustVugg/colibri/issues/8)). Verifica la tua versione:
+> ⚠️ Usa il container **gs64** qui sopra, non i vecchi mirror int4 per-row
+> (`mateogrgic/…`, `jlnsrk/…`): misurano circa 9 punti percentuali in meno sulla
+> qualità e causavano i loop in think-mode e le generazioni senza termine originali
+> di [#455](https://github.com/JustVugg/colibri/issues/455). Il container gs64 ha
+> corretto quegli A/B per-row controllati, ma non è una protezione generale contro
+> ripetizioni o EOS starvation. Anche la testa MTP deve essere **int8, non int4**
+> (int4 → 0% di accettazione dei draft,
+> [#8](https://github.com/JustVugg/colibri/issues/8)):
 > `ls -l <modello>/out-mtp-*` — int8 (corretto) è `3527131672 / 5366238584 / 1065950496`.
 
 Oppure converti tu stesso dalla sorgente FP8 — un unico comando riprendibile che
@@ -238,6 +326,19 @@ e per il gateway API opzionale.
 | Draft forzati da grammatica (output strutturato) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Inventario delle variabili d'ambiente | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## Prossimi passi
+
+- **La ricerca sui sistemi di inferenza è il prodotto.** La gerarchia attuale usa
+  LRU e un insieme appreso di expert fissati; il lavoro attivo copre formati,
+  compressione, piazzamento, scheduling, I/O, kernel CPU/GPU, sovrapposizione
+  eterogenea, stato KV e speculazione consapevole del routing. L'obiettivo è
+  ridurre i requisiti hardware e il costo per token utile, con risultati misurati
+  end-to-end, revisionati e sviluppati apertamente.
+- **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
+  qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
+  GLM-5.2 e OLMoE funzionano già; **Kimi K2**, **Qwen3 MoE** e **MiniMax** sono
+  nella roadmap.
+
 ## Sostenere il progetto
 
 colibrì è nato come progetto di una sola persona su un portatile con 12 core
@@ -247,6 +348,8 @@ Se ti è utile:
 - ⭐ metti una stella al repository e condividilo;
 - 🐛 apri issue con i numeri di benchmark del tuo hardware — i datapoint
   fanno avanzare questo progetto più di qualsiasi altra cosa;
+- 💬 entra nella [comunità Discord](https://discord.gg/fpQxKnRb) per discutere
+  esperimenti, risultati hardware e direzioni di ricerca;
 - 💬 contattaci via GitHub issues per sponsorizzare lo sviluppo o donare hardware.
 
 ## Struttura del repository

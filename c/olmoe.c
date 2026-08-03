@@ -3,7 +3,9 @@
  * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
  *
  * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
- * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
+ * Expert letti dal disco on-demand via pread, cache LRU per-layer; le pagine
+ * restano nel page cache cosi' i miss LRU non tornano su disco (EXPERT_DROP=1
+ * ripristina fadvise(DONTNEED) per macchine con poca RAM).
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
@@ -14,6 +16,8 @@
  *   SMOOTH=F      : EMA coefficient for routing momentum (default 0.3, range 0.0-0.95)
  *   CONF_LIMIT=F  : cumulative gate probability threshold for prefetch cutoff (default 0.92)
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
+ *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
+ *                    for RAM-tight boxes); 0=keep pages cached (default)
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -28,6 +32,10 @@
 #include <unistd.h>
 #endif
 #include "st.h"
+#ifdef _OPENMP
+#include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
+#endif
+#include "omp_tune.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -43,6 +51,9 @@ typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim;
     int n_experts, topk, inter, vocab;
     float theta, eps; int norm_topk;
+    int stop_ids[8], n_stop;   /* unused (no model-specific hardcoded stops) — chat mode's
+                                 * stop set comes entirely from the tokenizer's own special-
+                                 * token flags via sample.h's stops_arm_tok */
 } Cfg;
 
 /* ---------- pesi densi per-layer ---------- */
@@ -93,6 +104,7 @@ static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
+static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
@@ -125,6 +137,14 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
 #endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+
+/* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
+ * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
+ * Declared before #include "sample.h" — it references these by name, and
+ * Cfg/falloc above, without its own extern declarations. */
+static float g_temp = 0.7f;   /* TEMP env overrides */
+static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
+#include "sample.h"
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -406,7 +426,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
-    st_read_raw(&m->S, nm, s->g, 1);
+    st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
 
@@ -956,6 +976,110 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     return scored;
 }
 
+/* ---------- interactive chat mode (CHAT=1) ---------- */
+/* OLMoE-Instruct's real template (tokenizer_config.json's chat_template):
+ *   {{bos_token}}<|user|>\n{msg}\n<|assistant|>\n{reply}{eos_token}\n<|user|>\n...
+ * bos_token == eos_token == "|||IP_ADDRESS|||" (a genuine OLMoE tokenizer quirk,
+ * a PII-scrubbing artifact repurposed as the BOS/EOS marker — not a bug here).
+ * It's an added special token, so tok_encode() tokenizes the literal string as
+ * one atomic id, same as any other added token. <|user|>/<|assistant|> are NOT
+ * special tokens in this tokenizer — just plain text the model was trained to
+ * treat as turn markers.
+ * Turn 1 gets bos_token with no separator before "<|user|>"; every later turn
+ * gets eos_token+"\n" first (closing the previous assistant turn we never
+ * explicitly appended to history, matching the is_stop-skips-append design
+ * below) before its own "<|user|>...". */
+static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
+    int n = first_turn
+        ? snprintf(out, cap, "|||IP_ADDRESS|||<|user|>\n%s\n<|assistant|>\n", msg)
+        : snprintf(out, cap, "|||IP_ADDRESS|||\n<|user|>\n%s\n<|assistant|>\n", msg);
+    return (n < 0 || n >= cap) ? -1 : n;
+}
+
+/* KV cache allocated ONCE for ctx_cap and never reallocated — hist_len only
+ * grows (or resets to 0 on /reset), so every turn after the first reuses the
+ * previous turns' cached keys/values: real multi-turn context, not a fresh
+ * generate() call per message. ctx_cap capped at 4096: attention()'s per-head
+ * score buffer (sc[4096]) is fixed-size, any position >= 4096 would overflow it. */
+static void run_chat(Model *m, Tok *T, int ctx_cap) {
+    Cfg *c = &m->c;
+    m->max_t = ctx_cap;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+
+    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    stops_arm_tok(c, tok_eos, T);
+
+    int max_new = getenv("MAX_NEW") ? atoi(getenv("MAX_NEW")) : 512;
+    if (max_new < 1) max_new = 1;
+
+    int *hist = malloc((size_t)ctx_cap * sizeof(int));
+    int hist_len = 0;
+    int first_turn = 1;
+
+    char *line = malloc(8192);
+    char *turn = malloc(8192 + 64);
+    int  *newids = malloc(8192 * sizeof(int));
+    int  *gen = malloc((size_t)max_new * sizeof(int));
+    char *outbuf = malloc(65536);
+
+    fprintf(stderr, "olmoe chat — SNAP=%s, ctx=%d, TEMP=%.2f, NUCLEUS=%.2f\n"
+                     "  type a message and press enter; /reset clears context; Ctrl-D exits\n",
+            getenv("SNAP"), ctx_cap, g_temp, g_nuc);
+
+    for (;;) {
+        printf("\n> "); fflush(stdout);
+        if (!fgets(line, 8192, stdin)) break;
+        size_t L = strlen(line);
+        while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
+        if (L == 0) continue;
+        if (!strcmp(line, "/reset")) { hist_len = 0; first_turn = 1; fprintf(stderr, "[chat] context reset\n"); continue; }
+
+        int tn = fmt_user_turn(turn, 8192 + 64, line, first_turn);
+        if (tn < 0) { fprintf(stderr, "[chat] message too long, skipped\n"); continue; }
+        first_turn = 0;
+        int nn = tok_encode(T, turn, tn, newids, 8192);
+
+        if (hist_len + nn + max_new > ctx_cap) {
+            fprintf(stderr, "[chat] context window full (%d/%d tokens) — /reset to start over\n",
+                    hist_len + nn, ctx_cap);
+            continue;
+        }
+
+        float *logit = step(m, newids, nn, hist_len);
+        hist_len += nn;
+
+        /* Every token counted in hist_len must have gone through step() exactly
+         * once (that's what writes its KV-cache slot) — otherwise a later turn's
+         * attention would read an uninitialized slot. So even on the turn's LAST
+         * token we still call step() once to populate its KV before breaking;
+         * only its returned logit (which nothing will consume) is discarded. */
+        int ngen = 0;
+        for (int s = 0; s < max_new; s++) {
+            int nt = pick_tok(logit, c->vocab, -1);
+            free(logit); logit = NULL;
+            if (is_stop(nt)) break;
+            hist[hist_len] = nt; gen[ngen++] = nt; hist_len++;
+            int room_left = (s < max_new - 1) && (hist_len < ctx_cap);
+            logit = step(m, &nt, 1, hist_len - 1);
+            if (!room_left) {
+                if (hist_len >= ctx_cap) fprintf(stderr, "\n[chat] context window full mid-reply — /reset to start over\n");
+                free(logit); logit = NULL;
+                break;
+            }
+        }
+
+        int outn = tok_decode(T, gen, ngen, outbuf, 65535);
+        outbuf[outn] = 0;
+        printf("%s\n", outbuf);
+        fflush(stdout);
+    }
+    free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -965,11 +1089,13 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -979,6 +1105,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits);
         return 1;
     }
+
+    if (getenv("CHAT")) {   /* interactive mode: bypasses the ref.json harness entirely */
+        g_temp = getenv("TEMP")    ? (float)atof(getenv("TEMP"))    : g_temp;
+        g_nuc  = getenv("NUCLEUS") ? (float)atof(getenv("NUCLEUS")) : g_nuc;
+        int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
+            fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
+            return 1;
+        }
+        Model m; model_init(&m, snap, cap, bits);
+        printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+        Tok T;
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+        run_chat(&m, &T, ctx_cap);
+        return 0;
+    }
+
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;

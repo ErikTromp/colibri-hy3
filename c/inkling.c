@@ -33,6 +33,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "route_trace.h"                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -68,7 +69,14 @@ typedef struct {
  * move to VRAM (dev set, host freed): decode reads ~35 GB of residents per
  * token, so this trades the DDR5 bandwidth wall for VRAM bandwidth AND
  * frees the same RAM for the expert cache. */
-typedef struct { float *f; uint16_t *h; void *dev; } Wt;
+/* q4/qs: densa pre-quantizzata int4 group-scaled (gs=64) da un container
+ * separato, opzionale — vedi load_w. La densa bf16 di Inkling e' 49.4 GB e non
+ * entra in 25 GB (il caricamento la espande pure a f32, ~99 GB al picco: e' li'
+ * l'OOM). A int4-gs64 diventa ~15 GB. Nessun campo q4 = comportamento invariato. */
+typedef struct { float *f; uint16_t *h; void *dev;
+                 uint8_t *q4;        /* int4 nibble-packed (qbits=4) o int8 (qbits=8) */
+                 float *qs;          /* scale: [rows*ng] se qbits=4, [rows] se qbits=8 */
+                 int gs, qbits; int64_t qn; } Wt;   /* qn = byte in q4, per il guard OOB */
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -100,6 +108,9 @@ typedef struct { Slot *slots; int n, cap; } LCache;
 typedef struct {
     Cfg c;
     shards S;
+    shards Sq;                            /* container densa int4-gs64 (opzionale) */
+    int has_q, q_loaded;                  /* has_q: container presente; q_loaded: tensori presi da li */
+    int64_t q_bytes;
     int quant_bits;                       /* 0 = f32 experts (oracle mode) */
     int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
     Wt embed, lm_head;
@@ -110,6 +121,7 @@ typedef struct {
     uint32_t **eusage;                    /* per-layer expert selection counts */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
+    uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
@@ -126,6 +138,9 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
+/* TOPP=p (0..1): top-p adattivo sui routed — tieni gli esperti fino al peso
+ * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
+static float g_topp = 0.f;
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -196,6 +211,50 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 }
 
 /* dispatch on where the weight lives */
+/* y[S,O] = x[S,I] @ W^T con W int4 GROUP-scaled: nibble +8, low = colonna pari,
+ * una scala f32 ogni `gs` elementi lungo I (ng = ceil(I/gs) scale per riga).
+ * Differenza da matmul_q4 (per-riga): la scala cambia DENTRO la riga, quindi
+ * l'accumulo va chiuso a ogni gruppo invece che una volta sola a fine riga. */
+static void matmul_i4g(float *y, const float *x, const uint8_t *p, const float *scale,
+                       int S, int I, int O, int gs) {
+    int ng = (I + gs - 1) / gs;
+    int64_t rb = (I + 1) / 2;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = p + (int64_t)o * rb;
+        const float *sc = scale + (int64_t)o * ng;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int g = 0; g < ng; g++) {
+                int i0 = g * gs, i1 = i0 + gs; if (i1 > I) i1 = I;
+                float part = 0.f;
+                for (int i = i0; i < i1; i++) {
+                    uint8_t b = w[i >> 1];
+                    int q = (i & 1) ? (b >> 4) : (b & 0x0F);
+                    part += xs[i] * (float)(q - 8);
+                }
+                acc += part * sc[g];               /* scala chiusa per gruppo */
+            }
+            y[(int64_t)s * O + o] = acc;
+        }
+    }
+}
+/* int8 per-riga (embed/lm_head: sensibili, non vanno a 4 bit) */
+static void matmul_i8r(float *y, const float *x, const int8_t *q, const float *scale,
+                       int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I; float sc = scale[o];
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * (float)w[i];
+            y[(int64_t)s * O + o] = acc * sc;
+        }
+    }
+}
+
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
 #ifdef COLI_CUDA
     if (W.dev) {
@@ -203,6 +262,18 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
         fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
     }
 #endif
+    if (W.q4) {
+        /* guard: il container e' un file, non un invariante — se la geometria non
+         * torna si esce invece di leggere fuori dal buffer. */
+        int64_t need = W.qbits == 8 ? (int64_t)O * I : (int64_t)O * ((I + 1) / 2);
+        if (need > W.qn) {
+            fprintf(stderr, "dense q4: geometria incoerente (serve %lld B, ho %lld) I=%d O=%d\n",
+                    (long long)need, (long long)W.qn, I, O); exit(1);
+        }
+        if (W.qbits == 8) matmul_i8r(y, x, (const int8_t*)W.q4, W.qs, S, I, O);
+        else              matmul_i4g(y, x, W.q4, W.qs, S, I, O, W.gs);
+        return;
+    }
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
 }
@@ -478,10 +549,46 @@ static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
  * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact).
  * gpu_ok: bf16 tensors move to VRAM while budget lasts (embed stays host —
  * it's a row lookup, not a matmul). */
+/* Container densa pre-quantizzata (opzionale): <snap>/dense-int4g64/.
+ * Se il tensore c'e' li' dentro lo carichiamo int4-gs64 (U8 + sidecar .qs, la
+ * stessa convenzione che il container usa gia' per gli esperti); altrimenti si
+ * prosegue col percorso bf16/f32 di sempre. Container assente = nessun cambio. */
+static int load_w_quant(Model *m, const char *name, int64_t orig_numel, Wt *out) {
+    if (!m->has_q) return 0;
+    st_tensor *t = st_find(&m->Sq, name);
+    if (!t || t->dtype != 3) return 0;              /* 3 = U8/byte grezzi */
+    char qn[352]; snprintf(qn, sizeof(qn), "%s.qs", name);
+    st_tensor *s = st_find(&m->Sq, qn);
+    if (!s) return 0;                                /* senza scale non si decodifica */
+    /* Geometria dedotta dai CONTEGGI, non dalle shape (st_tensor non le porta):
+     *   int4-gs64 -> byte ~= numel/2 e scale ~= numel/64
+     *   int8      -> byte  == numel   e scale == righe (numel/I, I ignoto qui:
+     *                basta che le scale siano molte meno dei byte)
+     * Il controllo forte sull'OOB lo fa matmul_w con l'I vero del chiamante. */
+    Wt w = {0};
+    if (t->nbytes == orig_numel && s->numel * 64 < (int64_t)t->nbytes) {
+        w.qbits = 8;                                 /* int8 per riga */
+    } else if (t->nbytes * 2 >= orig_numel && t->nbytes * 2 <= orig_numel + 2 * s->numel) {
+        w.qbits = 4; w.gs = 64;                      /* int4 group-scaled */
+    } else {
+        fprintf(stderr, "[dense] %s: geometria non riconosciuta nel container, uso il bf16\n", name);
+        return 0;                                    /* dubbio -> percorso originale */
+    }
+    w.q4 = malloc(t->nbytes); if (!w.q4) { fprintf(stderr, "OOM %s\n", name); exit(1); }
+    pread_all(t->fd, w.q4, t->nbytes, t->off);
+    w.qn = t->nbytes;
+    w.qs = falloc(s->numel);
+    st_read_f32(&m->Sq, qn, w.qs, 0);
+    *out = w;
+    m->q_loaded++; m->q_bytes += t->nbytes + (int64_t)s->numel * 4;
+    return 1;
+}
+
 static Wt load_w(Model *m, const char *name, int gpu_ok) {
     Wt w = {0};
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (load_w_quant(m, name, t->numel, &w)) return w;
     if (t->dtype == 0) {
         w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
         pread_all(t->fd, w.h, t->nbytes, t->off);
@@ -500,12 +607,40 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
     }
     return w;
 }
-static Wt wt_off(Wt w, int64_t off) {
-    Wt r = { w.f ? w.f + off : NULL, w.h ? w.h + off : NULL,
-             w.dev ? (char*)w.dev + off*2 : NULL };   /* dev is always bf16 */
+/* `off` conta ELEMENTI ed e' sempre un multiplo di I (si affetta per riga: un
+ * esperto condiviso dal tensore fuso [E,R,I]), quindi I arriva dal chiamante —
+ * st_tensor non porta le shape e non voglio indovinarle. */
+static Wt wt_off_i(Wt w, int64_t off, int I) {
+    Wt r = w;
+    r.f = w.f ? w.f + off : NULL;
+    r.h = w.h ? w.h + off : NULL;
+    r.dev = w.dev ? (char*)w.dev + off*2 : NULL;    /* dev is always bf16 */
+    if (w.q4) {
+        int64_t row = off / I;
+        if (w.qbits == 8) { r.q4 = w.q4 + off;        r.qs = w.qs + row; r.qn = w.qn - off; }
+        else              { r.q4 = w.q4 + off / 2;    r.qs = w.qs + row * ((I + w.gs - 1) / w.gs);
+                            r.qn = w.qn - off / 2; }
+    }
     return r;
 }
+/* dequantizza UNA riga (int4-gs64: nibble +8, low = colonna pari, scala ogni gs) */
+static void wt_deq_row(Wt w, int64_t row, float *out, int I) {
+    if (w.qbits == 8) {
+        const int8_t *q = (const int8_t*)w.q4 + row * I; float s = w.qs[row];
+        for (int i = 0; i < I; i++) out[i] = (float)q[i] * s;
+        return;
+    }
+    int ng = (I + w.gs - 1) / w.gs;
+    const uint8_t *p = w.q4 + row * ((I + 1) / 2);
+    const float *sc = w.qs + row * ng;
+    for (int i = 0; i < I; i++) {
+        uint8_t b = p[i >> 1];
+        int q = (i & 1) ? (b >> 4) : (b & 0x0F);
+        out[i] = (float)(q - 8) * sc[i / w.gs];
+    }
+}
 static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
+    if (w.q4) { wt_deq_row(w, off / n, out, n); return; }   /* n = dim di contrazione */
     if (w.f) memcpy(out, w.f + off, n * sizeof(float));
     else for (int i = 0; i < n; i++) { union { uint32_t u; float f; } v = { (uint32_t)w.h[off + i] << 16 }; out[i] = v.f; }
 }
@@ -557,6 +692,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
+    /* densa pre-quantizzata, se il container c'e' (INK_DENSE_Q4=0 la ignora).
+     * Sta in una SOTTOCARTELLA apposta: nella dir dello snapshot i nomi tensore
+     * andrebbero in collisione con i bf16 originali, che restano intatti. */
+    {   char qd[2100]; snprintf(qd, sizeof(qd), "%s/dense-int4g64", snap);
+        const char *off = getenv("INK_DENSE_Q4");
+        struct stat qs;
+        if (!(off && *off == '0') && stat(qd, &qs) == 0 && S_ISDIR(qs.st_mode)) {
+            st_init(&m->Sq, qd);
+            if (m->Sq.n > 0) { m->has_q = 1;
+                fprintf(stderr, "[dense] container int4-gs64: %s (%d tensori)\n", qd, m->Sq.n); }
+        }
+    }
     Cfg *c = &m->c;
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
@@ -642,8 +789,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
     /* usage counters; seeded from a previous run's history when present */
-    m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
-    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
+    rt_init("inkling", c->n_layers, E);
+    for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
+    rt_drop_row(c->n_layers);                     /* inkling has no MTP row */
+    m->eusage = rt_counts_all();                  /* alias: the bump sites stay as they are */
     m->dense_load_s = now_s() - t0;
 }
 
@@ -744,14 +893,10 @@ static void pins_load(Model *m, const char *snap) {
     }
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
-    FILE *f = fopen(up, "rb");
-    if (!f) return;
-    uint32_t hdr[3];
-    if (fread(hdr, 4, 3, f) != 3 || hdr[0] != 0x31554B49u ||
-        (int)hdr[1] != c->n_layers || (int)hdr[2] != E) {
-        fprintf(stderr, "[pin] %s: not an inkling usage file, ignoring\n", up);
-        fclose(f); return;
-    }
+    /* Reads both layouts: the IKU1 block every previous inkling wrote, and the shared
+     * text format. Dimension and identity checks moved into the reader, which refuses
+     * by name instead of with a generic 'ignoring'. Counts land straight in eusage. */
+    if (rt_load(up) <= 0) return;
     int cap = m->cache[0].cap;
     /* default: pin half the cap. Measured on the 975B: cap/4 (19/layer) gave
      * 83.6% hit / 0.32 tok/s; 40/layer gave 95.6% / 0.80 tok/s — decode fills
@@ -759,14 +904,12 @@ static void pins_load(Model *m, const char *snap) {
     m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/2;
     if (m->npin > cap - 8) m->npin = cap - 8;
     if (m->npin < 0) m->npin = 0;
-    uint32_t *tmp = malloc((size_t)E * 4);
     Slot **ps = malloc((size_t)c->n_layers * m->npin * sizeof(Slot*));
     int *pl = malloc((size_t)c->n_layers * m->npin * sizeof(int));
     int np = 0;
     for (int i = 0; i < c->n_layers; i++) {
-        if (fread(tmp, 4, E, f) != (size_t)E) break;
-        if (!c->sparse[i] || !m->npin) continue;
-        memcpy(m->eusage[i], tmp, (size_t)E * 4);          /* seed the ranking */
+        const uint32_t *tmp = rt_counts(i);                /* seeded by rt_load above */
+        if (!tmp || !c->sparse[i] || !m->npin) continue;
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
@@ -780,7 +923,6 @@ static void pins_load(Model *m, const char *snap) {
             ps[np] = s; pl[np] = i; np++;
         }
     }
-    fclose(f);
     if (np) {
         double t0 = now_s();
         #pragma omp parallel for schedule(dynamic,1)
@@ -788,7 +930,7 @@ static void pins_load(Model *m, const char *snap) {
         fprintf(stderr, "[pin] %d experts pinned (%d/layer) from %s in %.1fs\n",
                 np, m->npin, up, now_s()-t0);
     }
-    free(tmp); free(ps); free(pl);
+    free(ps); free(pl);
 }
 
 /* usage snapshot: rewritten after every generation run (same contract as
@@ -796,24 +938,18 @@ static void pins_load(Model *m, const char *snap) {
  * USAGE_SAVE=0 skips the rewrite (e.g. benchmark loops that would skew the
  * ranking); PIN=off also implies no save (that run never seeded counts). */
 static int usage_save(Model *m, const char *snap) {
-    Cfg *c = &m->c; int E = c->n_experts;
-    char up[2048], tp[2060];
+    (void)m;                              /* the counters live in route_trace.h now */
+    char up[2048];
     const char *env = getenv("PIN");
     const char *sv = getenv("USAGE_SAVE");
     if (sv && *sv == '0') return 0;
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
-    snprintf(tp, sizeof(tp), "%s.tmp", up);
-    FILE *f = fopen(tp, "wb");
-    if (!f) return 0;
-    uint32_t hdr[3] = { 0x31554B49u, (uint32_t)c->n_layers, (uint32_t)E };
-    fwrite(hdr, 4, 3, f);
-    uint32_t *zero = calloc(E, 4);
-    for (int i = 0; i < c->n_layers; i++)
-        fwrite(m->eusage[i] ? m->eusage[i] : zero, 4, E, f);
-    free(zero); fclose(f);
-    return rename(tp, up) == 0;
+    /* One format for every engine now: sparse text with the dimension and identity
+     * header. The IKU1 block this replaced is still readable on load, so a history
+     * written by an older inkling keeps working and is rewritten in the new form. */
+    return rt_save(up, 1);
 }
 
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
@@ -920,6 +1056,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     matmul(logits, x, l->router, S, D, ET);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     int   *idx  = malloc((size_t)S*K*sizeof(int));
+    int   *keff = malloc((size_t)S*sizeof(int));      /* routed effettivi per token (TOPP) */
     float *wgt  = malloc((size_t)S*(K+ns)*sizeof(float));
     Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
@@ -945,8 +1082,53 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[si[kk]]); sum += w[kk]; }
         for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);    sum += w[K+j]; }
         for (int kk = 0; kk < K+ns; kk++) w[kk] *= c->route_scale * l->rgs / sum;
-        for (int kk = 0; kk < K; kk++) {
-            int eid = si[kk];
+        /* TOPP: tieni i routed fino al peso cumulato p, scarta la coda. Stessa
+         * semantica di colibri.c (g_topp) e kimi_k3.c (K3_TOPP): NON rinormalizza,
+         * il peso scartato semplicemente non contribuisce. E' una leva di QUALITA'
+         * — cambia il calcolo — quindi opt-in e annunciata all'avvio.
+         * Su questo motore vale piu' che sugli altri: Inkling e' limitato dal disco
+         * (topk=6 x 28 MB di esperto x 66 layer ~ 11 GB letti per token), e ogni
+         * esperto scartato e' un esperto NON letto.
+         * L'ordine di si[] segue sigmoid(logit)+bias mentre il peso e' sigmoid(logit)
+         * senza bias, quindi i pesi non sono garantiti decrescenti: si riordina la
+         * coppia (peso, id) prima di tagliare, come fa colibri.c. */
+        keff[s] = K;
+        m->ereq += K;
+        if (g_topp > 0.f && g_topp < 1.f) {
+            for (int a = 1; a < K; a++) { int ii = si[a]; float ww = w[a]; int b = a-1;
+                while (b >= 0 && w[b] < ww) { w[b+1] = w[b]; si[b+1] = si[b]; b--; }
+                w[b+1] = ww; si[b+1] = ii; }
+            float tot = 1e-20f; for (int kk = 0; kk < K; kk++) tot += w[kk];
+            float cum = 0;
+            for (int kk = 0; kk < K; kk++) { cum += w[kk];
+                if (cum >= g_topp * tot) { keff[s] = kk+1; break; } }
+        }
+        m->euse += keff[s];
+    }
+    /* Il ciclo sotto ACQUISISCE uno slot per ogni coppia (token, esperto) e ne tiene
+     * il puntatore fino al calcolo. slot_acquire evince l'LRU quando la cache e'
+     * piena — anche uno slot gia' consegnato in QUESTA chiamata: il puntatore resta
+     * valido ma lo slot ora contiene un ALTRO esperto, e il modello calcola con i
+     * pesi sbagliati. In silenzio: niente crash, solo output incoerente. Acquisire
+     * tutte le S*K coppie in una volta pretendeva quindi una cache capace di tenere
+     * tutti gli esperti distinti del batch (18 token x topk 6 = fino a 108 slot per
+     * layer), e sotto quella soglia il modello sembrava rotto.
+     * Fix: si lavora a GIRI di al piu' `cap` coppie — acquisisci, riempi, calcola e
+     * accumula — cosi' nessuno slot puo' essere evinto mentre serve. L'output MoE e'
+     * una somma pesata, quindi accumulare a giri da' lo stesso risultato di una
+     * passata sola, e la cache puo' scendere fino a 1 slot per layer (piu' letture
+     * da disco, ma memoria proporzionale a `cap` invece che al batch). */
+    int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
+    float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
+    int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    int64_t npair = (int64_t)S*K;
+    for (int64_t base = 0; base < npair; base += cap) {
+        int64_t end = base + cap < npair ? base + cap : npair;
+        nfill = 0;
+        for (int64_t t = base; t < end; t++) {           /* acquisizione del giro */
+            int s = (int)(t / K), kk = (int)(t % K);
+            if (kk >= keff[s]) { use[t - base] = NULL; continue; }   /* scartato da TOPP */
+            int eid = idx[(int64_t)s*K + kk];
             if (m->eusage[layer]) m->eusage[layer][eid]++;
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
@@ -955,27 +1137,22 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 e = slot_acquire(m, layer, eid);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
-            use[(int64_t)s*K + kk] = e;
+            use[t - base] = e;
         }
-    }
-    /* pass 2: one parallel burst for every miss in this layer call */
-    if (nfill) {
-        double tf = now_s();
-        #pragma omp parallel for schedule(dynamic,1)
-        for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
-        m->t_fill += now_s() - tf;
-    }
-    /* pass 3: compute. gate+up run as ONE matmul over the fused 2I rows —
-     * halves the number of (expensive to open) parallel regions per expert */
-    float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
-    int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        float *w = wgt + (int64_t)s*(K+ns);
+        if (nfill) {                                      /* riempimento in parallelo */
+            double tf = now_s();
+            #pragma omp parallel for schedule(dynamic,1)
+            for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+            m->t_fill += now_s() - tf;
+        }
         double te = now_s();
-        for (int kk = 0; kk < K; kk++) {
-            Slot *e = use[(int64_t)s*K + kk];
+        for (int64_t t = base; t < end; t++) {            /* calcolo + accumulo */
+            int s = (int)(t / K), kk = (int)(t % K);
+            Slot *e = use[t - base];
+            if (!e) continue;                              /* scartato da TOPP */
+            const float *xs = x + (int64_t)s*D;
+            float *os = out + (int64_t)s*D;
+            float *w = wgt + (int64_t)s*(K+ns);
             if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
@@ -997,18 +1174,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
-        double ts = now_s(); m->t_expert += ts - te;
-        /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
+        m->t_expert += now_s() - te;
+    }
+    /* shared experts: una volta per token, fuori dai giri (non usano la cache) */
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s*D;
+        float *os = out + (int64_t)s*D;
+        float *w = wgt + (int64_t)s*(K+ns);
+        double ts = now_s();
+        /* gamma inside (before down_proj is linear, so applied at the end) */
         for (int j = 0; j < ns; j++) {
-            matmul_w(g, xs, wt_off(l->sh_g, (int64_t)j*I*D), 1, D, I);
-            matmul_w(u, xs, wt_off(l->sh_u, (int64_t)j*I*D), 1, D, I);
+            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
+            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
             for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul_w(hh, g, wt_off(l->sh_d, (int64_t)j*D*I), 1, I, D);
+            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
             for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
         }
         m->t_shared += now_s() - ts;
     }
-    free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
+    free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
     free(g); free(hh);              /* u aliases g+I */
 }
 
@@ -1199,9 +1383,9 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
 static int stdin_readable(void) {
-    fd_set r; struct timeval tv = {0, 0};
-    FD_ZERO(&r); FD_SET(0, &r);
-    return select(1, &r, NULL, NULL, &tv) > 0;
+    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
+     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
+    return coli_stdin_readable();
 }
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
@@ -1345,6 +1529,7 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T) {
+    coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
@@ -1398,16 +1583,43 @@ int main(int argc, char **argv) {
 #endif  /* !COLI_CUDA */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
+    if (g_topp > 0.f && g_topp < 1.f)
+        fprintf(stderr, "[TOPP] %.2f: routed experts kept to cumulative weight — "
+                "fewer experts read per token, but the routing is TRIMMED "
+                "(quality lever, A/B it before trusting the speed-up)\n", g_topp);
+    else if (g_topp != 0.f) {
+        fprintf(stderr, "TOPP must be in (0,1); %.3f ignored\n", g_topp); g_topp = 0.f;
+    }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
-    int cap = -1, bits = 0, n_new = 256, npos = 0;
+    int cap = -1, bits = 0, n_new = 256, npos = 0, chat = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
+    }
+    /* --chat: avvolge il prompt nel template di Inkling (sottoinsieme testuale di
+     * chat_template.jinja, lo stesso che openai_server.py rende in render_chat_inkling):
+     * token di ruolo + <|content_text|>, <|end_message|> a chiudere, il livello di
+     * thinking come messaggio di sistema, e <|message_model|> come prompt di
+     * generazione. Senza template un modello instruct riceve testo fuori
+     * distribuzione. THINK=<0..1> alza lo sforzo di ragionamento (default 0). */
+    char *chat_buf = NULL;
+    if (chat && prompt) {
+        const char *eff = getenv("THINK") ? getenv("THINK") : "0";
+        size_t need = strlen(prompt) + strlen(eff) + 256;
+        chat_buf = malloc(need);
+        if (!chat_buf) { fprintf(stderr, "OOM chat template\n"); return 1; }
+        snprintf(chat_buf, need,
+                 "<|message_user|><|content_text|>%s<|end_message|>"
+                 "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>"
+                 "<|message_model|>", prompt, eff);
+        prompt = chat_buf;
     }
     if (cap < 0) cap = (prompt || pfile) ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
@@ -1450,6 +1662,13 @@ int main(int argc, char **argv) {
                tot ? 100.0*m.hits/tot : 0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss,
                saved ? " | usage history saved" : "");
+        /* quanto ha tagliato TOPP, in modo che la leva sia misurabile e non creduta */
+        if (g_topp > 0.f && m.ereq)
+            printf("[topp] %.2f: %llu/%llu routed used (%.1f%% trimmed, "
+                   "%.2f experts/token avg)\n", g_topp,
+                   (unsigned long long)m.euse, (unsigned long long)m.ereq,
+                   100.0*(double)(m.ereq-m.euse)/(double)m.ereq,
+                   (double)m.euse/((double)m.ereq/(double)m.c.topk));
         return 0;
     }
 

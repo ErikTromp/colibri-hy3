@@ -59,8 +59,10 @@
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -69,6 +71,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#endif
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
@@ -85,6 +90,12 @@ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pr
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
+/* #379: set in main() when the F_NOCACHE storage probe (coli_ssd_probe_cached,
+ * defined below) measured the model volume as fast (Metal + darwin only).
+ * Stays 0 on every other platform/build, so every read of it below is a no-op
+ * there -- see coli_resolve_cap() and cap_for_ram()'s CAP_RAISE default. */
+static int g_ssd_fast;
+
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
@@ -100,7 +111,14 @@ typedef struct {
  *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64.
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64,
+ * 6 E8/IQ3 lattice, 8 FP8-E4M3 (native, passthrough -- see quant.h). fmt=7 is
+ * MXFP4 (Kimi K3 Vulkan tier, #676/#705, backend_vulkan.c) -- claimed upstream,
+ * never a QT format here, deliberately absent from this struct's dispatch.
+ * fmt=8 is a PUBLIC ordinal: it developed under the PRIVATE ORDINAL BLOCK
+ * convention below as fmt=100, graduated to fmt=7 when the maintainer assigned
+ * that ordinal on #524, and was renumbered to 8 after #705 merged claiming 7
+ * for MXFP4 while this PR was still open (see the convention comment below).
  * q4 ospita int4/int2/int3 packed. fmt=4 (grouped int4, #242): per-row nibbles + one f32
  * scale per group of `gs` inputs (s has O*ceil(I/gs) entries).
  * fmt=6 (E8/IQ3 lattice, #452): 98B per 256 weights = 3.0625 bits/weight, grid
@@ -109,11 +127,64 @@ typedef struct {
  * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
  * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
  * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
- * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
+ * bits/weight effective — the quality/size sweet spot measured in the #132 ablation.
+ * fmt=8 (native FP8-e4m3 passthrough, resident/quality-core tier -- see quant.h's
+ * FP8_BLOCK/e4m3_decode/matmul_fp8): q8 holds O*I raw e4m3 bytes, ONE byte per weight,
+ * byte-identical layout to fmt=1's weight bytes (q4 is unused/NULL, same as fmt=1) --
+ * disambiguated from fmt=1 (and, at small [O,I], from fmt=6 -- see below) purely by
+ * scale geometry, see qt_resolve_fmt's "THE DESIGN LANDMINE" comment further down.
+ * s holds ONE f32 scale PER 128x128 BLOCK, ceil(O/128)*ceil(I/128) entries total
+ * (row-major: block-row-major then block-col), NOT O and NOT O*ceil(I/gs) --
+ * qt_bytes()/qt_scale_bytes() below are the authoritative byte-count formulas. The
+ * scale ENCODING is itself a declared PROPERTY of this format, not a hardcoded
+ * constant -- f32 (4 bytes/block, what's above) is the value THIS build
+ * implements; qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment
+ * documents why (a DeepSeek-V4 checkpoint ships this identical weight geometry
+ * with a UE8M0 scale encoding instead) and how an unimplemented encoding is
+ * recognized and refused by name rather than silently misread.
+ * gs is unused (0) for fmt=8, same as fmt 1/2/3. */
+/* ---- PRIVATE ORDINAL BLOCK CONVENTION ------------------------------------
+ * fmt values 0-8 are upstream-assigned, public, stable ordinals -- do not
+ * reuse or renumber them (fmt=8 is the newest member -- see "renumbered"
+ * above). fmt values 100+ remain this repo's PRIVATE/EXPERIMENTAL
+ * block for any OTHER in-flight format proposal: ordinals a branch mints for
+ * itself during development so it can't collide with a number upstream claims
+ * out from under it. That collision has now bitten this SAME format twice:
+ * first when #465's E8/IQ3 proposal claimed its original private number,
+ * fmt=6, upstream while this branch was still developing against it (forcing
+ * the re-mint to fmt=100 -- see upstream_contribution/FORMATS_registry_draft.md
+ * for the incident that prompted the rule); and again when #705 merged MXFP4
+ * as fmt=7 while this PR sat open already holding the maintainer-assigned
+ * ordinal 7 from #524, forcing the 7 -> 8 renumber recorded here. Ordinals
+ * are only settled by MERGE into dev, not by assignment on an open PR --
+ * docs/FORMATS.md (PR 2 of this pair) is the registry meant to make the
+ * next claim visible before it lands.
+ *
+ * A PRIVATE-BLOCK ordinal is an internal enum value only -- qt_resolve_fmt
+ * (below) infers format purely from byte arithmetic; the container on disk
+ * carries no format ordinal at all. (A self-describing container stamp that
+ * would persist a format's NAME, not its ordinal, is a follow-up proposal --
+ * see qt_resolve_fmt's own note on where that plumbing would attach -- not
+ * present in this build.) Nothing outside this binary's own compiled code
+ * ever observes a 100+ number, so renumbering one later (e.g. when a format
+ * is upstreamed and assigned a real public ordinal, as has now happened twice
+ * for fmt=8) is a pure find-and-replace with zero on-disk or cross-version
+ * compatibility impact.
+ *
+ * Rule for adding a new format to this branch or a future one: claim the next
+ * unused 100+ integer, never a number already claimed upstream (check dev AND
+ * open PRs before picking one -- dev alone was not enough to prevent either of
+ * fmt=8's two renumbers) or by another in-flight private format. Never ship a
+ * 100+ ordinal as a public default/committed-upstream value -- the real
+ * ordinal is only settled when the format MERGES into dev, exactly as fmt=8's
+ * two renumbers demonstrate. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
+#endif
+#ifdef COLI_VULKAN
+    ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
@@ -131,7 +202,90 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
     if(t->fmt==6)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
+    if(t->fmt==8){ /* fp8-e4m3 passthrough: O*I raw e4m3 bytes (n, byte-identical layout
+                    * to fmt=1's weight bytes) + one f32 scale per 128x128 block
+                    * (FP8_BLOCK in quant.h, included below qt_bytes -- keep the
+                    * arithmetic literal here, same discipline as fmt=5's comment
+                    * above). Missing this branch would fall through to the fmt=2
+                    * default below (packed-nibble formula, ~half the real weight
+                    * bytes) and undercount a resident fp8 tensor's byte footprint --
+                    * feeds AUTOPIN/RAM-budget math, so this branch is load-bearing
+                    * from day one, not a later fix (contrast fmt=6 above, upstream's
+                    * own #452 review round 1 caught this exact bug shape for E8). */
+        int64_t nblkO=((int64_t)t->O+127)/128, nblkI=((int64_t)t->I+127)/128;
+        return n + nblkO*nblkI*4; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
+}
+/* scale-array byte count only, format-aware -- split out of qt_bytes() because
+ * qt_wire_mmap/qt_unwire_mmap mlock the weight and scale ranges as TWO SEPARATE
+ * regions (separate allocations, not one contiguous buffer: qt_from_disk always
+ * qalloc's t->q8/t->q4 and t->s independently) and need the scale byte count on
+ * its own to split qt_bytes(t) into a weight half and a scale half. Hardcoding
+ * scale_b=O*4 at those two call sites -- i.e. assuming PER-ROW scale for every
+ * format -- is right for fmt 0/1/2/3 but wrong for fmt=4 (grouped,
+ * O*ceil(I/gs) scales), fmt=5 (int3-g64, O*ceil(I/64) scales), fmt=6 (E8/IQ3,
+ * a FIXED 4-byte tag, see below), and fmt=8 (per-128x128-block,
+ * ceil(O/128)*ceil(I/128) scales): any tensor in one of those four formats
+ * reaching qt_wire_mmap/qt_unwire_mmap would mlock/munlock the wrong byte
+ * ranges on BOTH halves (weight_b = qt_bytes(t)-scale_b shifts too). This is
+ * not purely a dormant fmt=8-only fix: fmt=4 is the routed-expert
+ * "int4-g64" format (qt_resolve_fmt assigns it to ESlot g/u/d the same as
+ * any other tensor, see expert_load_impl), so any COLI_MMAP +
+ * mem_should_wire() session pinning fmt=4 experts mlocks the wrong ranges
+ * without this. UNVERIFIED at runtime (no model run performed -- static/
+ * arithmetic fix only, see the report).
+ *
+ * REVIEW FINDING (maintainer, #528): this function existed correctly (the
+ * fmt=8 branch below is right) but neither qt_wire_mmap nor qt_unwire_mmap
+ * actually called it -- both independently hardcoded scale_b=(int64_t)t->O*4
+ * inline, so the "fix" this comment describes was never applied at either
+ * call site, and the resulting -Wunused-function warning on this then-dead
+ * function was suppressed by -Wno-unused-function in CFLAGS rather than
+ * caught. qt_wire_split() below is now the ONE place both call sites get
+ * weight_b/scale_b from -- see it and its call sites for the actual fix.
+ *
+ * FIX ROUND (audit finding, SHOULD-FIX): this comment used to ALSO claim
+ * fmt=6 (E8/IQ3) was "deliberately NOT covered" because "t->fmt==6 tensors
+ * never reach qt_wire_mmap/qt_unwire_mmap's mlock path in this build
+ * (int3-g64/E8 stay CPU-side, see qt_cuda_upload -- MMAP wiring is a
+ * CUDA/Metal-adjacent memory concern this build doesn't extend to them)" --
+ * that conflated two UNRELATED mechanisms: qt_cuda_upload decides GPU-VRAM
+ * upload eligibility (fmt=5/6 genuinely excluded there, no CUDA kernel for
+ * either -- see qt_cuda_upload's own `fmt==5||fmt==6` guard), while
+ * qt_wire_mmap/qt_unwire_mmap mlock HOST RAM pages under COLI_MMAP, an
+ * entirely CPU-side concern. Staying CPU-side (no CUDA kernel) is exactly
+ * what makes a tensor a CANDIDATE for RAM wiring, not exempt from it.
+ * expert_load_impl assigns fmt=6 to ESlot g/u/d exactly like fmt=4/5 (same
+ * qt_resolve_fmt call site, three lines above the fmt=4 comment), and
+ * pin_wire calls qt_wire_mmap/qt_unwire_mmap on every pinned ESlot's g/u/d
+ * unconditionally, with no format filter -- so a pinned E8/IQ3 expert under
+ * COLI_MMAP + mem_should_wire() DOES reach here. Before the fmt=6 branch
+ * below, the O*4 fallback would have returned a scale_b wildly larger than
+ * the tensor's real scale allocation (a FIXED 4 bytes, qsalloc(1) in
+ * qt_from_disk's fmt==6 branch -- confirmed against qt_bytes' own `+4`
+ * literal and qt_from_disk's st_read_f32_cap cardinality switch, both of
+ * which already treat fmt=6's scale as exactly 1 float, not O floats), then
+ * mlock/munlock'd that many bytes starting at t->s -- past the end of a
+ * 4-byte allocation. UNVERIFIED at runtime (same static/arithmetic-only
+ * caveat as the fmt=4/5/8 fix above -- no model run performed). */
+static int64_t qt_scale_bytes(const QT *t){
+    if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
+    if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
+    if(t->fmt==6) return 4;   /* E8/IQ3: FIXED 4-byte tag (qsalloc(1)), not O*4 -- see this
+                              * function's own header comment for why this is reachable and
+                              * load-bearing, not dead code. */
+    if(t->fmt==8){ int64_t nblkO=((int64_t)t->O+127)/128, nblkI=((int64_t)t->I+127)/128; return nblkO*nblkI*4; }
+    return (int64_t)t->O*4;   /* fmt 0 (t->s NULL, guarded by callers)/1/2/3: per-row. */
+}
+/* qt_wire_mmap/qt_unwire_mmap's shared weight/scale byte-range split -- the ONE
+ * place that computes it, so the two sites can never independently drift back
+ * to a hardcoded per-row-only formula (that drift -- qt_scale_bytes() existing
+ * but unused at both sites -- was the maintainer's #528 finding, see the
+ * comment above qt_scale_bytes()). Directly unit-tested (test_fp8_load.c) so a
+ * regression here, not just at a call site, fails the suite. */
+static void qt_wire_split(const QT *t, int64_t *weight_b, int64_t *scale_b){
+    *scale_b = qt_scale_bytes(t);
+    *weight_b = qt_bytes(t) - *scale_b;
 }
 
 typedef struct {
@@ -196,6 +350,9 @@ typedef struct {
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
+#ifdef COLI_VULKAN
+    int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
+#endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -237,6 +394,7 @@ typedef struct {
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
     uint64_t hit_pin, hit_ecache;                /* split di hits per tier (#336): pin vs LRU ecache */
+    uint64_t hit_vk;                             /* VK VRAM tier hits (registry-served, no RAM load) */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
@@ -283,6 +441,59 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
+#ifdef COLI_VULKAN
+static int g_vulkan;          /* COLI_VULKAN=1: compute routed experts on the Vulkan tier */
+static int g_vk_budget;       /* COLI_VK_EXPERTS: pinned VK expert tier size (0 = tier off) */
+static int g_vk_resident;     /* how many experts currently VK-resident */
+/* Pinned VK expert tier: top heat-ranked routed experts uploaded ONCE at startup into a
+ * registry keyed by (layer,eid), decoupled from the RAM cache slots — stable residency
+ * (no LRU churn, no uploads on the decode critical path), mirroring the HIP VRAM tier. */
+static struct ColiVkTensor **g_vk_reg;   /* [(layer*E+eid)*3 + {gate,up,down}] */
+static int g_vk_reg_n, g_vk_reg_E;
+static inline struct ColiVkTensor **vk_reg_at(int layer,int eid){
+    return g_vk_reg ? &g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] : NULL;
+}
+static int g_vk_reg_NL;                  /* registry layer bound (n_layers, MTP excluded) */
+/* Will the VK tier serve this expert at decode? (prefetch/pilot can skip its I/O.) */
+static inline int vk_reg_served(int layer,int eid){
+    if(!g_vk_reg || layer<0 || layer>=g_vk_reg_NL || eid<0 || eid>=g_vk_reg_E) return 0;
+    return g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] != NULL;
+}
+static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
+                               * projections + shared expert) on Vulkan too */
+static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
+static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
+/* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
+ * OR a directory containing it; unset, look alongside the binary (<exedir>/shaders/, the
+ * build layout) before the historical CWD-relative fallback, so launching from outside c/
+ * works. The other shaders load as siblings of the returned path (backend derive_*). */
+static const char *vk_resolve_spv(char *buf, size_t n){
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if(env && *env){
+        if(!stat(env,&st) && S_ISDIR(st.st_mode)){ snprintf(buf,n,"%s/qmatmul.spv",env); return buf; }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n-1);
+    if(k > 0){
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if(sl && (size_t)(sl+1-buf) + sizeof("shaders/qmatmul.spv") <= n){
+            strcpy(sl+1, "shaders/qmatmul.spv");
+            if(!stat(buf,&st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
+/* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
+ * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
+static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;
+static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_nvk2, g_vkb_ncpu;
+static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
+                               * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
+#endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -290,16 +501,69 @@ static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
+static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
 }
+/* #687: a resident tensor that fails to upload is disabled PERMANENTLY and silently
+ * falls back to CPU. The per-tensor line below is easy to lose in a busy log, and the
+ * end state -- GPU fully allocated, ~0% useful -- reads as healthy. Count them and say
+ * it once, loudly, naming the knob that actually fixes it. */
+static int g_cuda_disabled_n;
+static void cuda_disabled_note(void){
+    enum { CUDA_DISABLED_LOUD_AT = 8 };
+    if(++g_cuda_disabled_n != CUDA_DISABLED_LOUD_AT) return;
+    fprintf(stderr,
+        "[CUDA] ***** %d resident tensors have been disabled and moved to CPU *****\n"
+        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is now\n"
+        "[CUDA] on CPU: this run will be at or below CPU speed while the card stays\n"
+        "[CUDA] allocated. The usual cause is the expert tier claiming all VRAM and\n"
+        "[CUDA] leaving nothing for the lazily-uploaded resident tensors.\n"
+        "[CUDA] Fix: set an explicit CUDA_EXPERT_GB below the auto value (leave room\n"
+        "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
+        CUDA_DISABLED_LOUD_AT);
+}
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
+#endif
+#ifdef COLI_VULKAN
+/* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
+static void qt_vk_reset(QT *t){
+    if(t->vk){ coli_vk_tensor_free(t->vk); t->vk=NULL; }
+    t->vk_eligible=0;
+}
+/* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
+ * int8/int4/int3-g64 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU
+ * matmul) when VK-dense is off, the format is unsupported, or upload/compute fails. */
+#define VK_FMT_OK(t) ((t)->fmt==1||(t)->fmt==2||(t)->fmt==5||((t)->fmt==4&&(t)->gs>=8&&(t)->gs%8==0))
+static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
+    if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
+    const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
+}
+/* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
+static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
+    if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I) return 0;
+    const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
+    const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
+    return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
+                               &b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
+}
+#endif
+#ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
+    if(t->fmt==8) return 0;   /* fp8-e4m3 passthrough: no CUDA kernel yet either (matches the
+                               * fmt=5/6 idiom above; matmul_qt_ex's own caller-side fmt exclusion
+                               * already keeps this from being reached with cuda_eligible tensors
+                               * in the exact-kernel path, but row_bytes()/weight_at() in
+                               * backend_cuda.cu have no fmt=8 case either -- explicit early-
+                               * return here so a future caller doesn't have to rediscover that by
+                               * tracing through to the CUDA source. UNVERIFIED at runtime: no CUDA
+                               * toolchain on this macOS build host to compile-check. */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -309,6 +573,12 @@ static int qt_cuda_upload(QT *t){
         return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
+#ifdef COLI_ANS
+static int qt_cuda_upload_compressed(QT *t){
+    if(t->fmt!=2) return 0;
+    return coli_cuda_tensor_upload_compressed(&t->cuda,t->q4,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+#endif
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
@@ -317,21 +587,26 @@ static int qt_cuda_update(QT *t){
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
-    fprintf(stderr,COLI_ACCEL_TAG " resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    /* #687: say it again at the end -- by now the per-tensor lines are thousands of
+     * log lines back, and this is the number that explains a CPU-speed "GPU" run. */
+    if(g_cuda_disabled_n) fprintf(stderr,
+        "[CUDA] %d tensors ran on CPU after failed uploads: this run did NOT use the GPU for "
+        "them. Lower CUDA_EXPERT_GB (#687).\n", g_cuda_disabled_n);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
-        fprintf(stderr,COLI_ACCEL_TAG "   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+        fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
     }
     uint64_t calls=0,experts=0,rows=0; double h2d=0,kernel=0,d2h=0;
     coli_cuda_group_stats(&calls,&experts,&rows,&h2d,&kernel,&d2h);
-    if(calls) fprintf(stderr,COLI_ACCEL_TAG " expert groups: %llu call, %llu expert, %llu righe "
+    if(calls) fprintf(stderr,"[CUDA] expert groups: %llu call, %llu expert, %llu righe "
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
-        COLI_ACCEL_TAG " expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+        "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
-        COLI_ACCEL_TAG " overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
+        "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
 }
 static int parse_cuda_devices(const char *list, int *out){
@@ -572,19 +847,34 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
-    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+    /* fmt=8 (fp8 passthrough) deliberately absent from this allowlist, same as fmt=5/6:
+     * the S>=g_metal_gemm_min batched prefill GEMM path (coli_metal_gemm) only knows
+     * fmt 1/2/4 in this build, so it fails CLOSED to the CPU branch below (matmul_fp8)
+     * rather than being silently misread. coli_metal_gemm() also carries its own
+     * internal fmt!=1&&fmt!=2&&fmt!=4 guard, so this is belt-and-braces. */
+    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
+        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
+    /* fmt=8 excluded exactly like fmt=5/6: the CUDA backend's row_bytes()/weight_at()
+     * (backend_cuda.cu) have no case for it and fall through to `return 0` / undefined
+     * weight_at() behavior. row_bytes()==0 already makes coli_cuda_tensor_upload_g
+     * refuse (defensive fail-closed), but that path is reached only after paying an
+     * upload attempt and printing a "disabled after an error" message every load;
+     * excluding it here up front is the same fmt=5/6 idiom, silent and immediate.
+     * UNVERIFIED on this build (no CUDA toolchain on macOS to compile-check; traced
+     * from backend_cuda.cu source only). */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=8 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
-        fprintf(stderr,COLI_ACCEL_TAG " tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-            w->O,w->I,w->cuda_device);
+        if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+                w->O,w->I,w->cuda_device);
+        cuda_disabled_note();
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -602,6 +892,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else if(w->fmt==5) matmul_i3(y,x,w->q4,w->s,S,w->I,w->O);
+    else if(w->fmt==8) matmul_fp8(y,x,(const uint8_t*)w->q8,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
@@ -631,6 +922,9 @@ static float temp_from_env(const char *coli_temp, const char *temp){
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static Abl g_abl = {0};  /* per-expert causal-ablation config (per item). mode==0 -> the three moe()
+                          * hooks below are inert and output stays byte-identical to upstream.
+                          * Set only on the ABLATE_SCORE teacher-forced path (research instrument). */
 static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded per layer across the
                                * batch-union. Reduces disk I/O on cold/low-RAM hosts by dropping the
                                * lowest-gate-weight experts from the cross-position union. MoE-Spec
@@ -659,10 +953,9 @@ static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward v
  * parte (#8). MAI un vincolo sul sampling: solo proposte, la verifica batch-union
  * decide — grammatica sbagliata = draft rifiutati, output identico.
  * GRAMMAR_DRAFT=n (default 24) limita i token forzati per forward. */
-static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
-                               * per layer — offline co-activation / coupling analysis. Zero
-                               * effect on computation; measurement only. */
-static int g_route_call=0;
+/* ROUTE_TRACE=<path> (per-position top-K routing, for offline co-activation analysis)
+ * and the .coli_usage history both live in route_trace.h now, so every engine writes
+ * the same bytes. Measurement only; zero effect on computation. */
 /* COUPLE=<.coli_pairs>: coupling-scored cross-layer prefetch. The routing of layer L
  * strongly constrains the routing of L+1/L+2 (measured: median co-activation lift 1.8x
  * over independence, p99 40x, and the structure TRANSFERS across workloads — it is a
@@ -802,11 +1095,6 @@ static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer de
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
-static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old behavior (a speculation evicts the plain LRU).
-                          * Default ON: protect a RESIDENT demand-loaded expert from a speculation only when
-                          * it is genuinely WARM (>=2 accesses) AND clearly hotter than the predicted expert
-                          * by tier_pick_lfru's 25%+4-freq hysteresis; otherwise the speculation may evict the
-                          * plain-LRU victim as before. Cache placement only -> output byte-identical. (#441, #490) */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
  *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
  *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
@@ -822,11 +1110,17 @@ static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pilot_cv=PTHREAD_COND_INITIALIZER;
 static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' entrato (per forward) */
 static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
+static int g_pilot_nw=1;                 /* PILOT_WORKERS: blocking-path pilot threads (SPMC ring). 1 = today's behaviour (byte-identical). Only the non-URING PILOT_REAL path fans out; URING already batches to QD>1. */
+static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old plain-LRU eviction (A/B). Default ON:
+                          * a speculative pilot load may evict a RESIDENT expert only if the predicted
+                          * expert is historically HOTTER than the victim (same LFRU hysteresis as
+                          * tier_pick_lfru); else it drops the speculation rather than thrash a warm
+                          * demand-loaded expert. Cache placement only -> output byte-identical. (#441/#474) */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
     else if(bits>=4){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
@@ -1017,37 +1311,314 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* FORMAT NAME <-> internal fmt-int table. The NAME is the public identity a
+ * container or a Feature Request advertises; the int on the right is this
+ * build's internal enum value (colibri.c's QT.fmt / qt_resolve_fmt's return
+ * value), never itself persisted to a container -- a container's __metadata__
+ * stamp (below) carries the NAME, never the number, matching docs/FORMATS.md's
+ * own registry. Covers every format qt_resolve_fmt can return, not just the
+ * one this branch's tool stamps: a single-entry table could only ever
+ * exercise the "unrecognized name" refusal path, never a genuine
+ * recognized-but-different-format mismatch. "e8-iq3-lattice" is this build's
+ * own placeholder name for upstream fmt=6 (#465 never stamped containers --
+ * dev has no metadata-stamp feature of its own) -- listed so
+ * qt_fmt_by_name/qt_name_by_fmt are total over every value qt_resolve_fmt can
+ * return, matching this comment's own claim; a real name for fmt=6 belongs to
+ * whoever upstreams a stamp for it. "fp8-e4m3-b128" (fmt=8) names the WEIGHT
+ * geometry only, not a specific scale encoding -- a tensor stamped
+ * "fp8-e4m3-b128" whose scale sidecar carries UE8M0 bytes still refuses (see
+ * qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment): the stamp
+ * confirms the WEIGHT format, it does not grant this build a decoder it
+ * doesn't have. */
+static const struct { const char *name; int fmt; } FMT_NAMES[] = {
+    { "f32",           0 },
+    { "int8-row",      1 },
+    { "int4-row",      2 },
+    { "int2-row",      3 },
+    { "int4-grouped",  4 },
+    { "int3-g64",      5 },
+    { "e8-iq3-lattice", 6 },
+    { "fp8-e4m3-b128", 8 },
+};
+#define N_FMT_NAMES (int)(sizeof(FMT_NAMES)/sizeof(FMT_NAMES[0]))
+
+static int qt_fmt_by_name(const char *name){
+    for(int i=0;i<N_FMT_NAMES;i++) if(!strcmp(FMT_NAMES[i].name,name)) return FMT_NAMES[i].fmt;
+    return -1;   /* unrecognized name -- never a valid qt_resolve_fmt() return value */
+}
+static const char *qt_name_by_fmt(int fmt){
+    for(int i=0;i<N_FMT_NAMES;i++) if(FMT_NAMES[i].fmt==fmt) return FMT_NAMES[i].name;
+    return NULL; /* fmt has no registered public name yet (e.g. upstream 0-5) */
+}
+
 /* SEC: risolve e VALIDA il formato quantizzato di un tensore [O,I] letto da un
  * container non fidato (mirror). L'inferenza precedente (`?1:?2:3`) cadeva su
  * int2 per QUALSIASI conteggio byte non riconosciuto: un peso troppo corto
  * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
- * si termina invece di sforare. Ritorna fmt (1/2/3/4/5) e scrive *gs. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/8) e scrive *gs.
+ * `stamped_name`: the tensor's __metadata__ format-NAME stamp if the caller
+ * looked one up (st_fmt_stamp, st.h), else NULL -- used ONLY to break a
+ * genuine byte-count collision (see THE DESIGN LANDMINE and the SECOND
+ * DESIGN LANDMINE below); every other decision in this function is
+ * byte-arithmetic alone, unchanged by whether a stamp is present. A stamp
+ * can never grant this build a decoder it doesn't have: the UE8M0
+ * scale-encoding refusals below stay refusals even when a stamp names
+ * "fp8-e4m3-b128" correctly, because that name confirms the WEIGHT format,
+ * not a scale encoding this build can read. Routed-expert callers
+ * (expert_load_impl and friends) always pass NULL: this branch's repack
+ * tool never stamps routed experts, so there is nothing for those paths to
+ * consult. */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs, const char *stamped_name){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
      * convention is kept with a single-float tag — ns==4 is the discriminator
-     * (every other format carries at least O floats of real scales). */
-    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){ *gs=0; return 6; }
+     * (every other format carries at least O floats of real scales).
+     *
+     * SECOND DESIGN LANDMINE: e8_rowbytes(I) = ceil(I/256)*98 is the constant 98
+     * for every I in (0,256], so this check's nb==O*e8_rowbytes(I) collapses to
+     * nb==O*98 -- which is ALSO fp8-e4m3-b128's raw-byte weight count (O*I) at
+     * the ONE value of I where I itself equals 98 (solving 98k==I for I in
+     * ((k-1)*256,k*256] only admits k=1, I=98). At that same I=98 a handful of
+     * fp8 scale-array shapes ALSO carry exactly ns==4 bytes, same as this
+     * check's own tag, and each is a genuine collision candidate this block
+     * must catch before the unconditional `return 6` below:
+     *   - a SINGLE-BLOCK fp8 tensor (O<=128, fp8_nblk(O)*fp8_nblk(I)==1) with
+     *     f32 block scales: ns==1*4==4.
+     *   - a FOUR-BLOCK fp8 tensor (fp8_nblk(O)*fp8_nblk(I)==4, e.g. O in
+     *     (384,512] at this I) with UE8M0 (1 byte/block) scales: ns==4*1==4 --
+     *     the SAME arithmetic collision the fmt=1-vs-fmt=8 landmine below has
+     *     with UE8M0, just against fmt=6's tag instead of fmt=1's per-row
+     *     count; see that landmine's own comment for the general shape.
+     *   - at O==1 specifically, fmt=1's own per-row tag (O*4) is also 4.
+     * A stamp naming exactly one live candidate resolves the ambiguity --
+     * EXCEPT a "fp8-e4m3-b128" stamp on the UE8M0-shaped candidate: the stamp
+     * confirms the WEIGHT format, not a scale encoding this build can decode,
+     * so that specific case still refuses (same "recognized but not
+     * implemented" discipline as the landmine below). Everything else
+     * (unstamped, or a stamp that doesn't resolve) refuses rather than let
+     * dev's own unconditional `return 6` silently misread an fp8-e4m3-b128
+     * (or, at O==1, plain int8) tensor as E8/IQ3-lattice-decoded garbage with
+     * no error. No real GLM tensor has these shapes; the discipline exists
+     * for untrusted containers. */
+    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){
+        int fp8_blk_f32_also   = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==1);
+        int fp8_blk_ue8m0_also = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==4);
+        int i8_row_also        = (nb==(int64_t)O*I) && (O==1);   /* ns==O*4==4 iff O==1 */
+        if(fp8_blk_f32_also || fp8_blk_ue8m0_also || i8_row_also){
+            int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+            if(sf==6){ *gs=0; return 6; }
+            if(sf==8 && fp8_blk_f32_also){ *gs=0; return 8; }
+            if(sf==1 && i8_row_also){ *gs=0; return 1; }
+            /* sf==8 with only fp8_blk_ue8m0_also true falls through here too --
+             * see the comment above this block. */
+            fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
+                "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
+                "container, fmt=6 collision at I=98)%s\n",
+                name,O,I,(long long)nb,(long long)ns,
+                fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=8, single block)" : "",
+                fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks, recognized-not-implemented)" : "",
+                i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "",
+                stamped_name ? " -- metadata stamp present but names a format/encoding that doesn't resolve the ambiguity"
+                             : "");
+            exit(1);
+        }
+        *gs=0; return 6;
+    }
     /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
      * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
      * are distinct, and the weight bytes — not the scale size — are the int3 tag, because
      * int3-g64 and grouped-int4-at-gs=64 carry the SAME scale cardinality O*ceil(I/64). */
     int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : (nb==exp_i3)?5 : 0;
     if(!fmt){
-        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64 layout for [%d,%d], refusing (untrusted container)\n",
+        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64/fp8 layout for [%d,%d], refusing (untrusted container)\n",
                 name,(long long)nb,O,I); exit(1); }
     *gs=0;
     if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
+    /* fmt=1 vs fmt=8 (native FP8-e4m3 passthrough): THE DESIGN LANDMINE. Weight
+     * bytes are IDENTICAL (O*I raw bytes, both matched exp_i8 above) -- fmt=1
+     * and fmt=8 can only be told apart by the SCALE array's geometry: fmt=1 is
+     * per-row (ns==O*4 bytes); fmt=8 is per-128x128-BLOCK, ns==ceil(O/128)*
+     * ceil(I/128)*4 bytes for THIS build's implemented f32 scale encoding. For
+     * most real shapes these two byte counts are distinct and the match is
+     * unambiguous. But for small O (<=128) and/or small I, ceil(O/128)*
+     * ceil(I/128) can equal O exactly (e.g. O=1,I<=128 -> 1*1=1=O; O=2,I in
+     * [129,256] -> 1*2=2=O; O=256,I in (16256,16384] -> 2*128=256=O) -- a
+     * tensor whose scale array satisfies BOTH conventions at once.
+     *
+     * REVIEW FINDING (maintainer, #528): this collision is not a theoretical
+     * corner case. GLM-5.2's own self_attn.o_proj.weight loads as
+     * [D,H*v_head] = [6144,16384]: nblkO=ceil(6144/128)=48,
+     * nblkI=ceil(16384/128)=128, nblkO*nblkI=6144==O -- a real, pre-existing,
+     * VALID int8-row o_proj tensor hits this exact byte-count collision on
+     * every GLM-5.2 checkpoint this engine has ever loaded. The general
+     * family is any int8 tensor where O==ceil(O/128)*ceil(I/128) (see the
+     * CENSUS SCAN, tools/fp8_collision_census.py, for the complete
+     * enumerated set over this repo's own containers). An earlier revision
+     * of this function refused unconditionally here -- exit(1) at load time
+     * on an ordinary, already-shipping, valid model -- which is a strictly
+     * worse failure mode than the misread it was guarding against.
+     *
+     * INVERSION, governing the UNSTAMPED case: an ambiguous shape with no
+     * resolving stamp resolves to fmt=1 -- the incumbent, already-on-disk,
+     * decodable format -- instead of refusing. This is sound because the
+     * WRITER side (tools/repack_fp8_passthrough.py's _check_geometry) now
+     * refuses to EMIT an fmt=8 container at any shape satisfying this same
+     * collision predicate: no genuine fmt=8 tensor this engine's own tooling
+     * can produce will ever reach this branch unstamped, so resolving to
+     * fmt=1 here is not a guess against a live fmt=8 candidate -- it is the
+     * only remaining candidate. THE STAMPED CASE IS UNCHANGED by this
+     * inversion: a metadata stamp present and naming exactly one of the two
+     * colliding candidates (int8-row or fp8-e4m3-b128) still resolves via
+     * that stamp through the existing TRUST-VERIFY-REFUSE path below (the
+     * maintainer verified that path is sound on #524/#529) -- a THIRD-PARTY
+     * fmt=8 container can still declare itself at this same colliding shape
+     * and be believed, exactly as before. A stamp naming anything else
+     * (unrecognized, or a format that isn't one of the two candidates) does
+     * NOT resolve the ambiguity and refuses, same as it did before this
+     * inversion -- the inversion changes ONLY what an absent stamp does here.
+     *
+     * SCALE ENCODING IS A DECLARED PROPERTY, not a hardcoded constant: f32 (4
+     * bytes/block, above) is what THIS build implements, but it is not the
+     * only encoding real fp8-e4m3-b128 weight geometry ships with. DeepSeek-V4
+     * ships the SAME weight layout (FP8 E4M3, 128x128 blocks) with UE8M0
+     * scales instead -- one byte per block, a power-of-two exponent, dtype
+     * F8_E8M0 (maintainer finding, colibri #524) -- so a fp8-e4m3-b128
+     * container's scale sidecar can legitimately be ceil(O/128)*ceil(I/128)*1
+     * bytes, not *4. That byte count is a REAL, distinct signature (never
+     * equal to the f32 block-scale count above for any O,I>=1, since one is
+     * exactly 4x the other and 4n==n only at n==0) -- recognized here rather
+     * than silently misread as a truncated or corrupt f32 scale array. This
+     * build does not implement UE8M0 decode: recognizing the signature and
+     * refusing BY NAME (rather than falling through to the generic
+     * "wrong byte count" refusal below, or worse, matching it against the
+     * wrong candidate) is the whole point -- a future decoder lands into this
+     * seam rather than a near-duplicate format. Checked for collision against
+     * every OTHER format's ns arithmetic reachable from this nb==O*I branch
+     * (fmt=1 and fmt=8-f32, both above): the byte counts are realistically
+     * distinct (nblkO*nblkI is orders of magnitude smaller than O*4 for any
+     * real GLM-sized matrix), but NOT categorically distinct -- the same
+     * small-O regime that makes the fmt=1-vs-fmt=8-f32 collision above
+     * possible also makes a fmt=1-vs-fmt=8-ue8m0 collision possible (e.g.
+     * O=1, I in (384,512]: nblkO=1, nblkI=4, ue8m0 ns=4=O*4=fmt=1's own
+     * per-row count). A stamp naming "int8-row" resolves that specific
+     * corner to fmt=1 (the stamp confirms it really is plain int8, a format
+     * this build CAN decode); a stamp naming "fp8-e4m3-b128" does NOT resolve
+     * it, for the same "recognized but not implemented" reason the clean
+     * (non-colliding) ue8m0 case below refuses regardless of any stamp.
+     * The colliding FAMILY is exactly: nb==O*I && ns==O*4 &&
+     * ceil(O/128)*ceil(I/128)==4*O (is_row && is_blk_ue8m0 below; is_blk can
+     * never co-hold since nblk==O and nblk==4*O are disjoint for O>=1).
+     * At I<=16384 (nblkI<=128) membership forces O<=32; every GLM-5.2
+     * resident/routed role has O>=576 (kv_a's kv_lora+qk_rope is the
+     * smallest -- tools/fp8_collision_census.py enumerates the roles, and
+     * the census over the real checkpoint was run in this PR's rev5 round),
+     * so no GLM-5.2 tensor is a member -- the discipline exists for
+     * untrusted containers. tests/test_fp8_load.c's Part A3b pins the
+     * family's polarity at member shapes [1,400], [2,1024], [129,33000].
+     * See also the SECOND DESIGN LANDMINE above for the analogous
+     * ue8m0-vs-fmt=6 corner this same signature can hit. */
+    if(fmt==1){
+        int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
+        int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4, ns_blk_ue8m0=nblkO*nblkI;
+        int is_row=(ns==ns_row), is_blk=(ns==ns_blk), is_blk_ue8m0=(ns==ns_blk_ue8m0);
+        int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+        /* THE DESIGN LANDMINE, INVERTED for the UNSTAMPED case (maintainer
+         * review, #528): is_row&&is_blk with no resolving stamp used to
+         * exit(1) unconditionally -- see this function's "REVIEW
+         * FINDING"/"INVERSION" comment above for why that was wrong. The
+         * STAMPED sub-case (sf==1 || sf==8) is untouched by the inversion:
+         * it already resolved via TRUST-VERIFY-REFUSE before this revision
+         * and still does. Only the "no stamp, or a stamp that names neither
+         * candidate" branch changes: it used to exit(1); it now falls
+         * through to fmt=1 (already the value coming into this block, so no
+         * explicit assignment is needed -- the `is_blk && !is_row` check
+         * further down evaluates false whenever is_row is true). A stamp
+         * that names some OTHER, unrelated format still refuses -- the
+         * inversion applies only to the genuinely stamp-less case. */
+        if(is_row && is_blk){
+            if(sf==1 || sf==8){
+                fmt = sf;
+            } else if(stamped_name){
+                fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                    "int8 (fmt=1) and per-128x128-block FP8 (fmt=8) scale geometry; refusing "
+                    "rather than guessing (untrusted container, THE DESIGN LANDMINE) -- metadata "
+                    "stamp present but names a format that doesn't resolve the ambiguity\n",
+                    name,O,I,(long long)ns);
+                exit(1);
+            }
+            /* else (no stamp at all): falls through to fmt=1, the INVERSION. */
+        } else if(is_blk_ue8m0){
+            if(sf==1 && is_row){
+                fmt = 1;   /* stamp confirms this is genuinely plain int8, not an
+                            * unimplemented-encoding fp8 tensor -- safe to resolve. */
+            } else {
+                fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
+                    "implemented; only f32 block scales are supported in this build (nb=%lld "
+                    "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
+                    "1 byte/block)%s%s -- refusing rather than misreading the sidecar "
+                    "(untrusted container)\n",
+                    name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
+                    is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
+                    stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"
+                                 : "");
+                exit(1);
+            }
+        } else if(is_blk && !is_row) fmt=8;
+    }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
-                      : (fmt==5)? (int64_t)O*i3_groups(I) : (int64_t)O;   /* in FLOAT */
+                      : (fmt==5)? (int64_t)O*i3_groups(I)
+                      : (fmt==8)? fp8_nblk(O)*fp8_nblk(I)
+                      : (int64_t)O;   /* in FLOAT */
     if(ns != exp_scale*4){
         fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
     return fmt;
 }
+
+/* TRUST-VERIFY-REFUSE: if `stamped` (the tensor's __metadata__ format-NAME
+ * stamp, or NULL if none -- see st_fmt_stamp/st_fmt_stamp_ingest in st.h)
+ * is present, verify it agrees with `fmt` (qt_resolve_fmt's byte-arithmetic
+ * result) and refuse loudly on disagreement -- same "untrusted container"
+ * discipline qt_resolve_fmt applies throughout. A stamp naming a format this
+ * build doesn't recognize is ALSO a refusal: silently accepting an
+ * unrecognized name would be indistinguishable from missing a real mismatch,
+ * and "refuse rather than guess" is the whole point of this function's
+ * design. No stamp at all is NOT an error -- the container simply predates
+ * this feature (or was never stamped by a stamping tool), and byte-arithmetic
+ * inference alone decides, exactly as before this function existed: zero
+ * behavior change for unstamped containers.
+ *
+ * Called from qt_from_disk right after qt_resolve_fmt -- the resident-tensor
+ * load path this branch's repack tool actually stamps. Deliberately NOT
+ * threaded into the routed-expert loader paths (expert_load_impl and
+ * friends, which call qt_resolve_fmt separately for g/u/d slab layout): this
+ * branch's tools/repack_fp8_passthrough.py never stamps routed experts (kind
+ * "x" is explicitly excluded, see that tool's module docstring), so there is
+ * no stamp for those paths to verify yet -- adding the plumbing there now
+ * would be framework-building ahead of any container that needs it, which
+ * this reference implementation deliberately avoids. */
+static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
+    if(!stamped) return;                       /* unstamped: infer exactly as today */
+    int stamped_fmt = qt_fmt_by_name(stamped);
+    if(stamped_fmt == fmt) return;              /* agree: silent pass-through, loads normally */
+    if(stamped_fmt < 0){
+        fprintf(stderr,
+            "%s: metadata stamp names format '%s', which this build does not recognize "
+            "(byte-arithmetic inference says fmt=%d) -- refusing (untrusted container, "
+            "unrecognized stamp name)\n", name, stamped, fmt);
+        exit(1);
+    }
+    const char *inferred_name = qt_name_by_fmt(fmt);
+    fprintf(stderr,
+        "%s: metadata stamp says format '%s' but byte-arithmetic inference says fmt=%d "
+        "(%s) -- refusing (untrusted container, stamp/inference mismatch)\n",
+        name, stamped, fmt, inferred_name ? inferred_name : "no registered name");
+    exit(1);
+}
+
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1061,10 +1632,25 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
         int gs=0;
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
+        const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped);
+        qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
-            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            /* METAL: t->s must be page-aligned + coli_metal_register'd like every other
+             * fmt's scale buffer (qsalloc, used by fmt 1/2/3 just below/above), or
+             * bind_gemv/coli_metal_gemm's resolve(t->s,...) can never find it and the
+             * whole GPU dispatch silently CPU-falls-back (safe, but defeats the point of
+             * wiring fmt=4 into the shader at all). falloc() here was a plain malloc --
+             * O*ng floats never registered -- found while tracing the per-row-scale path
+             * this stage extends to per-group; fixed alongside it.
+             * Trade-off (this site is NOT #ifdef COLI_METAL): on a CPU-only build this
+             * swaps falloc's checked-exit overflow/OOM guard for qalloc's unchecked
+             * malloc -- same hole qsalloc already has for fmt 1/2/3, so consistency,
+             * not a new class; noted rather than silent. fmt=5's group scales (just
+             * below) still use falloc and so remain Metal-inert -- pre-existing,
+             * inconsistent after this change, a candidate for whoever wires fmt=5. */
+            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1072,16 +1658,25 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         else if(fmt==6){   /* E8/IQ3: everything in-block, .qs is the 4-byte tag */
             if(t->fmt!=6||!t->q4){ t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1); }
             st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==8){ int64_t nblk=fp8_nblk(O)*fp8_nblk(I);   /* fp8-e4m3: raw bytes (q8, like fmt=1)
+            * + one f32 scale per 128x128 block. BOTH weights and scale via qalloc, not falloc,
+            * from day one -- the GPU-visibility lesson fmt=4 and fmt=5 each had to learn
+            * separately (see review round 1 audit history in the report). */
+            if(t->fmt!=8||!t->q8){ t->fmt=8; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=(float*)qalloc((size_t)nblk*sizeof(float)); }
+            st_read_raw(&m->S,name,t->q8,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
          * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
-         * O*ceil(I/gs) scales and int3-g64 (fmt=5) keeps O*i3_groups(I); everything
-         * else is per-row O. Using the per-row bound for a grouped format would
-         * reject a legitimate container (fmt=5 regressed exactly that way). */
+         * O*ceil(I/gs) scales, int3-g64 (fmt=5) keeps O*i3_groups(I), E8/IQ3 (fmt=6)
+         * keeps the 1-float tag, and fp8-e4m3 (fmt=8) keeps ceil(O/128)*ceil(I/128)
+         * block scales; everything else is per-row O. Using the per-row bound for a
+         * grouped/blocked format would reject a legitimate container (fmt=5 regressed
+         * exactly that way). */
         st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
-                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
+                        fmt==6 ? (int64_t)1               :
+                        fmt==8 ? fp8_nblk(O)*fp8_nblk(I) : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -1150,9 +1745,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
+#ifdef COLI_VULKAN
+    m->vk_kv_valid=calloc(NR,sizeof(int));
+#endif
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
-    m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
+    rt_init("glm_moe_dsa",c->n_layers,c->n_experts);   /* owns the counters + the format */
+    m->eusage=rt_counts_all();                         /* alias: bump sites unchanged */
+    m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
     m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
@@ -1196,7 +1796,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 #endif
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
-            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -1249,7 +1848,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));
-            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -1301,6 +1899,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     }
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         rb+=qt_bytes(&m->ix_wq[i])+qt_bytes(&m->ix_wk[i])+qt_bytes(&m->ix_wp[i]);
+    /* Dense layers, and the MTP row when the model has none, do not route and so get no
+     * counter row -- the exact shape eusage had before route_trace.h owned it. rt_init
+     * cannot know this: sparsity is settled while the layers are built, above. A row is
+     * the load admission rule, so dropping these is what keeps a history record naming a
+     * dense layer from being absorbed and written back out. */
+    for(int i=0;i<c->n_layers;i++) if(!m->L[i].sparse) rt_drop_row(i);
+    if(!m->has_mtp) rt_drop_row(c->n_layers);
     m->resident_bytes=rb;
 }
 
@@ -1370,17 +1975,20 @@ static void *map_of_fd(int fd){
     return base;
 }
 
-/* ==================== DUAL-SSD: two model copies, two drives ====================
- * COLI_MODEL_MIRROR=<dir> registers a SECOND (read-only) copy of the model on
- * another drive; expert reads are split between the two according to
- * COLI_DISK_WEIGHTS=<primary>,<mirror> (relative bandwidth; without the env it
- * is measured at startup with the engine's own access pattern). Cold decode is
- * disk-bound (~11 GB/token): two NVMe drives reading in parallel add up. */
-static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR */
+/* ==================== MULTI-SSD: N model copies, N drives ====================
+ * COLI_MODEL_MIRROR=<dir>[;<dir>...] registers additional read-only copies of
+ * the model on other drives; expert reads split across all copies according to
+ * COLI_DISK_WEIGHTS=<primary>,<mirror>[,<mirror2>...] (relative bandwidth;
+ * without the env it is measured at startup with the engine's own access
+ * pattern). Cold decode is disk-bound (~11 GB/token): N NVMe drives reading in
+ * parallel add up. */
+#define MIR_REPS (1+ST_MAX_MIR)        /* replicas incl. the primary */
+static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR (dir list) */
 static int g_mirror=0;                 /* 1 = mirror active (at least one shard accepted) */
-static int g_mir_share=64;             /* expert share routed to the mirror, out of 256 */
-static _Atomic int64_t g_mir_bytes[2]; /* bytes served per drive: [0] primary, [1] mirror */
-static _Atomic int64_t g_mir_nread[2];
+static int g_mir_nrep=1;               /* replicas incl. the primary */
+static int g_mir_cut[MIR_REPS]={256};  /* cumulative hash cuts of 256: replica r serves h in [cut[r-1],cut[r]) */
+static _Atomic int64_t g_mir_bytes[MIR_REPS]; /* bytes served per drive: [0] primary, [r] mirror r */
+static _Atomic int64_t g_mir_nread[MIR_REPS];
 
 /* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
  * requirement, not a style choice: the readahead/PILOT WILLNEED and the demand
@@ -1390,12 +1998,62 @@ static inline int expert_route(int layer,int eid){
     if(!g_mirror) return 0;
     uint32_t h=(uint32_t)layer*2654435761u ^ (uint32_t)eid*0x9E3779B9u;
     h^=h>>16; h*=0x45d9f3bu; h^=h>>16;
-    return (int)(h&255) < g_mir_share;
+    int hv=(int)(h&255), r=0;
+    while(hv>=g_mir_cut[r]) r++;       /* cut[nrep-1]==256 terminates the scan */
+    return r;
 }
 
 /* buffered fd of the replica, falling back to the primary if the file is not mirrored */
 static inline int rep_bfd(shards *S,int fd,int rep){
     int r=st_fd_rep(S,fd,rep); return r<0?fd:r;
+}
+
+/* MULTI-SSD striped demand read (COLI_MIR_STRIPE=0 disables): split the one
+ * coalesced O_DIRECT expert pread into disjoint 4K-aligned chunks, one per
+ * replica that holds the shard, read in parallel. A cold ~19 MB expert read is
+ * single-thread latency-bound (~4 GB/s on one NVMe) and it is the felt wait of
+ * every demand miss; N drives reading stripes of the SAME expert cut it ~N-fold.
+ * O_DIRECT only: no page cache involved, so striping cannot double-cache an
+ * expert across drives (the buffered path keeps whole-expert replica routing).
+ * Chunk 0 starts on the ROUTED replica so the hash still spreads first-chunk
+ * load evenly. Any short stripe fails the whole attempt (caller falls back to
+ * the single-replica read). */
+static int g_mir_stripe=1;
+typedef struct { int fd; char *buf; int64_t len, off; ssize_t r; } MirStripe;
+static void *mir_stripe_worker(void *a){
+    MirStripe *st=(MirStripe*)a;
+    st->r = pread(st->fd, st->buf, (size_t)st->len, st->off);
+    return NULL;
+}
+/* Returns total bytes read (== len) on success, -1 to make the caller fall back. */
+static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,int64_t base){
+    if(!g_mir_stripe || g_mir_nrep<2 || len < (4<<20)) return -1;
+    int sfd[MIR_REPS], srep[MIR_REPS], nsf=0;
+    for(int r=0;r<g_mir_nrep && r<MIR_REPS;r++){
+        int f=st_direct_fd_rep(S,fd,r);
+        if(f>=0){ sfd[nsf]=f; srep[nsf]=r; nsf++; }
+    }
+    if(nsf<2) return -1;
+    int64_t chunk=((len+nsf-1)/nsf + 4095) & ~4095LL;
+    MirStripe st[MIR_REPS]; pthread_t th[MIR_REPS]; int nth=0, ns=0;
+    for(int i=0;i<nsf;i++){
+        int64_t o=(int64_t)i*chunk; if(o>=len) break;
+        int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
+        st[ns]=(MirStripe){sfd[k], buf+o, len-o<chunk?len-o:chunk, base+o, -1};
+        ns++;
+    }
+    for(int i=1;i<ns;i++)
+        if(pthread_create(&th[nth],NULL,mir_stripe_worker,&st[i])==0) nth++;
+        else st[i].r=pread(st[i].fd,st[i].buf,(size_t)st[i].len,st[i].off);
+    st[0].r = pread(st[0].fd, st[0].buf, (size_t)st[0].len, st[0].off);
+    for(int i=0;i<nth;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<ns;i++) if(st[i].r!=st[i].len) return -1;
+    for(int i=0;i<ns;i++){
+        int k=(rep+i)%nsf;
+        atomic_fetch_add_explicit(&g_mir_bytes[srep[k]],st[i].len,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_nread[srep[k]],1,memory_order_relaxed);
+    }
+    return len;
 }
 
 static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag);
@@ -1407,7 +2065,7 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
  * Accounts bytes per drive. Returns 0 = ok, -1 = real error/EOF (like pread_full). */
 static ssize_t mir_pread(shards *S,int fd,int rep,void *buf,int64_t n,int64_t off,const char *tag){
     int rfd = st_fd_rep(S,fd,rep);
-    int used = rep && rfd>=0;
+    int used = (rep && rfd>=0) ? rep : 0;
     if(rfd<0) rfd=fd;
     int rc=pread_full(rfd,buf,n,off,tag);
     if(rc && used){
@@ -1489,6 +2147,14 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
      * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
+#ifdef COLI_VULKAN
+    /* Slot reused for a different expert: free the stale VK-resident weights so the new
+     * expert re-uploads instead of computing with the old expert's tensors. */
+    if(s->eid!=eid){
+        if(s->g.vk_eligible) g_vk_resident--;
+        qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d);
+    }
+#endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
      * nm[k]/qn snprintfs can't overflow: worst key is "model.layers.<i>.mlp.experts.<i>.down_proj.weight"
@@ -1509,7 +2175,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
-        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        /* strnlen+memcpy come al load fmt-aware (#484): gcc -Wformat-truncation
+         * vede nm[k] a indice variabile come l'intero nm[3][] e segnala 863>320 */
+        { size_t n=strnlen(nm[k],sizeof(nm[k])); memcpy(qn,nm[k],n); memcpy(qn+n,".qs",4); }
+        tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ if(fatal) st_die_missing(&m->S,nm[k]);   /* #586: diagnose, don't just name it */
                             fprintf(stderr,"missing %s\n",nm[k]); return -1; }
     }
@@ -1521,7 +2190,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                                 __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
     }
     int rep=expert_route(layer,eid);             /* DUAL-SSD: this expert's replica */
-    if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
+    if(rep && st_fd_rep(&m->S,tw[0]->fd,rep)<0) rep=0; /* shard not in that mirror (partial) */
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
@@ -1533,7 +2202,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1645,12 +2314,19 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
             int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
             int64_t len=(need+4095)&~4095LL;
-            ssize_t r=pread(dfd, s->slab, len, base);
+            /* multi-SSD: stripe the read across the replicas (accounts internally);
+             * any failure falls back to the whole read on the routed replica */
+            ssize_t r=(ssize_t)mir_pread_striped(&m->S,tw[ord[0]]->fd,rep,(char*)s->slab,len,base);
+            if(r<need){
+                r=pread(dfd, s->slab, len, base);
+                if(r>=need){
+                    atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
+                }
+            }
             if(r>=need){
                 pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
                 pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1; dc_direct=1;
-                atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             }
         }
         if(!done){                               /* fallback bufferizzato */
@@ -1695,7 +2371,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -1889,7 +2565,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
          * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
@@ -2033,6 +2709,16 @@ static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
     atomic_store_explicit(&g_pp.cur,(g<<8),memory_order_release);                          /* PUBLISH */
     pthread_mutex_lock(&g_pp.mx); pthread_cond_broadcast(&g_pp.cv); pthread_mutex_unlock(&g_pp.mx);
 }
+/* Non-blocking probe of a pipe slot's load-done flag — an ORDERING hint only (the
+ * VK block computes ready experts first): callers still pipe_wait() before touching
+ * the slab. Under URING completion happens inside finalize, there is no flag to
+ * peek — report not-ready and let the wait do the work. */
+static inline int pipe_ready(int q){
+#ifdef __linux__
+    if(g_uring) return 0;
+#endif
+    return atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)!=0;
+}
 static inline void pipe_wait(int q){
 #ifdef __linux__
     if(g_uring){
@@ -2070,7 +2756,19 @@ static void expert_host_release(Model *m, ESlot *s){
      * fixed at the original expert_load site. fslab is plain malloc/falloc
      * on the CPU path, so its free() stays plain (Metal path frees it before
      * re-alloc and never reaches here with an aligned fslab on _WIN32). */
-    if(s->aslab){ s->slab=NULL; s->fslab=NULL; }  /* arena slice (#419): detach, keep caps, never free */
+    if(s->aslab){
+#ifdef __linux__
+        /* The arena owns the virtual address, not the resident pages.  A GPU
+         * slot no longer needs its host copy after the synchronous H2D upload.
+         * Keeping those anonymous pages resident made every live REPIN pass
+         * grow RSS by one swapped batch (~300 MB at 16 experts).  DONTNEED
+         * preserves the reusable slice while returning its pages to Linux;
+         * expert_host_ensure reloads them before the slot can run on CPU. */
+        madvise(s->slab,(size_t)s->slab_cap,MADV_DONTNEED);
+        madvise(s->fslab,(size_t)s->fslab_cap*sizeof(float),MADV_DONTNEED);
+#endif
+        s->slab=NULL; s->fslab=NULL;               /* detach, keep caps/arena ownership */
+    }
     else { compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; }
     QT *q[3]={&s->g,&s->u,&s->d};
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
@@ -2131,6 +2829,33 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 acc[base+k]+=cg*(float)((int)u-4); } }
         return; }
+    /* GUARD (fix round 2, engine defect -- clean-room conformance trial found a real
+     * SIGSEGV, reproduced): fmt 0/4/5 already returned above; everything below this
+     * point assumes a PER-ROW scale (t->s[row]) followed by fmt=1 (int8, explicit
+     * branch), fmt=2 (int4 packed, explicit branch), or the tail's own IMPLICIT fmt=3
+     * (int2 packed, the final unconditional block) -- there was no guard stopping any
+     * OTHER fmt from reaching here. fmt=6 (E8/IQ3): t->s is a FIXED 4-byte tag (ONE
+     * float total, qsalloc(1) in qt_from_disk), not O floats -- t->s[row] for row>0 is
+     * a heap OVERREAD, and the untouched fall-through then misreads t->q4's real E8
+     * lattice bytes as int2-packed data (same bug SHAPE as #298's CUDA absorb-kernel
+     * fix, and the same one this file's own fmt=4/5 branches above were added to
+     * dodge -- fmt=6 was simply missed). fmt=8 (fp8-e4m3-b128): t->s holds
+     * ceil(O/128)*ceil(I/128) per-block floats, not O -- t->s[row] overreads for
+     * row>=nblk (e.g. a [130,130] tensor has nblk=4, so every row past 3 already reads
+     * out of bounds), AND t->q4 is NULL for fmt=8 (raw bytes live in t->q8 instead,
+     * same convention as fmt=1 -- see the QT struct comment), so the fall-through's
+     * `t->q4+(int64_t)row*((I+3)/4)` dereferences NULL-plus-offset: SIGSEGV,
+     * reproduced (see the report's proof-of-bite transcript). Refuse loudly instead --
+     * this function has no byte-count context of its own to validate against (it only
+     * ever sees an already-resolved QT), so "unsupported fmt" is the only check
+     * available, same "refuse rather than misread" discipline qt_resolve_fmt applies
+     * at load time. */
+    if(t->fmt!=1 && t->fmt!=2 && t->fmt!=3){
+        fprintf(stderr,"qt_addrow: unsupported fmt=%d for the per-row-scale absorb path "
+            "(only fmt 1/2/3 reach this point; fmt 0/4/5 are handled above and return "
+            "before it) -- refusing rather than misread t->s[row]/t->q4\n", t->fmt);
+        exit(1);
+    }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
@@ -2177,8 +2902,21 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                     acc+=(float)((int)u-4)*x[base+k]; }
                 a+=(double)(acc*sr[g]); } }
-        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
+        /* fmt=3 (int2 packed, per-row scale) is the only fmt this final arm legitimately
+         * handles -- fmt 0/4/5 matched above, fmt 1/2 have their own explicit branches
+         * above too. Same GUARD and same reasoning as qt_addrow's (fix round 2, engine
+         * defect): fmt=6's t->s is a fixed 4-byte tag (t->s[row] overreads for row>0),
+         * fmt=8's t->s holds per-128x128-block floats (t->s[row] overreads for
+         * row>=nblk) and t->q4 is NULL for fmt=8 -- both would have silently misread or
+         * crashed here exactly like qt_addrow did before its own fix; refuse instead. */
+        else if(t->fmt==3){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+        else {
+            fprintf(stderr,"qt_matvec_rows: unsupported fmt=%d for the per-row-scale absorb "
+                "path (only fmt 0/1/2/3/4/5 are handled) -- refusing rather than misread "
+                "t->s[row]/t->q4\n", t->fmt);
+            exit(1);
+        }
         y[j]=(float)a;
     }
 }
@@ -2371,7 +3109,58 @@ done:
     free(chost);                              /* gli scratch device restano al contesto */
     return ok;
 }
+
+/* Decode-scale prefix only: upload x once and reuse it for q_a and kv_a. Keep
+ * the stock CPU RMSNorm between q_a and q_b so greedy output stays exact, then
+ * return Q/comp to the stock attention path. */
+static int attn_pipe_prefix(Model *m,Layer *l,const float *x,int S,float *QR,float *Q,float *comp){
+    Cfg *c=&m->c; int D=c->hidden,ql=c->q_lora,kvl=c->kv_lora,R=c->qk_rope;
+    int dev=l->q_a.cuda_device;
+    if(S<1||S>4||dev<0||l->q_b.cuda_device!=dev||l->kv_a.cuda_device!=dev) return 0;
+    size_t xb=(size_t)S*D*4,qrb=(size_t)S*ql*4;
+    size_t qb=(size_t)S*c->n_heads*c->qk_head*4,cb=(size_t)S*(kvl+R)*4;
+    float *xd=coli_cuda_pipe_scratch(dev,0,xb);
+    float *qrd=coli_cuda_pipe_scratch(dev,1,qrb);
+    float *qd=coli_cuda_pipe_scratch(dev,2,qb);
+    float *cd=coli_cuda_pipe_scratch(dev,3,cb);
+    if(!xd||!qrd||!qd||!cd) return 0;
+    if(!coli_cuda_pipe_upload(dev,xd,x,xb)||
+       !coli_cuda_pipe_gemm(l->q_a.cuda,qrd,xd,S)||
+       !coli_cuda_pipe_download(dev,qrd,QR,qrb)) return 0;
+    for(int s=0;s<S;s++) rmsnorm(QR+(int64_t)s*ql,QR+(int64_t)s*ql,l->q_a_ln,ql,c->eps);
+    if(!coli_cuda_pipe_upload(dev,qrd,QR,qrb)||
+       !coli_cuda_pipe_gemm(l->q_b.cuda,qd,qrd,S)||
+       !coli_cuda_pipe_gemm(l->kv_a.cuda,cd,xd,S)||
+       !coli_cuda_pipe_download(dev,qd,Q,qb)||
+       !coli_cuda_pipe_download(dev,cd,comp,cb)) return 0;
+    return 1;
+}
 #endif
+
+/* POSITIVE allowlist for the two fused Metal decode gates below
+ * (attention_rows / layer_forward_rows): only the mm_gemv shader's explicit
+ * INTEGER-format branches (fmt 1/2/3/4) may enter the fused path -- the
+ * exact set that was BOTH admitted by the old negative guard AND computed
+ * correctly. Anything else falls back to the CPU path (correct, slower).
+ * INVARIANT this predicate names: a NEGATIVE guard (the previous
+ * `fmt!=8` form) is fail-OPEN for every format it doesn't name --
+ * bind_gemv (backend_metal.mm) has no fmt allowlist of its own, and the
+ * mm_gemv shader's dispatch chain ends in an unconditional f32 fallback
+ * branch, so a resident fmt=5 or fmt=6 tensor slipping through would have
+ * its REAL weight bytes (they live in q4, which is exactly what the WP_()
+ * macro hands the kernel) silently misread as f32 garbage, with no error.
+ * This form is fail-CLOSED: a future format is excluded until someone
+ * proves it on the fused path and adds it here. fmt=3 (int2) is included
+ * because it was legal-and-correct here before this change (explicit
+ * mm_gemv branch, real q4 bytes) -- excluding it would be this change's
+ * only regression. fmt=0 (f32) stays excluded: it never actually fused --
+ * WP_() hands the shader q4, which is NULL for fmt=0 (weights live in qf)
+ * -- so admitting it would be dead permissiveness, not a preserved
+ * behavior. fmt=5/6 (misread hazard), fmt=8 (NULL-q4 variant), and every
+ * future format remain excluded.
+ * Defined unconditionally (not #ifdef COLI_METAL) so the CPU test build
+ * can unit-test the truth table (tests/test_fp8_load.c Part F). */
+static inline int metal_fused_fmt_ok(int fmt){ return fmt==1 || fmt==2 || fmt==3 || fmt==4; }
 
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
@@ -2386,10 +3175,29 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * (step_decode_batch) passes per-row kvs[]/positions[] with pos_base=0, so the kernel
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
-     * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s]. */
+     * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s].
+     * metal_fused_fmt_ok(q_a/q_b/kv_a/o): POSITIVE allowlist (fmt 1/2/4, see the
+     * predicate's own comment above attention_rows). Previously these were
+     * negative fmt!=8 guards -- fail-OPEN for everything they didn't name: for
+     * fmt=8 specifically the WP_() macro two lines below picks q8 only for
+     * fmt==1, else q4 -- and q4 is NULL/unallocated for fmt=8 (same convention
+     * as fmt=1, see the QT struct comment), so an fmt=8 tensor reaching
+     * coli_metal_attn_decode would hand the kernel a NULL weight pointer; for
+     * fmt=5/6 the hazard is WORSE -- their real weight bytes live in q4, so
+     * WP_() hands the shader a valid pointer and mm_gemv's terminal f32
+     * fallback branch silently misreads them as f32 garbage. The allowlist
+     * fails CLOSED to the CPU path below for all of them (matmul_qt_ex there
+     * dispatches every format correctly, incl. fmt=8 via matmul_fp8); wiring
+     * fmt=8 through bind_gemv/coli_metal_attn_decode stays a deferred
+     * follow-up (see this PR's GPU-path note). kv_b is already pinned to
+     * fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
+     * these four checks are the same discipline extended to the tensors that
+     * flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
+       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
+       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
@@ -2400,11 +3208,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
             int ok = coli_metal_attn_decode(x,
-                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
-                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
-                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
                 WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
-                WP_(l->o), l->o.s, l->o.fmt,
+                WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
             #undef WP_
             if(ok){ m->t_attn += now_s()-ta0; return; }
@@ -2429,7 +3237,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * batch-union. matmul_qt_ex(...,0) keeps them on the EXACT int4 kernel: letting S>1 pull
      * them into IDOT is much faster but costs ~12% perplexity (measured). Batching alone is
      * bit-identical to upstream; the kernel switch is not. */
-    int pipe_done=0;
+    int pipe_done=0,prefix_done=0;
 #ifdef COLI_CUDA
     if(g_cuda_pipe&&!kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        !(m->has_dsa&&pos_base+S>c->index_topk)&&
@@ -2438,13 +3246,64 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
        qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o))
         pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
+    if(!pipe_done&&getenv("COLI_CUDA_ATTN_PREFIX")&&atoi(getenv("COLI_CUDA_ATTN_PREFIX"))&&
+       !kvs&&S<=4&&g_cuda_enabled&&
+       (!m->has_dsa||pos_base+S<=c->index_topk)&&
+       l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
+       qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a))
+        prefix_done=attn_pipe_prefix(m,l,x,S,QR,Q,comp);
 #endif
-    if(!pipe_done){
+    if(!pipe_done&&!prefix_done){
+        int vk_qp=0; (void)vk_qp;
+#ifdef COLI_VULKAN
+        /* Single-submit q-prep chain: [q_a+kv_a] -> rmsnorm(q latent, on-GPU) -> q_b.
+         * One fence where the split path pays three (the CPU norm forced the extra
+         * roundtrips). Q and comp are written directly; QR is skipped entirely. */
+        static int g_vk_qprep=-1;
+        if(g_vk_qprep<0) g_vk_qprep=getenv("COLI_VK_QPREP")?atoi(getenv("COLI_VK_QPREP")):1;
+        float *dbgQ=NULL,*dbgC=NULL;
+        if(g_vk_qprep==2){ dbgQ=falloc((int64_t)S*l->q_b.O); dbgC=falloc((int64_t)S*l->kv_a.O); }
+        if(g_vk_qprep && g_vk_dense && l->q_a.fmt==l->kv_a.fmt && l->q_a.fmt==l->q_b.fmt && VK_FMT_OK(&l->q_a)
+           && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs)
+            vk_qp=coli_vk_attn_qprep(layer,
+                &l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
+                &l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
+                &l->q_b.vk, l->q_b.fmt==1?(const void*)l->q_b.q8:(const void*)l->q_b.q4, l->q_b.s, l->q_b.O,
+                l->q_a.fmt, l->q_a.gs, l->q_a_ln, c->eps, x, S, l->q_a.I,
+                g_vk_qprep==2?dbgQ:Q, g_vk_qprep==2?dbgC:comp,
+                g_vk_qprep==2?NULL:QR);   /* the DSA indexer reads the NORMED latent from QR */
+        int qp_ran=vk_qp;
+        if(g_vk_qprep==2 && vk_qp) vk_qp=0;   /* verify mode: chain ran, split path is authoritative */
+        if(!vk_qp){
+#endif
+        int vk_pair=0; (void)vk_pair;
+#ifdef COLI_VULKAN
+        /* q_a and kv_a read the SAME x: one fused submit for the pair (one x upload,
+         * one fence) instead of two full roundtrips. Fallback = the single calls. */
+        vk_pair=vk_matmul_pair_qt(&l->q_a, QR, &l->kv_a, comp, x, S);
+        if(!vk_pair)
+        if(!vk_matmul_qt(&l->q_a, QR, x, S))
+#endif
         matmul_qt_ex(QR, x, &l->q_a, S, 0);
         for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
             rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->q_b, Q, QR, S))
+#endif
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
+#ifdef COLI_VULKAN
+        if(!vk_pair)
+        if(!vk_matmul_qt(&l->kv_a, comp, x, S))
+#endif
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
+#ifdef COLI_VULKAN
+        }
+        if(dbgQ){ float mq=0,mc=0;
+            for(int64_t i2=0;i2<(int64_t)S*l->q_b.O;i2++){ float d=fabsf(dbgQ[i2]-Q[i2])/(fabsf(Q[i2])+1e-3f); if(d>mq) mq=d; }
+            for(int64_t i2=0;i2<(int64_t)S*l->kv_a.O;i2++){ float d=fabsf(dbgC[i2]-comp[i2])/(fabsf(comp[i2])+1e-3f); if(d>mc) mc=d; }
+            fprintf(stderr,"[QPREP-VERIFY] layer %d S=%d ran=%d maxrel q %.4g kv %.4g\n",layer,S,qp_ran,mq,mc);
+            free(dbgQ); free(dbgC); }
+#endif
     }
     if(!pipe_done) for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
@@ -2457,6 +3316,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #ifdef COLI_CUDA
         if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
             m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
+#endif
+#ifdef COLI_VULKAN
+        if(ks==m->kv&&m->vk_kv_valid&&layer<=c->n_layers&&m->vk_kv_valid[layer]>pos)
+            m->vk_kv_valid[layer]=pos;               /* riga riscritta: la cache VK si accorcia */
 #endif
         memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
@@ -2658,7 +3521,45 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
         }
 #endif
-        if(!cuda_core){
+        int vk_core=0, vk_projected=0;
+#ifdef COLI_VULKAN
+        /* Vulkan MLA absorb core (COLI_VK_ATTN=1): scores/softmax/latent/value rows for all
+         * S x H in ONE submit per layer, reading the persistent on-device KV mirror (rows
+         * appended incrementally; vk_kv_valid = watermark, invalidated like the CUDA shadow
+         * on rewrite/rebind/resize). Falls back to CPU on DSA top-k selection, ragged KV,
+         * the MTP layer, or any backend failure — output identical either way. */
+        if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
+           VK_FMT_OK(&l->kv_b)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
+           m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
+                                                * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
+                                                * falls back to the CPU path until the VK
+                                                * mirror learns fp8 */
+            int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
+            int st0=m->kv_start[layer], T=pos_base+S;
+            if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+                int ok=1;
+                for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
+                    ok=coli_vk_kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
+                                      coli_kv_row(m->Rc[layer],t,c->qk_rope));
+                if(ok){
+                    m->vk_kv_valid[layer]=T;
+                    const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
+                    /* fused absorb + o-projection: ctx never leaves the device */
+                    if(VK_FMT_OK(&l->o)&&
+                       coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
+                            &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
+                            l->o.s,l->o.fmt,l->o.gs,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            vh,kvl,st0,T,c->attn_scale,D))
+                        vk_core=vk_projected=1;
+                    if(!vk_core)
+                        vk_core=coli_vk_attention_absorb(&l->kv_b.vk,kw,
+                            l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            vh,kvl,st0,T,c->attn_scale);
+                }
+            }
+        }
+#endif
+        if(!cuda_core&&!vk_core){
         /* Causal rows grow with s; round-robin pairs keep that work balanced. */
         #pragma omp parallel for collapse(2) schedule(static,1)
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
@@ -2727,7 +3628,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        if(!cuda_projected){matmul_qt(out, ctx, &l->o, S);} m->t_aout+=now_s()-tao;
+        if(!cuda_projected&&!vk_projected){
+#ifdef COLI_VULKAN
+            if(!vk_matmul_qt(&l->o, out, ctx, S))
+#endif
+            matmul_qt(out, ctx, &l->o, S);
+        } m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
@@ -2782,6 +3688,22 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+#ifdef COLI_VULKAN
+/* dev2 group issue on a worker thread: the Polaris/x4 submit path costs ~0.8ms per
+ * dev2-active block serialized on the main thread (measured 3.2s/decode vs 0.15s
+ * dev0-only) while the 580's exec itself finishes early (take-wait 0.1s) — off-thread
+ * it overlaps dev0's issue + the CPU expert share. All Vulkan state it touches is
+ * G2-private, and moe() joins before take2, preserving the one-in-flight invariant. */
+typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *x; int rc; double dt; } Vk2Iss;
+static void *vk2_issue_worker(void *p){
+    Vk2Iss *j=(Vk2Iss*)p;
+    double t0=now_s();
+    j->rc = coli_vk_expert_group_issue2(j->g,j->u,j->d,j->rows,j->n,j->x);
+    j->dt = now_s()-t0;
+    return NULL;
+}
+#endif
+
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
     ESlot *P=m->pin[layer];
@@ -2806,6 +3728,18 @@ static int router_best_or_fallback(int best, int kk, int E, int layer){
         fprintf(stderr,"[router] logits non finiti al layer %d: selezione degradata\n",layer); }
     return kk<E ? kk : 0;
 }
+
+#ifdef COLI_METAL
+/* Rotate the Metal-staged gate/up input rows for fmt=6 (Q^T x). Duplicate rows
+ * (same source s) are copied from the first rotated instance: O(p^2) scan, p<=65. */
+static void metal_stage_rot_e8(float *mxg, const int *mrows, int p, int D){
+    for(int i=0;i<p;i++){
+        int j=-1; for(int k=0;k<i;k++) if(mrows[k]==mrows[i]){ j=k; break; }
+        if(j>=0) memcpy(mxg+(int64_t)i*D, mxg+(int64_t)j*D, (size_t)D*sizeof(float));
+        else e8_rot_rows(mxg+(int64_t)i*D, 1, D);
+    }
+}
+#endif
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
@@ -3008,6 +3942,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=w[kk];
             float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=w[kk]; if(cum>=g_topp*tot){ Ke=kk+1; break; } }
         }
+        /* ===== CAUSAL ABLATION (FASE A) — inert unless g_abl.mode set this item.
+         * Both hooks act on the token's SELECTED set BEFORE the eusage/eheat/elast
+         * counters, norm_topk, routed_scale, and ROUTE_TRACE below, so the load
+         * counters, renormalised weights, and any route trace all reflect the
+         * post-ablation routing (route-around: the ablated cell truly did not fire;
+         * module-swap: the substitute fired at the original routed weight). */
+        if(g_abl.mode==2){                 /* route-around: drop ablated cells, survivors renormalise below */
+            int wr=0;
+            for(int kk=0;kk<Ke;kk++){
+                if(abl_route_around(&g_abl, layer, idx[kk])) continue;
+                idx[wr]=idx[kk]; w[wr]=w[kk]; wr++;
+            }
+            Ke=wr;
+        } else if(g_abl.mode==3){          /* module-swap: remap the slot's expert id, keep its weight */
+            for(int kk=0;kk<Ke;kk++){
+                int to=abl_swap_target(&g_abl, layer, idx[kk]);
+                if(to>=0) idx[kk]=to;
+            }
+        }
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++){
             m->eusage[layer][idx[kk]]++;
@@ -3022,16 +3975,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
-        if(g_route_fp){                       /* ROUTE_TRACE: one line per (position, layer) */
-            fprintf(g_route_fp,"%d %d %d",g_route_call,s,layer);
-            for(int kk=0;kk<Ke;kk++) fprintf(g_route_fp," %d:%.4f",idx[kk],w[kk]);
-            fputc('\n',g_route_fp);
-        }
+        rt_trace(layer,s,idx,w,Ke);           /* ROUTE_TRACE: one line per (position, layer) */
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
     free(rank_buf); free(rank_w);
     if(g_prof)m->t_route+=now_s()-route_t0;
-    if(g_route_fp) g_route_call++;
+    rt_trace_end();
     if(g_couple && cp_pred && S<=8)
         for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
     if(g_looka && S==1 && layer<c->n_layers){
@@ -3176,11 +4125,33 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int *group_row=group_enabled?xalloc((size_t)64*S*sizeof(int),"moe group_row"):NULL;
     float *group_weight=group_enabled?xalloc((size_t)64*S*sizeof(float),"moe group_weight"):NULL;
 #endif
+    int vk_active = 0; (void)vk_active;
+#ifdef COLI_VULKAN
+    vk_active = g_vulkan && (g_vk_reg_n+g_vk_reg_n2)>0 && !omp_in_parallel() && S<=4;   /* empty
+                                                * registry (tier off / no usage history) = normal CPU expert loop */
+    float *vk_xh = vk_active?falloc((int64_t)S*K*D):NULL;
+    float *vk_yh = vk_active?falloc((int64_t)S*K*D):NULL;
+    int vk2_on = vk_active && g_vk_reg_n2>0;    /* dev2 tier live: second async group */
+    float *vk_xh2 = vk2_on?falloc((int64_t)S*K*D):NULL;
+    float *vk_yh2 = vk2_on?falloc((int64_t)S*K*D):NULL;
+#endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+#ifdef COLI_VULKAN
+        int vk_hit[64]={0};
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+#ifdef COLI_VULKAN
+            /* VK VRAM tier first: registry-served experts need NO RAM slot and NO disk
+             * load (the whole point) — and skipping the LRU recency bump lets them age
+             * out of the RAM cache, freeing capacity for the CPU-served experts. */
+            if(vk_active && layer<c->n_layers){
+                ColiVkTensor **rg=vk_reg_at(layer,eid);
+                if(rg && rg[0]){ vk_hit[j]=1; m->hits++; m->hit_vk++; continue; }
+            }
+#endif
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
@@ -3194,6 +4165,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * the first block) to the GPU BEFORE loading the missed experts from disk, so the
          * preads run while the GPU computes; the missed subset follows in a second submit.
          * Per-subset CPU fallback on unresolved slab / bad fmt / GPU fault. */
+        /* fmt=6 stores W@Q, so the staged gate/up input must be rotated (Q^T x) before
+         * upload. Rotate each distinct source row once, copy to duplicates — a decode
+         * batch's rows all share s, so this is one FWHT per token in practice. The down
+         * input is rotated on-GPU by moe_fwht inside moe_submit. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
         int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
@@ -3239,6 +4214,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             MB_BUILD(0, base==0 && !g_pre_sh);
             if(nbb>0){
                 double t0=now_s();
+                if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
                 if(mh){ cpu_res=0; mh_shared=sh_in; }
@@ -3268,6 +4244,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
             for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
                 ESlot *P=m->pin[layer];
+#ifdef COLI_VULKAN
+                if(vk_active && vk_reg_served(layer,eid)) found=1;   /* VK-tier-served at decode */
+#endif
                 for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
                 ESlot *Sl=m->ecache[layer];
                 for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
@@ -3298,6 +4277,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
             if(nbb>0){
                 double t0=now_s();
+                if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
             } else cpu_miss=0;
@@ -3394,7 +4374,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * on GLM-5.2 int4: identical 256-token greedy output, and on the int4 tiny
          * oracle). Gated off the speculation window like every S-dependent kernel switch. */
         int xexp_done=0;
-        if(g_xexp && !metal_done && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
+        if(g_xexp && !metal_done && !vk_active && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
 #ifdef COLI_CUDA
            && !g_cuda_enabled
 #endif
@@ -3449,7 +4429,137 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
         }
-        if(!metal_done && !xexp_done)
+#ifdef COLI_VULKAN
+        /* Vulkan expert tier (COLI_VULKAN=1): upload routed int4/int3-g64 experts to the GPU once
+         * (capped by COLI_VK_EXPERTS), then compute the resident ones as one batched
+         * coli_vk_expert_group (fused gate+up+silu -> down, on-device); the rest + misses
+         * fall back to the CPU below. Decode-only (S<=4). Measured ~35% faster than ROCm. */
+        if(vk_active && !metal_done){
+            /* Pinned+async VK expert tier. Pass 1 partitions by REGISTRY residency (the
+             * heat-pinned startup uploads — no uploads, no loads here); pass 2 ISSUES the
+             * GPU batch async and computes the CPU share while it runs; pass 3 drains the
+             * pipe + RAM-loads the GPU-side slots (cache invariants: every dispatched slot
+             * waited, every use[] slot loaded before the end-of-block LRU swap); pass 4
+             * takes the GPU results (fallback: recompute those rows on the CPU). */
+            ColiVkTensor *vg[64],*vu[64],*vd[64]; int veid[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
+            ColiVkTensor *vg2[64],*vu2[64],*vd2[64]; int veid2[64]; int vrows2[64], voff2[64], vrmap2[64*4]; float vwmap2[64*4];
+            ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64];
+            int nvk=0, vtot=0, nvk2=0, vtot2=0, ncpu=0;
+            double t0=now_s();
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j];
+                int nr=0;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
+                if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
+                    ColiVkTensor **reg=vk_reg_at(layer,eid);
+                    if(vk2_on && coli_vk_tensor_dev(reg[0])==1){   /* dev2 tier expert */
+                        voff2[nvk2]=vtot2;
+                        for(int r=0;r<nr;r++){ memcpy(vk_xh2+(int64_t)(vtot2+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                            vrmap2[nvk2*S+r]=rows[r]; vwmap2[nvk2*S+r]=rw[r]; }
+                        vg2[nvk2]=reg[0]; vu2[nvk2]=reg[1]; vd2[nvk2]=reg[2]; veid2[nvk2]=eid; vrows2[nvk2]=nr; vtot2+=nr; nvk2++;
+                    } else {
+                        voff[nvk]=vtot;
+                        for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                            vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
+                        vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; veid[nvk]=eid; vrows[nvk]=nr; vtot+=nr; nvk++;
+                    }
+                } else {
+                    ce[ncpu]=use[j]; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
+                    for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
+                    ncpu++;
+                }
+            }
+            if(g_prof){ g_vkb_cls+=now_s()-t0; g_vkb_blocks++; g_vkb_nvk+=nvk+nvk2; g_vkb_nvk2+=nvk2; g_vkb_ncpu+=ncpu; }
+            double t_iss0=now_s();
+            /* issue the SLOWER device first so it gets the longest overlap window;
+             * dev2's submit runs on a worker thread (joined before take2 below) so its
+             * per-block cost overlaps dev0 issue + the CPU share instead of serializing */
+            Vk2Iss iss2 = { vg2, vu2, vd2, vrows2, nvk2, vk_xh2, 0, 0 };
+            pthread_t iss2_th; int iss2_threaded=0;
+            if(nvk2>0){
+                if(pthread_create(&iss2_th,NULL,vk2_issue_worker,&iss2)==0) iss2_threaded=1;
+                else iss2.rc = coli_vk_expert_group_issue2(vg2,vu2,vd2,vrows2,nvk2,vk_xh2);
+            }
+            int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
+            if(g_prof) g_vkb_issue+=now_s()-t_iss0;
+            /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
+             * block leaves only ~5-6 CPU experts (the tier absorbs the hot head), fewer
+             * than the OMP pool, so one-task-per-expert ran each expert single-threaded
+             * at ~2.5 GB/s while cores idled — measured -23% vs this structure (A/B
+             * 2026-07-20); the kernels' internal parallel-for already uses every core.
+             * What IS reordered: pipe-ready and cache-resident experts run FIRST, so a
+             * still-loading expert gets its I/O hidden behind their matmuls instead of
+             * head-of-line blocking the block. The class is an ordering HINT only —
+             * the body still pipe_waits/loads every entry, so a stale probe costs
+             * nothing but order. t_ecpu counts kernel time only (the default path's
+             * meaning); the waits land in t_ewait. */
+            {
+                uint8_t vcls[64];
+                for(int c2=0;c2<ncpu;c2++){
+                    if(g_pipe && cqof[c2]>=0) vcls[c2] = pipe_ready(cqof[c2]) ? 0 : 2;   /* loaded : in flight */
+                    else                      vcls[c2] = ce[c2]->slab       ? 0 : 1;   /* resident : sync miss */
+                }
+                int vord[64], no=0;
+                for(uint8_t k2=0;k2<3;k2++) for(int c2=0;c2<ncpu;c2++) if(vcls[c2]==k2) vord[no++]=c2;
+                for(int oi=0;oi<no;oi++){ int c2=vord[oi]; ESlot *e=ce[c2]; int nr=cnr[c2];
+                    if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
+                    if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
+                    double te0=now_s();
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    if(g_prof){ m->t_ecpu+=now_s()-te0;
+                        m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                        m->cpu_expert_rows+=(uint64_t)nr; }
+                }
+            }
+            double t_take0=now_s();
+            int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
+            if(g_prof) m->t_egpu+=now_s()-t_take0;
+            for(int c2=0;c2<nvk;c2++){ int nr=vrows[c2];
+                if(vk_ok){ int o=voff[c2];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *src=vk_yh+(int64_t)(o+r)*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
+                } else {   /* issue/take failed (device lost): load + recompute on the CPU */
+                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                }
+            }
+            /* dev2 group: taken AFTER dev0's accumulate so the slower card gets the
+             * extra overlap; same per-expert CPU recompute fallback on failure. */
+            if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
+                if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
+            int vk2_ok = iss2.rc && coli_vk_expert_group_take2(vk_yh2);
+            for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
+                if(vk2_ok){ int o=voff2[c2];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
+                } else {
+                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                }
+            }
+            double dt=now_s()-t0; m->t_emm+=dt;
+            if(g_prof) g_vkb_acc+=now_s()-t_take0;   /* take-wait (t_egpu) + result accumulate */
+        }
+#endif
+        if(!metal_done && !xexp_done && !vk_active)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
 #ifdef COLI_CUDA
             if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
@@ -3469,6 +4579,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
+            /* CAUSAL ABLATION (FASE C, contribution mode): this expert's routing,
+             * counters, and any route trace were already recorded in FASE A; its
+             * weighted output is now replaced by ZERO -> skip its matmul+accumulate.
+             * CPU path only (the ablation harness runs the CPU forward). */
+            if(g_abl.mode==1 && abl_zero_contrib(&g_abl, layer, eid)) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
             if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
@@ -3674,11 +4789,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 #endif
     if(!shared_cuda){
+#ifdef COLI_VULKAN
+        /* Whole shared expert as ONE fused submit (gate+up+silu -> down, hidden on-device)
+         * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
+         * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
+        int fsh=l->sh_gate.fmt;
+        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
+           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
+            #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
+            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
+               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
+               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
+                ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
+                int rows1[1]={S};
+                if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
+            }
+            #undef SW_
+        }
+        if(!shared_cuda){
+#endif
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
+#endif
         matmul_qt(sg, x, &l->sh_gate, S);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_up, su, x, S))
+#endif
         matmul_qt(su, x, &l->sh_up,   S);
         for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
+#endif
         matmul_qt(hh, sg, &l->sh_down, S);
+#ifdef COLI_VULKAN
+        }
+#endif
     }
     if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(sg); free(su);
@@ -3690,6 +4836,9 @@ shared_done:
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
+#endif
+#ifdef COLI_VULKAN
+    free(vk_xh); free(vk_yh);
 #endif
 }
 
@@ -3775,7 +4924,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
-static struct { int l,e; } pilot_q[4096];
+static struct { _Atomic int l,e; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
@@ -3783,46 +4932,63 @@ static Model *pilot_m=NULL;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
 static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_lock(&g_pilot_mx);
-    if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-        pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
+    if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
+        pthread_mutex_unlock(&g_pilot_mx); return;
     }
     ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
+#ifdef COLI_VULKAN
+    if(vk_reg_served(layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }   /* VK-tier-served: no load */
+#endif
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
-    if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
-        /* LFRU eviction guard (#441, fix #490): a speculation must not drop a WARM
-         * demand-loaded expert. We PROTECT the victim only when it is genuinely warm
-         * (>=2 demand accesses) AND clearly hotter than the speculation by tier_pick_lfru's
-         * 25%+4-freq hysteresis. The original #441 formula tested the speculation's score
-         * against victim+margin, which — because a speculation is by definition historically
-         * colder than a just-used demand expert — dropped ~all speculations once the cache
-         * was full, collapsing the LRU hit share (#490). Cache placement only -> output
-         * byte-identical (a dropped speculation is demand-loaded later, same value). */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
-            int vid=Sl[lru].eid; uint32_t vh=m->eheat[layer][vid];
+    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];   /* dedup contro residenti E prenotazioni in volo -(eid+2) */
+    for(int z=0;z<nn;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
+     * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
+     * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
+     * ecn bumpato subito, scan-vittima che salta le prenotazioni). */
+    int slot,isnew=0;
+    if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
+    else {
+        slot=-1;
+        for(int z=0;z<nn;z++){
+            if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
+            if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
+            if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
+        }
+        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti gli slot sono in volo */
+        /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
+         * protect the victim only when genuinely WARM (>=2 demand accesses) AND clearly
+         * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
+         * un-narrowed #474 test dropped ~all speculations on a full cache (#490).
+         * Skips free slots (eid==-1). Cache placement only -> output unchanged. */
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
+            int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
                 uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
                 if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); return; } } } }
+                                            pthread_mutex_unlock(&g_pilot_mx); return; } } }
+    }
     ESlot *dst=&Sl[slot];
-    dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
+    dst->eid=-(eid+2);                                  /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
+    (void)isnew;
+    dst->used=(uint64_t)-1;                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
+                                                         * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
+                                                         * far superare da altri load durante il pread). used fresco ristampato al successo. */
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server; demand=0: speculative, never classified */
+    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, concorrente fra worker (come i PIPE demand); fatal=0: una speculazione fallita NON uccide il server; demand=0: speculative, never classified. Al successo expert_load setta dst->eid=eid. */
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-        if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
+        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
+        dst->eid=-1;                                    /* load fallito: libera la prenotazione (slot resta in ecn ma nascosto, riusabile) */
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
     pthread_cond_broadcast(&g_pilot_cv);
@@ -3838,7 +5004,7 @@ static void pilot_uring_batch(Model *m){
     unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
     unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
     while(r!=w && nd<URING_LOAD_MAX){
-        int layer=pilot_q[r&4095].l,eid=pilot_q[r&4095].e; r++;
+        int layer=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed),eid=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed); r++;
         if(layer<0 || layer>=256){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue; }
         pthread_mutex_lock(&g_pilot_mx);
         if(layer<=atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
@@ -3846,6 +5012,9 @@ static void pilot_uring_batch(Model *m){
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
         int found=0; ESlot *P=m->pin[layer];
+#ifdef COLI_VULKAN
+        if(vk_reg_served(layer,eid)) found=1;               /* VK-tier-served: no load */
+#endif
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
         ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
         for(int z=0;z<nn && !found;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)) found=1;
@@ -3859,21 +5028,17 @@ static void pilot_uring_batch(Model *m){
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
             }
-            /* LFRU eviction guard (#441, fix #490): protect a WARM resident from a speculation.
-             * Same corrected test as pilot_realload: victim must be genuinely warm (>=2 accesses)
-             * AND clearly hotter (25%+4-freq hysteresis). See pilot_realload for the rationale and
-             * the #490 regression the original formula caused. */
-            if(slot>=0 && Sl[slot].eid>=0 && g_pilot_evict_guard && m->eheat && m->elast){
-                int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
-                if(vh>=2){
-                    uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                    uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                    if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                                pthread_mutex_unlock(&g_pilot_mx); continue; }
-                }
-            }
         }
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
+        /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
+         * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
+            int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
+            if(vh>=2){
+                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                            pthread_mutex_unlock(&g_pilot_mx); continue; } } }
         ESlot *dst=&Sl[slot];
         dst->eid=-(eid+2);                         /* visible reservation; never considered resident/evictable */
         g_pilot_inflight[layer]++;
@@ -3915,22 +5080,63 @@ static void pilot_uring_batch(Model *m){
     }
 }
 #endif
-static void *pilot_worker(void *arg){
-    (void)arg;
+/* SPMC ring claim: each of N pilot workers grabs a UNIQUE ring index via CAS, never
+ * advancing past pilot_w. Returns 1 and *out=index, or 0 if the ring is empty. The
+ * producer stays single (main thread, only pilot_w) — this only splits the consumer. */
+static int pilot_ring_claim(int *out_l, int *out_e){
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
-        if(r==w){ usleep(200); continue; }
-        if(g_pilot_real){
-#ifdef __linux__
-            if(g_uring){ pilot_uring_batch(pilot_m); continue; }
-#endif
-            pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        if(r==w) return 0;                              /* empty */
+        /* Read the payload BEFORE committing the claim. While pilot_r==r the slot at
+         * index r cannot be overwritten (the producer's w-r<4096 guard keeps pilot_w
+         * below r+4096). If the CAS succeeds, pilot_r was r the whole time -> the read
+         * is valid. If it fails, another worker advanced pilot_r; we discard and retry
+         * (a torn read there is thrown away, never used). */
+        int l=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed), e=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        if(__atomic_compare_exchange_n(&pilot_r,&r,r+1,/*weak=*/1,
+                                       __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+            *out_l=l; *out_e=e; return 1;                /* claimed exactly one item, payload valid */
         }
-        else             expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
-        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+        /* lost the CAS race to another worker -> retry */
+    }
+}
+static void *pilot_worker(void *arg){
+    (void)arg;
+    for(;;){
+#ifdef __linux__
+        if(g_pilot_real && g_uring){                    /* URING drains a whole batch itself -> single worker (nw==1) */
+            unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+            unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+            if(r==w){ usleep(200); continue; }
+            pilot_uring_batch(pilot_m);
+            continue;
+        }
+#endif
+        int l,e;                                        /* blocking / hint path: SPMC, one item per worker */
+        if(!pilot_ring_claim(&l,&e)){ usleep(200); continue; }
+        if(g_pilot_real) pilot_realload(pilot_m, l, e); /* QD=N: N concurrent preads instead of 1 */
+        else             expert_prefetch(pilot_m, l, e);
     }
     return NULL;
+}
+/* Spawn the pilot worker(s) ONCE, from the MAIN thread (first pilot_prefetch/couple_prefetch).
+ * Only the blocking PILOT_REAL path fans out to g_pilot_nw threads; the URING path already
+ * batches to QD>1 and hint-only is cheap fadvise, so both keep a single worker. */
+static void pilot_spawn(Model *m){
+    if(pilot_m) return;                                 /* pilot_m is the once-guard; only the main thread calls this */
+    pilot_m=m;
+    int uring_active=0;
+#ifdef __linux__
+    uring_active=g_uring;
+#endif
+    /* INVARIANTE: con URING attivo nw DEVE restare 1 — pilot_uring_batch e' un
+     * consumatore SINGOLO (avanza pilot_r con uno store semplice, non la CAS di
+     * pilot_ring_claim); due drainer URING concorrenti corromperebbero pilot_r.
+     * Il ramo blocking (pilot_ring_claim, CAS) e' invece SPMC-safe a N. */
+    int nw=(g_pilot_real && !uring_active)?g_pilot_nw:1;
+    if(nw<1) nw=1; if(nw>16) nw=16;
+    for(int i=0;i<nw;i++){ pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
 }
 /* parse .coli_pairs (see tools/route_pairs.py): "COLIPAIRS 1 <n>" then
  * "<L> <dL> <e> f:c f:c ..." lines. Needs c->n_experts/n_layers -> called post-init. */
@@ -3971,7 +5177,7 @@ static void couple_load(Model *m, const char *path){
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
     Cfg *c=&m->c; int E=c->n_experts;
     if(E>512) return;
-    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    pilot_spawn(m);
     for(int dL=1; dL<=g_couple_d; dL++){
         int lt=layer+dL;
         if(lt>=c->n_layers || !m->L[lt].sparse) continue;
@@ -3988,6 +5194,9 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             int found=0;                            /* residency scan, same locking as pilot */
             pthread_mutex_lock(&g_pilot_mx);
             ESlot *P=m->pin[lt];
+#ifdef COLI_VULKAN
+            if(vk_reg_served(lt,best)) found=1;             /* VK-tier-served: no load */
+#endif
             for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lt];
             for(int z=0;z<m->ecn[lt] && !found;z++)
@@ -3996,7 +5205,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lt; pilot_q[w&4095].e=best;
+                    atomic_store_explicit(&pilot_q[w&4095].l,lt,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                     g_cp_enq++;
                 }
@@ -4007,7 +5216,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
-    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    pilot_spawn(m);
     float *nrm=falloc(D), *ch=falloc(E);
     /* Two-step workspace (allocated once, reused across positions) */
     float *snrm=NULL, *sg=NULL, *su=NULL, *sout=NULL, *hc=NULL;
@@ -4050,6 +5259,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             int found=0;
             pthread_mutex_lock(&g_pilot_mx);
             ESlot *P=m->pin[lnext];
+#ifdef COLI_VULKAN
+            if(vk_reg_served(lnext,best)) found=1;          /* VK-tier-served: no load */
+#endif
             for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lnext];
             for(int z=0;z<m->ecn[lnext] && !found;z++)
@@ -4058,7 +5270,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
-                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
+                    atomic_store_explicit(&pilot_q[w&4095].l,lnext,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                 }
             }
@@ -4129,7 +5341,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * ROUTE_P / ROUTE_TRACE keep the CPU ranking they need. */
     static int lr_idx[64]; static float lr_w[64]; static int lr_keff[1];
     int dev_routed=0;
-    if(g_cuda_router && S==1 && !g_cache_route && g_route_p<=0.f && !g_route_fp
+    if(g_cuda_router && S==1 && !g_cache_route && g_route_p<=0.f && !rt_tracing()
        && c->n_experts<=4096 && c->topk<=64 && !l->router_cuda_bad){
         int E=c->n_experts, K=c->topk;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
@@ -4217,19 +5429,46 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                                KVState *const *kvs, const int *positions, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
-        for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
+        for(int z=0;z<m->enr[li];z++){
+            int pe=m->eroute[li][z];
+#ifdef COLI_VULKAN
+            /* VK-tier-served experts never need host bytes at decode — their pages are
+             * never demand-read, so on a RAM-tight box this WILLNEED would re-fetch the
+             * same hot experts from disk every time cache pressure evicts them (#523).
+             * S>4 = prefill batches, where the tier doesn't serve and the hint stays. */
+            if(S<=4 && vk_reg_served(li,pe)) continue;
+#endif
+            expert_prefetch(m,li,pe);
+        }
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
 #ifdef COLI_METAL
     /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
      * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
-     * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
+     * single Lc/Rc + pos_base contract — see the matching guard in attention_rows.
+     * metal_fused_fmt_ok(q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): POSITIVE allowlist
+     * (fmt 1/2/4), same fail-closed discipline as attention_rows, extended to the
+     * shared-expert MLP this fused kernel also covers. The mm_gemv shader these
+     * bind_gemv calls dispatch through has a real fmt==8 branch (this PR's own
+     * Metal kernel commit), but the WP_() macro below picks q8 only for fmt==1
+     * and q4 (NULL/unallocated for fmt=8) otherwise, so none of these seven
+     * bind_gemv-routed tensors can safely carry fmt=8 through this fused path
+     * yet -- and a fmt=5/6 tensor's REAL q4 bytes would be silently misread by
+     * the shader's terminal f32 fallback (see the predicate's comment). CPU
+     * below dispatches every format correctly, incl. fmt=8 via
+     * matmul_qt_ex/matmul_fp8. Fixing WP_() and wiring fmt=8 through bind_gemv
+     * is the same deferred follow-up noted in attention_rows, not done in this
+     * round. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
-       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
+       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
+       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)
+       && metal_fused_fmt_ok(l->sh_gate.fmt) && metal_fused_fmt_ok(l->sh_up.fmt)
+       && metal_fused_fmt_ok(l->sh_down.fmt)){
         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
@@ -4240,14 +5479,14 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
             double ta0=now_s();
             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
             int ok = coli_metal_layer_decode(x, l->in_ln, l->post_ln,
-                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
-                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
-                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
                 WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
-                WP_(l->o), l->o.s, l->o.fmt,
-                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt,
-                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,
-                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
+                WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
+                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt, l->sh_gate.gs,
+                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,   l->sh_up.gs,
+                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt, l->sh_down.gs,
                 l->router, l->router_bias,
                 c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
                 m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
@@ -4392,6 +5631,12 @@ static void kv_alloc(Model *m, int max_t){
         m->kv_dev_valid[i]=0;
     }
 #endif
+#ifdef COLI_VULKAN
+    if(g_vulkan&&m->vk_kv_valid){                        /* dimensioni cambiate: cache VK da rifare */
+        coli_vk_kv_reset();
+        for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
+    }
+#endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
@@ -4426,6 +5671,10 @@ static void kv_alloc(Model *m, int max_t){
 static void kv_bind(Model *m, KVState *k){
     if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
         for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
+#ifdef COLI_VULKAN
+    if(m->kv!=k && m->vk_kv_valid)                  /* la cache VK specchia la KV corrente */
+        for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
+#endif
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
@@ -4521,6 +5770,53 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
 /* METODO E — prompt-lookup: cerca l'occorrenza piu' recente dell'ultimo bigramma nel
  * contesto e propone i token che la seguirono. Zero pesi extra, zero costo: e' solo
  * un'ipotesi che il modello verifichera'. */
+/* ---- CORPUS DRAFTS (REST-style external draft source) ----------------------
+ * COLI_DRAFT_CORPUS=<file>  whitespace-separated token ids of past generations
+ *                           (build one with TOKENS=1, which already dumps them)
+ * COLI_CORPUS_K=n           proposal depth, default 8 (cap 48: batch[64] in spec_decode)
+ * Proposals come from the longest suffix of the live context that also occurs in
+ * the corpus; the engine's existing verification accepts only what it would have
+ * generated anyway, so output stays byte-identical (lossless by construction).
+ * Unlike MTP (1 token/forward) a corpus hit proposes a whole span at once. */
+static int *g_corp=NULL; static long g_corp_n=0; static int g_corp_k=0;
+static uint64_t g_corp_prop=0, g_corp_acc=0;
+static void corpus_load(void){
+    const char *p=getenv("COLI_DRAFT_CORPUS");
+    if(!p||!*p) return;
+    FILE *f=fopen(p,"rb");
+    if(!f){ fprintf(stderr,"[CORPUS] cannot open %s\n",p); return; }
+    long cap=1<<16; g_corp=malloc((size_t)cap*sizeof(int)); g_corp_n=0;
+    int v;
+    while(g_corp && fscanf(f,"%d",&v)==1){
+        if(g_corp_n>=cap){ cap*=2; int *n2=realloc(g_corp,(size_t)cap*sizeof(int));
+            if(!n2){ free(g_corp); g_corp=NULL; break; } g_corp=n2; }
+        g_corp[g_corp_n++]=v;
+    }
+    fclose(f);
+    if(!g_corp){ g_corp_n=0; fprintf(stderr,"[CORPUS] OOM\n"); return; }
+    g_corp_k=getenv("COLI_CORPUS_K")?atoi(getenv("COLI_CORPUS_K")):8;
+    if(g_corp_k<1) g_corp_k=1;
+    if(g_corp_k>48) g_corp_k=48;
+    fprintf(stderr,"[CORPUS] %ld ids from %s (draft depth %d)\n",g_corp_n,p,g_corp_k);
+}
+static int corpus_draft(const int *ctx, int nctx, int *out, int k, int minn, int maxn){
+    /* il minimo utile e' un match di `minn` piu' ALMENO un token da proporre:
+     * sotto quella soglia non esiste proposta possibile (#test_corpus_draft) */
+    if(!g_corp||g_corp_n<(long)minn+1||nctx<minn||k<1) return 0;
+    for(int n=maxn;n>=minn;n--){
+        if(n>nctx) continue;
+        const int *suf=ctx+nctx-n;
+        for(long i=g_corp_n-n-1;i>=0;i--){
+            int ok=1;
+            for(int j=0;j<n;j++) if(g_corp[i+j]!=suf[j]||g_corp[i+j]<0){ ok=0; break; }
+            if(!ok) continue;
+            int g=0;
+            for(int j=0;j<k && i+n+j<g_corp_n && g_corp[i+n+j]>=0;j++) out[g++]=g_corp[i+n+j];
+            if(g>0) return g;
+        }
+    }
+    return 0;
+}
 static int ngram_draft(const int *ids, int len, int G, int *draft){
     if(len<4 || G<1) return 0;
     int a=ids[len-2], b=ids[len-1];
@@ -4729,6 +6025,15 @@ static void intr_install(void){
 #else
 static void intr_install(void){}
 #endif
+/* #678: mid-turn STOP/CANCEL for the single-slot speculative serve path. With
+ * KV_SLOTS=1 the whole turn runs inside ONE spec_decode call, so run_serve_mux's
+ * stdin poll never runs mid-turn and a server-sent STOP (raised when its stop
+ * filter matches, e.g. a role marker) sat unread until max_tokens. These flags
+ * are raised by mux_ctl_poll (called from the mux emit callback, once per emitted
+ * token) and checked in spec_decode next to g_intr. They are only ever set while
+ * a mux spec turn is running and are reset at each turn boundary, so every other
+ * spec_decode caller (chat, run, oracle) sees them permanently 0. */
+static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
@@ -4746,7 +6051,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
-    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
+    uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
+    while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
+        /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -4757,6 +6064,31 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                                                          * forza, l'acceptance e' ~1 (#48) */
             g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
+        }
+        if(!g && g_corp && g_corp_k>0){                 /* corpus: uno span intero per forward
+                                                         * dove il contesto ricalca il congelato */
+            /* Guard di accettazione (stessa forma di quello MTP sopra, soglia diversa).
+             * Un draft di corpus RIFIUTATO costa piu' di uno MTP: la verifica batcha
+             * 1+K righe e in un MoE ogni riga attiva i propri expert, quindi lo spreco
+             * scala con la profondita'. Misurato su GLM-5.2/H200: 90% acceptance =
+             * +22% decode, 19% = -25% (il break-even sta circa a meta'). Sotto
+             * COLI_CORPUS_MINACC (default 50%) la fonte si mette in pausa. */
+            if(cp_pause>0){ cp_pause--; if(!cp_pause){ cp_prop0=g_corp_prop; cp_acc0=g_corp_acc; } }
+            else {
+                uint64_t pw=g_corp_prop-cp_prop0, aw=g_corp_acc-cp_acc0;
+                int minacc=getenv("COLI_CORPUS_MINACC")?atoi(getenv("COLI_CORPUS_MINACC")):50;
+                if(minacc<0) minacc=0; if(minacc>100) minacc=100;
+                if(pw>=24 && aw*100 < pw*(uint64_t)minacc){
+                    fprintf(stderr,"[CORPUS] %.0f%% acceptance over the last %llu proposals (<%d%%): "
+                            "drafts paused for %d tokens\n",
+                            100.0*aw/pw,(unsigned long long)pw,minacc,(int)GUARD_PAUSE_TOKENS);
+                    cp_pause=GUARD_PAUSE_TOKENS;
+                }
+            }
+            if(!cp_pause){
+                g=corpus_draft(all,kv+1,draft,g_corp_k,3,8);
+                if(g>0){ gsrc=3; g_corp_prop+=(uint64_t)g; }
+            }
         }
         if(!g && g_draft>0 && m->has_mtp){
             /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
@@ -4797,6 +6129,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
+        else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
@@ -4934,6 +6267,108 @@ static void run_score(Model *m, const char *snap, const char *path){
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
 
+/* ===========================================================================
+ * CAUSAL-ABLATION teacher-forced path.  Reached via ABLATE_SCORE=<manifest>;
+ * writes per-target-position final-logit summaries to ABLATE_OUT=<file> (JSONL).
+ * For each item it configures g_abl (mode + ablated (layer,expert) cells), runs
+ * ONE teacher-forced prefill (moe() applies the ablation), then reads out the
+ * FINAL logits at every target position -- the causal effect on the model's real
+ * output, not a logit lens.  If ROUTE_TRACE=<path> is also set, moe() dumps the
+ * POST-ablation router trace for free (the host correlates by manifest order).
+ *
+ * Manifest, one item per line, whitespace ints:
+ *     item  T  n_prompt  mode  ncells  (L E A){ncells}  t_0 .. t_{T-1}
+ *   item    = manifest item id (host joins to (corpus_item, condition, cell))
+ *   T       = seq length (prompt + teacher-forced target)
+ *   n_prompt= # prompt tokens; targets are positions [n_prompt, T)
+ *   mode    = 0 baseline | 1 contribution | 2 route-around | 3 module-swap
+ *   ncells  = # ablated cells (0 for baseline)
+ *   L E A   = layer, expert, swap-target (A=-1 unless mode 3), one triple per cell
+ *   t_*     = token ids (host pre-tokenised, prefix included if the model needs it)
+ * abl_reset() before each item makes the ablation PER-ITEM (an item's spec can
+ * never leak into the next). NLL/margin/correctness are exact; top-K is for a
+ * paired approximate next-token KL on the host. */
+#define ABL_LOGIT_TOPK 32
+static void run_ablate_score(Model *m, const char *path){
+    Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
+    FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
+    const char *outp=getenv("ABLATE_OUT");
+    FILE *of = outp ? fopen(outp,"wb") : NULL;
+    if(outp && !of){ fprintf(stderr,"[ablate] cannot open ABLATE_OUT=%s\n",outp); }
+    if(of) fprintf(of,"{\"t\":\"hdr\",\"schema\":\"coli-ablate/1\",\"vocab\":%d,\"topk\":%d}\n",V,ABL_LOGIT_TOPK);
+    int maxT=1; { char *ln=NULL; size_t cp=0;
+        while(getline(&ln,&cp,f)>0){ long id,T; char *e;
+            id=strtol(ln,&e,10); if(e==ln) continue; T=strtol(e,&e,10);
+            if(T>maxT) maxT=(int)T; (void)id; }
+        free(ln); }
+    kv_alloc(m,maxT);
+    float *x=falloc((int64_t)maxT*D), *lo=falloc(V), *row=falloc(D);
+    int *ids=malloc((size_t)maxT*sizeof(int));
+    int tk_id[ABL_LOGIT_TOPK]; float tk_val[ABL_LOGIT_TOPK];
+    rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
+    while(getline(&ln,&cp,f)>0){
+        char *p=ln, *e;
+        long item=strtol(p,&e,10); if(e==p) continue; p=e;                 /* blank line */
+        long T=strtol(p,&e,10);  if(e==p){ fprintf(stderr,"[ablate] bad T\n"); continue; } p=e;
+        long np=strtol(p,&e,10); if(e==p){ fprintf(stderr,"[ablate] bad n_prompt\n"); continue; } p=e;
+        long mode=strtol(p,&e,10); if(e==p){ fprintf(stderr,"[ablate] bad mode\n"); continue; } p=e;
+        long nc=strtol(p,&e,10);  if(e==p){ fprintf(stderr,"[ablate] bad ncells\n"); continue; } p=e;
+        int Ls[ABL_MAX_CELLS], Es[ABL_MAX_CELLS], As[ABL_MAX_CELLS];
+        int bad=0; long ncc = nc<0?0:(nc>ABL_MAX_CELLS?ABL_MAX_CELLS:nc);
+        for(long i=0;i<nc;i++){                                            /* read every triple; keep first ABL_MAX_CELLS */
+            long L=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
+            long E=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
+            long A=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
+            if(i<ncc){ Ls[i]=(int)L; Es[i]=(int)E; As[i]=(int)A; }
+        }
+        bad = bad || (T<1 || T>maxT || np<0 || np>T || mode<0 || mode>3);
+        for(long i=0;i<T && !bad;i++){ long v=strtol(p,&e,10); if(e==p){bad=1;break;} p=e;
+            if(v<0 || v>=V) bad=1; else ids[i]=(int)v; }
+        if(bad){ fprintf(stderr,"[ablate] ERR item %ld (bad field/token)\n",item); continue; }
+        /* PER-ITEM RESET then configure this item's ablation (no cross-item leak). */
+        abl_reset(&g_abl);
+        abl_set_item(&g_abl, (int)mode, Ls, Es, (mode==3?As:NULL), (int)ncc);
+        if(of){
+            fprintf(of,"{\"t\":\"ah\",\"item\":%ld,\"mode\":%ld,\"ncells\":%ld,\"T\":%ld,\"n_prompt\":%ld,\"cells\":[",
+                    item, mode, ncc, T, np);
+            for(int i=0;i<(int)ncc;i++) fprintf(of,"%s[%d,%d,%d]", i?",":"", Ls[i],Es[i],As[i]);
+            fprintf(of,"]}\n");
+        }
+        for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+        layers_forward(m,x,(int)T,0);                                      /* ONE prefill; moe() applies g_abl */
+        /* FINAL-logit read-out at every target position pos in [np-1, T-1). */
+        if(of) for(long pos=(np>0?np-1:0); pos<T-1; pos++){
+            rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
+            matmul_qt(lo, row, &m->lm_head, 1);
+            int gold=ids[pos+1];
+            float mx=lo[0]; int am=0;
+            for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];am=i;} }
+            double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
+            double logZ=(double)mx+log(se);
+            double gnll=logZ-(double)lo[gold];                             /* -log p(gold) */
+            float molo=-1e30f; for(int i=0;i<V;i++){ if(i!=gold && lo[i]>molo) molo=lo[i]; }
+            float mgn=lo[gold]-molo;                                       /* gold-vs-best-competitor logit margin */
+            for(int k=0;k<ABL_LOGIT_TOPK;k++){ tk_id[k]=-1; tk_val[k]=-1e30f; }
+            for(int i=0;i<V;i++){ float v=lo[i];
+                int mn=0; for(int k=1;k<ABL_LOGIT_TOPK;k++) if(tk_val[k]<tk_val[mn]) mn=k;
+                if(v>tk_val[mn]){ tk_val[mn]=v; tk_id[mn]=i; } }
+            fprintf(of,"{\"t\":\"lg\",\"item\":%ld,\"pos\":%ld,\"gold\":%d,\"nll\":%.6f,"
+                       "\"glogit\":%.6g,\"molo\":%.6g,\"mgn\":%.6g,\"am\":%d,\"amlogit\":%.6g,"
+                       "\"logZ\":%.6f,\"corr\":%d,\"tk\":[",
+                    item, pos, gold, gnll, (double)lo[gold], (double)molo, (double)mgn,
+                    am, (double)mx, logZ, (am==gold)?1:0);
+            for(int k=0;k<ABL_LOGIT_TOPK;k++) fprintf(of,"%s[%d,%.5g]", k?",":"", tk_id[k], (double)tk_val[k]);
+            fprintf(of,"]}\n");
+        }
+        if(of) fflush(of);
+        if(++nreq%8==0) fprintf(stderr,"[ablate %d item | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
+            nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
+    }
+    abl_reset(&g_abl);                                                     /* leave the engine in the OFF state */
+    if(of){ fflush(of); fclose(of); }
+    free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
+}
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
@@ -4954,13 +6389,21 @@ static void profile_print(Model *m, double elapsed){
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
+#ifdef COLI_VULKAN
+    if(g_prof && g_vkb_blocks)
+        printf("VK-BLOCK: %lld blocks | avg nvk %.2f (dev2 %.2f) / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | d2-iss wrk %.3fs join %.3fs | cpu exec %.3fs wait %.3fs\n",
+            (long long)g_vkb_blocks,(double)g_vkb_nvk/g_vkb_blocks,(double)g_vkb_nvk2/g_vkb_blocks,(double)g_vkb_ncpu/g_vkb_blocks,
+            g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,g_vkb_wrk,g_vkb_join,m->t_ecpu,m->t_ewait);
+#endif
     if(g_mirror){
-        double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
-        double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
-        printf("MIRROR: primary %.2f GB (%lld reads) | mirror %.2f GB (%lld reads) — %.0f%% of expert bytes from the mirror\n",
-            b0,(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed),
-            b1,(long long)atomic_load_explicit(&g_mir_nread[1],memory_order_relaxed),
-            b0+b1>0?100.0*b1/(b0+b1):0.0);
+        double br[MIR_REPS]={0}, bt=0;
+        for(int r=0;r<g_mir_nrep;r++){ br[r]=atomic_load_explicit(&g_mir_bytes[r],memory_order_relaxed)/1e9; bt+=br[r]; }
+        printf("MIRROR: primary %.2f GB (%lld reads)",
+            br[0],(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed));
+        for(int r=1;r<g_mir_nrep;r++)
+            printf(" | mirror%d %.2f GB (%lld reads)",
+                r,br[r],(long long)atomic_load_explicit(&g_mir_nread[r],memory_order_relaxed));
+        printf(" — %.0f%% of expert bytes from the mirrors\n", bt>0?100.0*(bt-br[0])/bt:0.0);
     }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
@@ -4979,6 +6422,9 @@ static void profile_reset(Model *m){
     m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_ecpu=m->t_egpu=m->t_route=m->t_p2p=0;m->n_p2p=0;
     m->cpu_expert_bytes=0;m->cpu_expert_rows=0;
+#ifdef COLI_VULKAN
+    g_vkb_cls=g_vkb_issue=g_vkb_acc=g_vkb_wrk=g_vkb_join=0; g_vkb_blocks=g_vkb_nvk=g_vkb_nvk2=g_vkb_ncpu=0;
+#endif
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
@@ -5102,11 +6548,10 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
-    atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
-    atomic_store(&g_mir_nread[0],0); atomic_store(&g_mir_nread[1],0);
+    for(int r=0;r<MIR_REPS;r++){ atomic_store(&g_mir_bytes[r],0); atomic_store(&g_mir_nread[r],0); }
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         double tf0=g_prof?now_s():0;
@@ -5166,7 +6611,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     }
     prefill_t=now_s()-prefill_t;
     printf("PROFILO PREFILL (%.2fs):\n",prefill_t); profile_print(m,prefill_t);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
     m->n_emit=m->n_fw=0;
     g_last_repin=0;
     profile_reset(m);
@@ -5179,9 +6624,11 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\nprefill %d tokens in %.2fs | decode %d tokens in %.2fs (%.2f tok/s) | "
-           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%) | RSS %.2f GB",       /* split #336: quale tier serve gli hit */
+           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%%s) | RSS %.2f GB",     /* split #336 (+VK VRAM tier) */
         np,prefill_t,produced,dt,produced/dt,tot?100.0*m->hits/tot:0.0,
-        tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0, rss_gb());
+        tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0,
+        m->hit_vk?({ static char vkb[40]; snprintf(vkb,sizeof(vkb)," + vk %.1f%%",tot?100.0*m->hit_vk/tot:0.0); vkb; }):"",
+        rss_gb());
     if(g_cache_route && m->route_slots)
         printf(" | swap %.1f%% (%llu/%llu)",
             100.0*m->route_swaps/m->route_slots,
@@ -5202,6 +6649,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
+    if(g_corp_prop) printf("corpus drafts: %.0f%% acceptance (%llu/%llu proposed from %ld frozen ids)\n",
+        100.0*g_corp_acc/g_corp_prop, (unsigned long long)g_corp_acc,
+        (unsigned long long)g_corp_prop, g_corp_n);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
     if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
@@ -5233,6 +6683,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
      * for exact A/B comparison across decode paths (e.g. resident vs CPU).
      * The ids are all[np .. np+produced-1]. */
     if(getenv("TOKENS") && atoi(getenv("TOKENS"))){
+        fprintf(stderr,"[PROMPT_TOKENS] %d:",np);
+        for(int i=0;i<np;i++) fprintf(stderr," %d",all[i]);
+        fprintf(stderr,"\n");
         fprintf(stderr,"[TOKENS] %d generated:",produced);
         for(int i=np;i<np+produced;i++) fprintf(stderr," %d",all[i]);
         fprintf(stderr,"\n");
@@ -5494,9 +6947,62 @@ static void mux_data(Tok *T, unsigned long long id, int token){
     fflush(stdout);
 }
 
+/* #678: non-blocking stdin poll while a single-slot spec turn is running. Consumes
+ * pending STOP/CANCEL lines (raising g_mux_stop/g_mux_cancel for the active id) so
+ * the server's stop takes effect within ~1 token instead of after max_tokens. The
+ * framed protocol stays in sync: STOP/CANCEL are single lines; a SUBMIT cannot
+ * legally arrive while the only slot is busy, but if one does its payload is
+ * drained and it is refused with SLOT_BUSY exactly as mux_submit would. On stdin
+ * types the platform cannot poll (e.g. Windows non-pipe stdin), ready stays 0 and
+ * behaviour falls back to the pre-#678 end-of-turn handling. */
+static void mux_ctl_poll(unsigned long long id){
+    for(;;){
+        int ready=0;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+        struct timeval tv={0,0};
+        ready = select(STDIN_FILENO+1,&rfds,NULL,NULL,&tv)>0 && FD_ISSET(STDIN_FILENO,&rfds);
+#elif defined(_WIN32)
+        HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
+        DWORD avail=0;
+        ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
+#endif
+        if(!ready) return;
+        char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
+        if(nr<0){ free(line); return; }
+        if(nr && line[nr-1]=='\n') line[--nr]=0;
+        unsigned long long cid=0; char tail;
+        if(!strncmp(line,"STOP ",5) && sscanf(line+5,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_stop=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else if(!strncmp(line,"CANCEL ",7) && sscanf(line+7,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_cancel=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else{
+            ColiSubmit sub;
+            if(coli_submit_parse(line,&sub)){
+                long long left=(long long)sub.bytes+(long long)sub.gbytes;   /* drain payload */
+                char buf[4096];
+                while(left>0){
+                    size_t take = left>(long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
+                    size_t got=fread(buf,1,take,stdin); if(!got) break; left-=(long long)got;
+                }
+                int delim=fgetc(stdin); (void)delim;                          /* trailing '\n' */
+                printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout);
+            }else{
+                printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout);
+            }
+        }
+        free(line);
+    }
+}
+
 /* emit callback for the single-slot speculative path: stream straight to the mux protocol */
 typedef struct { Tok *T; unsigned long long id; } MuxEmit;
-static void mux_spec_emit(int t, void *ud){ MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t); }
+static void mux_spec_emit(int t, void *ud){
+    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t);
+    mux_ctl_poll(e->id);                 /* #678: honor STOP/CANCEL within ~1 token */
+}
 
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
@@ -5788,15 +7294,29 @@ static void run_serve_mux(Model *m, const char *snap){
                  * the exact contract run_serve (non-mux) already uses. No chunk
                  * splicing (that would re-enter spec_decode mid-turn and double
                  * the boundary token); Ctrl-C interrupts through g_intr inside
-                 * spec_decode, same as every other serve path. r->spec_logit
-                 * holds the prefill continuation from mux_submit. */
+                 * spec_decode, and a server STOP/CANCEL through g_mux_stop /
+                 * g_mux_cancel raised by mux_ctl_poll in the emit callback (#678).
+                 * r->spec_logit holds the prefill continuation from mux_submit. */
                 kv_bind(m,&sc->kv);
                 g_temp=r->temp; g_nuc=r->top_p;
                 float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
                 MuxEmit ud={&T,r->id};
+                g_mux_stop=0; g_mux_cancel=0;                  /* fresh per turn (#678) */
                 int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
                                      mux_spec_emit,&ud,&sc->len,NULL);
                 r->emitted+=prod;
+                if(g_mux_cancel){
+                    /* mirror of mux_submit's CANCEL epilogue: no DONE frame, the
+                     * dispatcher expects ERROR <id> CANCELLED. KV history is kept
+                     * consistent exactly like the between-turns path. */
+                    g_mux_cancel=0; g_mux_stop=0;
+                    r->spec=0; r->active=0;
+                    kv_bind(m,&sc->kv);
+                    kv_disk_append(m,sc->hist,sc->len);
+                    printf("ERROR %llu CANCELLED\n",r->id); fflush(stdout);
+                    continue;
+                }
+                g_mux_stop=0;                /* STOP or natural end: same DONE path */
                 mux_done(m,sc,r);
                 continue;                    /* whole turn handled outside the shared batch */
             }
@@ -6040,6 +7560,152 @@ static int *read_arr(jval*o,const char*k,int*n){
 
 /* telemetry, stats, usage persistence — moved to telemetry.h */
 
+#ifdef COLI_VULKAN
+/* Pinned VK expert tier fill: upload the top-COLI_VK_EXPERTS heat-ranked routed experts
+ * ONCE at startup (mirrors the HIP VRAM tier: stable residency, zero uploads at decode).
+ * Ranking comes from the persistent usage history; already-pinned RAM slots feed the
+ * upload directly, the rest stream through one transient slot and are freed after. */
+typedef struct { uint32_t u; int layer, eid; } VkCand;
+static int vk_cand_cmp(const void *a, const void *b){
+    uint32_t ua=((const VkCand*)a)->u, ub=((const VkCand*)b)->u;
+    return ua<ub ? 1 : ua>ub ? -1 : 0;
+}
+/* Upload the VK dense working set (attention projections, absorb kv_b, o-proj,
+ * shared expert) at startup, BEFORE the tier fill. These ~8 GB otherwise
+ * allocate lazily on the first forwards — AFTER the tier has filled to its
+ * budget — and on a 16 GB card the late arrivals overflow to GTT (measured
+ * 2.1 GB spilled with a 320-expert int4 tier; every per-token attention
+ * submit then pays PCIe latency: absorb 1.69 → 2.26 ms/call, +34%). Claiming
+ * the dense set first lets the budget-capped tier fill see the true remainder
+ * and self-size to what actually fits in device memory. */
+static void vk_dense_preload(Model *m){
+    Cfg *c=&m->c;
+    if(!g_vulkan || !g_vk_dense) return;
+    double t0=now_s(); int64_t bytes=0; int nt=0, full=0;
+    for(int i=0;i<=c->n_layers && !full;i++){
+        Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
+        QT *ts[]={&l->q_a,&l->q_b,&l->kv_a,&l->kv_b,&l->o,&l->sh_gate,&l->sh_up,&l->sh_down};
+        for(size_t k=0;k<sizeof(ts)/sizeof(ts[0]);k++){
+            QT *t=ts[k];
+            if(t->vk || !VK_FMT_OK(t) || t->I<=0 || t->O<=0) continue;
+            const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+            if(!w || !t->s) continue;
+            if(!coli_vk_tensor_ensure(&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs)){
+                fprintf(stderr,"[VK] dense preload: VRAM full at layer %d — remaining tensors stay lazy\n",i);
+                full=1; break;
+            }
+            bytes+=coli_vk_tensor_bytes(t->vk); nt++;
+        }
+    }
+    if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
+                   nt,bytes/1e9,now_s()-t0);
+}
+
+static void vk_registry_fill(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
+    if(!g_vulkan || g_vk_budget<=0) return;
+    int64_t nz=0;
+    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
+    if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "
+                     "(it seeds from %s as you use the model)\n", g_usage_path); return; }
+    VkCand *cand=malloc((size_t)nz*sizeof(VkCand)); if(!cand) return;
+    int64_t n=0;
+    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++)
+        if(m->eusage[i][e]) cand[n++]=(VkCand){m->eusage[i][e],i,e};
+    qsort(cand,(size_t)n,sizeof(VkCand),vk_cand_cmp);
+    g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E; g_vk_reg_NL=NL;
+    if(!g_vk_reg){ free(cand); return; }
+    ESlot tmp; memset(&tmp,0,sizeof(tmp)); tmp.eid=-1;
+    double t0=now_s(); int64_t bytes=0; int tried=0, loadfail=0;
+    /* Pressure-proofing: tier weights are the EVICTABLE class (0.4 vs scratch/KV 1.0,
+     * dense 0.75) so an oversubscribed heap sheds cold experts instead of thrashing
+     * the per-token attention submits; and the fill STOPS while the device-local
+     * budget still holds COLI_VK_RESERVE_GB (default 3) for the lazily-allocated
+     * dense weights + KV mirror + staging (measured ~1.7 GB at 4k ctx, growing with
+     * max_t). Without the budget extension the count cap alone applies, as before. */
+    double vkr_reserve = getenv("COLI_VK_RESERVE_GB")?atof(getenv("COLI_VK_RESERVE_GB")):3.0;
+    int vkr_stopped=0; double vkr_used=0, vkr_budget=0;
+    int64_t i2=0;
+    coli_vk_alloc_priority(0.4f);
+    for(;i2<n && g_vk_reg_n<g_vk_budget;i2++){
+        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
+           && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
+        int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
+        ESlot *src=NULL, *P=m->pin[layer];
+        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+        if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){   /* 0 = success (impl convention); demand=0: startup tier fill */
+                if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
+                if(loadfail>=64) break;                     /* disk trouble: stop burning time */
+                continue; } src=&tmp; }
+        int xf=src->g.fmt;   /* int4 (2), grouped int4 (4), int3-g64 (5) tiers; gate/up must
+                              * share fmt for the fused gate_up shader, down may differ */
+        if((xf!=2&&xf!=4&&xf!=5)||src->u.fmt!=xf||src->u.gs!=src->g.gs
+           ||(src->d.fmt!=2&&src->d.fmt!=4&&src->d.fmt!=5)
+           ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8))){
+            if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d not int4/int3-g64 (src=%s)\n",
+                layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
+            continue; }
+        ColiVkTensor **slot=vk_reg_at(layer,eid);
+        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
+           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
+           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
+            if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
+            if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+            fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
+            break;
+        }
+        bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+        g_vk_reg_n++;
+    }
+    coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
+    fprintf(stderr,"[VK] expert tier: %d hot experts resident (%.2f GB VRAM, %.1fs, top-%d of history)\n",
+            g_vk_reg_n,bytes/1e9,now_s()-t0,tried);
+    if(vkr_stopped)
+        fprintf(stderr,"[VK] expert tier: budget stop at %d experts — %.1f of %.1f GB device-local used, %.1f GB reserved (COLI_VK_RESERVE_GB)\n",
+                g_vk_reg_n,vkr_used,vkr_budget,vkr_reserve);
+    /* DEV2 tier: continue down the heat ranking onto the second GPU (COLI_VK_DEV2),
+     * starting at the candidate dev0 stopped on. Same fmt gates, its own budget. */
+    if(g_vk_budget2>0 && coli_vk_dev2_available()){
+        double t20=now_s(); int64_t bytes2=0; int tried2=0;
+        double vkr2_reserve = getenv("COLI_VK_RESERVE2_GB")?atof(getenv("COLI_VK_RESERVE2_GB")):0.5;
+        int vkr2_stopped=0; double u2=0,b2=0;
+        for(;i2<n && g_vk_reg_n2<g_vk_budget2;i2++){
+            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && coli_vk_mem_budget2(&u2,&b2)
+               && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
+            int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
+            ESlot *src=NULL, *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+            if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){
+                    if(++loadfail>=64) break;
+                    continue; } src=&tmp; }
+            int xf=src->g.fmt;
+            if((xf!=2&&xf!=4&&xf!=5)||src->u.fmt!=xf||src->u.gs!=src->g.gs
+               ||(src->d.fmt!=2&&src->d.fmt!=4&&src->d.fmt!=5)
+               ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8)))
+                continue;
+            ColiVkTensor **slot=vk_reg_at(layer,eid);
+            if(!coli_vk_tensor_ensure2(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
+               !coli_vk_tensor_ensure2(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
+               !coli_vk_tensor_ensure2(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
+                if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
+                if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+                fprintf(stderr,"[VK] dev2 tier: VRAM full after %d experts\n",g_vk_reg_n2);
+                break;
+            }
+            bytes2+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+            g_vk_reg_n2++;
+        }
+        fprintf(stderr,"[VK] dev2 tier: %d experts resident (%.2f GB VRAM, %.1fs, next-%d of history)\n",
+                g_vk_reg_n2,bytes2/1e9,now_s()-t20,tried2);
+        if(vkr2_stopped)
+            fprintf(stderr,"[VK] dev2 tier: budget stop at %d experts — %.1f of %.1f GB device-local used, %.1f GB reserved (COLI_VK_RESERVE2_GB)\n",
+                    g_vk_reg_n2,u2,b2,vkr2_reserve);
+    }
+    if(tmp.slab){ compat_aligned_free(tmp.slab); free(tmp.fslab); }
+    free(cand);
+}
+#endif
+
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
  * Ogni hit evita una lettura dal disco lento. */
@@ -6087,8 +7753,7 @@ static int mem_wire(void *addr, size_t len){
 static void qt_unwire_mmap(QT *t){
     if(!g_mmap || !mem_should_wire()) return;
     if(!t->q8 && !t->q4) return;
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b, scale_b; qt_wire_split(t,&weight_b,&scale_b);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(weight_b>0 && !munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
@@ -6101,8 +7766,7 @@ static void qt_unwire_mmap(QT *t){
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
     if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b, scale_b; qt_wire_split(t,&weight_b,&scale_b);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
     if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
     if(t->s && scale_b>0){ if(mem_wire(t->s,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }
@@ -6146,16 +7810,16 @@ static void pin_wire(Model *m){
 static double mirror_probe_bw(shards *S,int rep){
     int big=-1; int64_t bsz=0;
     for(int i=0;i<S->nfd;i++){
-        if(rep && S->mfds[i]<0) continue;
-        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        if(rep && S->mfds[rep-1][i]<0) continue;
+        int64_t sz=lseek(rep?S->mfds[rep-1][i]:S->fds[i],0,SEEK_END);
         if(sz>bsz){ bsz=sz; big=i; }
     }
     const int64_t blk=19ll<<20; const int NB=8;
     if(big<0 || bsz<blk*(NB+1)) return 0;
-    int dfd = rep? S->mdfds[big] : S->dfds[big];
-    int fd  = dfd>=0? dfd : (rep? S->mfds[big] : S->fds[big]);
-    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on %s: the probe may read the page cache — "
-                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep?"the mirror":"the primary");
+    int dfd = rep? S->mdfds[rep-1][big] : S->dfds[big];
+    int fd  = dfd>=0? dfd : (rep? S->mfds[rep-1][big] : S->fds[big]);
+    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on replica %d: the probe may read the page cache — "
+                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep);
     double t0=now_s(); int64_t tot=0;
     #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
     for(int i=0;i<NB;i++){
@@ -6171,37 +7835,82 @@ static double mirror_probe_bw(shards *S,int rep){
     return (dt>0 && tot>0)? tot/1e9/dt : 0;
 }
 
-/* DUAL-SSD setup: register the mirror copy, derive the read split from
- * COLI_DISK_WEIGHTS=<primary>,<mirror> or from a startup bandwidth probe.
- * Runs after model_init (needs the shard index) and BEFORE any pin/autopin
- * load, so the OMP-parallel pin warmup already streams from both drives. */
+/* MULTI-SSD setup: register every mirror copy listed in COLI_MODEL_MIRROR
+ * (';' or ',' separated dirs), derive the read split from
+ * COLI_DISK_WEIGHTS=<primary>,<mirror>[,<mirror2>...] or from a startup
+ * bandwidth probe. Runs after model_init (needs the shard index) and BEFORE
+ * any pin/autopin load, so the OMP-parallel pin warmup streams from all drives. */
 static void mirror_setup(Model *m){
     if(!g_mirror_dir) return;
-    const char *snap=getenv("SNAP");
-    if(snap && !strcmp(snap,g_mirror_dir)){
-        fprintf(stderr,"[MIRROR] mirror dir equals the model dir — ignored\n"); return;
+    const char *snap=getenv("SNAP"); if(!snap||!*snap) snap=getenv("COLI_MODEL");
+    st_mirror_reset(&m->S);
+    int nrep=1;
+    {   char buf[4096]; snprintf(buf,sizeof(buf),"%s",g_mirror_dir);
+        char *p=buf;
+        while(p && *p){
+            char *sep=p; while(*sep && *sep!=';' && *sep!=',') sep++;
+            int last=(*sep==0); *sep=0;
+            while(*p==' ') p++;
+            size_t plen=strlen(p); while(plen>0 && p[plen-1]==' ') p[--plen]=0;
+            if(*p){
+                if(snap && !strcmp(snap,p))
+                    fprintf(stderr,"[MIRROR] %s equals the model dir — ignored\n",p);
+                else if(nrep>=MIR_REPS)
+                    fprintf(stderr,"[MIRROR] %s: too many mirrors (max %d) — ignored\n",p,ST_MAX_MIR);
+                else {
+                    int nf=st_mirror_add(&m->S,p);
+                    if(nf<=0)
+                        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — skipped\n",p);
+                    else {
+                        fprintf(stderr,"[MIRROR] %s: %d/%d shards (replica %d)\n",p,nf,m->S.nfd,nrep);
+                        nrep++;
+                    }
+                }
+            }
+            p=last?NULL:sep+1;
+        }
     }
-    int nf=st_mirror_init(&m->S,g_mirror_dir);
-    if(nf<=0){
-        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — "
-                       "running on the primary drive only\n",g_mirror_dir);
+    if(nrep<2){
+        fprintf(stderr,"[MIRROR] no usable mirror — running on the primary drive only\n");
         return;
     }
-    g_mirror=1;
-    double wp=0,wm=0; const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
-    if(w && (sscanf(w," %lf , %lf",&wp,&wm)!=2 || wp<=0 || wm<=0)){
-        fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want e.g. 9,3) — probing instead\n",w);
-        wp=wm=0;
+    g_mirror=1; g_mir_nrep=nrep;
+    double wt[MIR_REPS]; int have=0;
+    const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
+    if(w && *w){
+        char wb[256]; snprintf(wb,sizeof(wb),"%s",w); int wn=0, bad=0;
+        for(char *tok=strtok(wb,", "); tok; tok=strtok(NULL,", ")){
+            double v=atof(tok);
+            if(v<=0 || wn>=MIR_REPS){ bad=1; break; }
+            wt[wn++]=v;
+        }
+        if(!bad && wn==nrep) have=1;
+        else fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive comma-separated "
+                            "weights, e.g. 9,3) — probing instead\n",w,nrep);
     }
-    if(wp<=0||wm<=0){
-        wp=mirror_probe_bw(&m->S,0); wm=mirror_probe_bw(&m->S,1); how="measured";
-        if(wp>0&&wm>0) fprintf(stderr,"[MIRROR] probe: primary %.2f GB/s, mirror %.2f GB/s\n",wp,wm);
-        else { wp=wm=1; how="fallback 1:1 (probe failed)"; }
+    if(!have){
+        have=1; how="measured";
+        for(int r=0;r<nrep;r++){ wt[r]=mirror_probe_bw(&m->S,r); if(wt[r]<=0) have=0; }
+        if(have){
+            fprintf(stderr,"[MIRROR] probe:");
+            for(int r=0;r<nrep;r++) fprintf(stderr,"%s %s %.2f GB/s",r?" |":"",r?"mirror":"primary",wt[r]);
+            fprintf(stderr,"\n");
+        } else { for(int r=0;r<nrep;r++) wt[r]=1; how="fallback 1:1 (probe failed)"; }
     }
-    int share=(int)(256.0*wm/(wp+wm)+0.5);
-    g_mir_share = share<1?1 : share>255?255 : share;
-    fprintf(stderr,"[MIRROR] %s: %d/%d shards | read split primary %.0f%% / mirror %.0f%% (%s)\n",
-        g_mirror_dir,nf,m->S.nfd,100.0*(256-g_mir_share)/256,100.0*g_mir_share/256,how);
+    double W=0; for(int r=0;r<nrep;r++) W+=wt[r];
+    int acc=0; double cum=0;
+    for(int r=0;r<nrep;r++){
+        cum+=wt[r];
+        int c=(int)(256.0*cum/W+0.5);
+        if(c<=acc) c=acc+1;            /* every replica keeps a non-empty slice */
+        if(c>256) c=256;
+        g_mir_cut[r]=c; acc=c;
+    }
+    g_mir_cut[nrep-1]=256;             /* the last replica absorbs rounding */
+    fprintf(stderr,"[MIRROR] %d drives | read split",nrep);
+    for(int r=0;r<nrep;r++){ int lo=r?g_mir_cut[r-1]:0;
+        fprintf(stderr,"%s %.0f%%",r?" /":"",100.0*(g_mir_cut[r]-lo)/256); }
+    fprintf(stderr," (%s)\n",how);
 }
 
 typedef struct { int l,e; uint32_t c; } PinRec;
@@ -6260,19 +7969,30 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
 #endif
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static double g_mem_avail_boot;   /* def. sotto (#653: corretta qui su GPU integrate) */
-static void pin_load(Model *m, const char *statspath, double gb){
-    FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
+/* Admission test unchanged; it just runs from route_trace.h's reader now, so PIN=<file>
+ * accepts every history layout an engine can write instead of only sparse text (#700). */
+typedef struct { Model *m; PinRec *r; int *n, cap; unsigned char *seen; } PinCollect;
+static int pin_collect_cb(int l, int e, uint32_t cnt, void *ud){
+    PinCollect *p=(PinCollect*)ud; Model *m=p->m; Cfg *c=&m->c;
+    if(*p->n>=p->cap) return 0;
+    int ok = l>=0 && e>=0 && e<c->n_experts &&
+             ((l<c->n_layers && m->L[l].sparse) || (l==c->n_layers && m->has_mtp));
+    int64_t key=(int64_t)l*c->n_experts+e;
+    if(ok&&!p->seen[key]){ p->r[(*p->n)++]=(PinRec){l,e,cnt}; p->seen[key]=1; return 1; }
+    return 0;
+}
+/* trusted=1 only when the user typed this path. An auto-discovered history has not been
+ * vouched for by anyone, so it stays subject to the identity check like any other. */
+static void pin_load(Model *m, const char *statspath, double gb, int trusted){
+    { FILE *probe=fopen(statspath,"rb");        /* keep the same message on a bad path */
+      if(!probe){ perror(statspath); return; } fclose(probe); }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
     PinRec *r=malloc((size_t)cap*sizeof(PinRec)); int n=0;
     unsigned char *seen=calloc((size_t)(c->n_layers+1)*c->n_experts,1);
-    int l,e; uint32_t cnt;
-    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
-        int ok = l>=0 && e>=0 && e<c->n_experts &&
-                 ((l<c->n_layers && m->L[l].sparse) || (l==c->n_layers && m->has_mtp));
-        int64_t key=(int64_t)l*c->n_experts+e;
-        if(ok&&!seen[key]){ r[n++]=(PinRec){l,e,cnt}; seen[key]=1; }
-    }
-    fclose(f);
+    /* A named file is what the identity refusal tells the user to pass, so honouring it
+     * here is what makes that message true. Dimensions and format version still apply:
+     * those refusals never offered a way past them. */
+    { PinCollect pc={m,r,&n,cap,seen}; rt_read_ex(statspath,pin_collect_cb,&pc,trusted); }
     int fill=getenv("PIN_FILL")?atoi(getenv("PIN_FILL")):0;
 #ifdef COLI_CUDA
     if(!getenv("PIN_FILL")&&g_cuda_release_host) fill=1;
@@ -6322,6 +8042,13 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
         prefix_est=(int)(budget/eb)+g_cuda_ndev;
+#ifdef COLI_ANS
+        if(g_cuda_raw_experts>=0){
+            int raw=g_cuda_raw_experts;
+            if((double)raw*eb>budget) raw=(int)(budget/eb);
+            prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
+        }
+#endif
         npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
     }
 #endif
@@ -6349,31 +8076,74 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #ifdef __linux__
     if(gpu_prefix>0) g_numa_skip_bind=1;   /* prefix slabs = transient upload staging: don't bind (#419) */
 #endif
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-#ifdef __linux__
-    g_numa_skip_bind=0;
+    int pre_n = gpu_prefix?gpu_prefix:npin;   /* quanti esperti nella fase "prefisso" */
+    /* #730: quanti caricarne per volta. Il default e' "tutti", che riproduce esattamente
+     * il comportamento precedente. Sotto CUDA_RELEASE_HOST i slab host del prefisso sono
+     * staging TRANSITORIO -- il commento di budget qui sopra lo dice: "prefix RAM is
+     * returned after upload" -- ma erano transitori in AGGREGATO: si caricava tutto il
+     * prefisso in RAM host e solo dopo si liberava un esperto alla volta. Il picco di RSS
+     * host era quindi l'intero CUDA_EXPERT_GB, e su un host con piu' VRAM che RAM (96 GB
+     * di VRAM contro 64 di RAM, #730) l'OOM arriva prima che il primo release parta.
+     * A round, il picco diventa stage*eb e il carico parallelo mantiene la sua banda. */
+    int stage = pre_n;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && g_cuda_release_host && gpu_prefix>0 && budget>0){
+        /* Tetto di staging: il piu' piccolo tra 4 GB e un ottavo del budget del tier,
+         * mai meno di un esperto (altrimenti il ciclo non avanza) e mai piu' del
+         * prefisso. Un ottavo mantiene i round abbastanza grandi da tenere occupati
+         * i thread del carico parallelo; il tetto assoluto protegge chi ha poca RAM
+         * e un budget enorme, che e' esattamente il caso segnalato. */
+        double cap = 4e9; if(budget/8.0 < cap) cap = budget/8.0;
+        int st = (int)(cap/eb);
+        if(st < 1) st = 1;
+        if(st < stage) stage = st;
+        if(stage < pre_n)
+            fprintf(stderr,"[CUDA] tier staging: %d experts per round (%.1f GB host peak) "
+                           "instead of %d at once (%.1f GB) — CUDA_RELEASE_HOST frees each "
+                           "round before the next (#730)\n",
+                    stage, stage*eb/1e9, pre_n, pre_n*eb/1e9);
+    }
 #endif
-    m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
+    for(int base=0; base<pre_n; base+=stage){
+    int hi = base+stage; if(hi>pre_n) hi=pre_n;
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int a=base;a<hi;a++)
+        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+    m->resident_bytes+=(int64_t)(hi-base)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
-        int gpu_limit=gpu_prefix?gpu_prefix:npin;
-        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
+        for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
             { ESlot *s=&m->pin[li][slot_of[a]];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
+                int compress=0;
+#ifdef COLI_ANS
+                compress=g_cuda_raw_experts>=0&&a>=g_cuda_raw_experts;
+#endif
+                int64_t projected=compress?need*80/100:need;
+                if(m->gpu_expert_bytes+projected>budget) break;
                 int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
                 for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
                     int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=projected &&
                         (best<0||placed_b[i]<placed_b[best])) best=i;
                     if(best<0) break;
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                    int uploaded=
+#ifdef COLI_ANS
+                        compress ? (qt_cuda_upload_compressed(&s->g)&&qt_cuda_upload_compressed(&s->u)&&
+                                    qt_cuda_upload_compressed(&s->d)) :
+#endif
+                        (qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d));
+#ifdef COLI_ANS
+                    if(compress&&!uploaded){
+                        fprintf(stderr,"[ANS] sidecar load failed; refusing partial VRAM placement\n");
+                        exit(2);
+                    }
+#endif
+                    if(uploaded){
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -6389,12 +8159,20 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 }
             }
         }
-        fprintf(stderr,COLI_ACCEL_TAG " hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
+    }
+#endif
+    }   /* fine del ciclo a round (#730) */
+#ifdef __linux__
+    g_numa_skip_bind=0;
+#endif
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && budget>0){
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
             g_cuda_expert_auto?", auto":"",
             g_cuda_reserve_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,COLI_ACCEL_TAG "   device %d: %d experts, %.2f GB\n",
+        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
         /* #653: on integrated / unified-memory GPUs (Grace-Blackwell GB10, Jetson) the
          * expert tier and the host RAM cache draw from ONE physical pool, so the boot
@@ -6527,6 +8305,16 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
             m->resident_bytes/1e9,slack/1e9,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+#ifdef COLI_CUDA
+        /* #686: on a single GPU that also holds host copies of the VRAM tier, the
+         * thing inflating the resident set is often those copies rather than
+         * PIN_GB itself -- name the knob instead of leaving the user to find it. */
+        if(g_cuda_enabled && g_cuda_ndev==1 && !g_cuda_release_host &&
+           (g_cuda_expert_gb>0||g_cuda_expert_auto))
+            fprintf(stderr,"[RAM] the VRAM expert tier still has host copies in RAM "
+                "(CUDA_RELEASE_HOST=0 on a single GPU): CUDA_RELEASE_HOST=1 frees them for "
+                "the RAM tier and is what this topology usually wants (#686).\n");
+#endif
         if(g_mem_avail_boot>0 && peak > g_mem_avail_boot*1e9 &&
            !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
             fprintf(stderr,"[RAM] refusing to start: that peak also exceeds the %.1f GB actually "
@@ -6549,8 +8337,14 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
          * Senza questo, una macchina da 128 GB girava con la LRU di una da 16
          * (cap=8 di default in coli): hit 23-28% con decine di GB inutilizzati.
          * Tetto a n_experts: oltre, ogni layer avrebbe slot che non puo' riempire.
-         * CAP_RAISE=0 ripristina il comportamento fisso. */
-        int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):1;
+         * CAP_RAISE=0 ripristina il comportamento fisso.
+         * #379: on Metal + darwin + fast SSD, raising the cache back up is the
+         * same anti-pattern the platform cap default exists to avoid, so the
+         * default flips to off there. An explicit CAP_RAISE always wins either
+         * way -- this only changes what happens when nobody set it.
+         * CURRENT-STATE CALIBRATION (#379): same revisit trigger and
+         * measurement stamp as the cap-1 default in coli_resolve_cap(). */
+        int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):(g_ssd_fast?0:1);
         int newcap = capmax>c->n_experts ? c->n_experts : capmax;
         if(raise_on && newcap>m->ecap){
             for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
@@ -6614,6 +8408,371 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
 
+/* ---- #379: honest Metal-cache storage probe (S1) --------------------------
+ * Metal's per-buffer residency cost makes the engine's own expert LRU cache
+ * anti-productive on fast NVMe: the OS page cache already streams cold
+ * experts cheaper than Metal can re-pin them (maintainer-endorsed root cause,
+ * issue #379). "Fast" has to be MEASURED, not assumed -- buffered reads lie
+ * (page-cache hits read 23-97 GB/s on the reference box; the real F_NOCACHE
+ * number was 14 GB/s), so this probes the actual model volume the same way
+ * compat_open_direct()/iobench.c's __APPLE__ branch do: open + F_NOCACHE,
+ * random 16K-aligned pread, no readahead. F_NOCACHE alone is NOT enough: it
+ * bypasses the cache for NEW pages but still serves already-resident ones, so
+ * a warm shard measured 22.1 GB/s of RAM and latched it as "disk". The probe
+ * therefore steers its reads to ranges mincore reports cold, and refuses to
+ * conclude anything when the file offers too few cold bytes (veto below).
+ * Gating: the whole block builds only for the one consumer (COLI_METAL on
+ * __APPLE__), so the default build carries no orphaned probe code; tests
+ * define COLI_SSD_PROBE_TEST to compile it anywhere -- the decision layer
+ * (grammar parser, cold-tile steering, veto) is pure portable C by design,
+ * exercised by tests/test_ssd_probe.c on every platform. */
+#if (defined(COLI_METAL) && defined(__APPLE__)) || defined(COLI_SSD_PROBE_TEST)
+#define COLI_SSD_PROBE_BLK   (4u*1024*1024)     /* 4 MB reads, 16K-aligned offsets */
+#define COLI_SSD_PROBE_MAXB  (300*1024*1024)    /* "a few hundred MB", capped on fast media */
+#define COLI_SSD_PROBE_SECS  0.35               /* wall-clock budget, well under the ~1s target */
+#define COLI_SSD_PROBE_COLD_FLOOR (64ll*1024*1024) /* fewer cold bytes than this = contaminated */
+#define COLI_SSD_CACHE_MAX   64                 /* longest well-formed .coli_ssd, in bytes */
+
+/* Why a measurement was refused (contaminated-class: nothing cached, one
+ * honest stderr line naming the ACTUAL condition, retry on a later start).
+ * The reasons differ in what the user should do about them -- "wait for a
+ * cold start" vs "finish the download" vs "nothing, this shard can never
+ * host a trustworthy probe" -- so the message must not lump them. */
+enum {
+    COLI_SSD_VETO_NONE = 0,
+    COLI_SSD_VETO_RESIDENT,                     /* too few cold pages: page cache would answer */
+    COLI_SSD_VETO_SMALL,                        /* shard offers < COLD_FLOOR of whole windows, ever */
+    COLI_SSD_VETO_SPARSE                        /* under-allocated: holes read as VFS zero-fill */
+};
+
+/* Under-allocation gate (#386 round 2, F1): steering prefers never-resident
+ * pages, and in a sparse or still-downloading file those are HOLES -- pread
+ * of a hole is VFS zero-fill at RAM speed (a 10 GB shard with 100 MB of real
+ * data measured 73 GB/s and latched it as disk bandwidth). st_blocks*512 is
+ * what actually sits on disk; require it to cover the file size within 12.5%
+ * slack (HFS+/APFS metadata rounding, tail blocks). Same conservative
+ * polarity as the residency veto: not fully allocated -> not measurable. */
+static int coli_ssd_probe_underallocated(long long allocated, long long size){
+    return allocated < size - size/8;
+}
+
+/* digits [ "." digits ] -- returns chars consumed, 0 = no match. The ONLY
+ * number shape the cache grammar admits (see coli_ssd_cache_parse). */
+static size_t coli_ssd_scan_number(const char *p, size_t len){
+    size_t i=0;
+    while(i<len && p[i]>='0' && p[i]<='9') i++;
+    if(!i) return 0;
+    if(i<len && p[i]=='.'){
+        size_t j=i+1;
+        while(j<len && p[j]>='0' && p[j]<='9') j++;
+        if(j==i+1) return 0;                     /* "5." is garbage */
+        i=j;
+    }
+    return i;
+}
+
+/* Strict .coli_ssd grammar -- mirrored byte-for-byte by resource_plan.py's
+ * parse_ssd_cache() (keep the two in lockstep; test_ssd_probe.c and
+ * test_resource_plan.py chew the same vector file,
+ * tests/fixtures/ssd_cache_vectors.txt):
+ *   v2:     "v2 <gbs> <st_dev>"   single spaces, at most one trailing \n
+ *   legacy: "<gbs>"               the pre-fix format, never trusted (re-probed)
+ * where <gbs> = digits["."digits], 0 < gbs < 1000, and <st_dev> = 1..20
+ * digits fitting unsigned 64-bit. Total length <= COLI_SSD_CACHE_MAX bytes,
+ * no NULs, nothing else. Everything outside the grammar is garbage and
+ * re-probes: strtod permissiveness ("inf", "nan", "0x8", "1e99", leading
+ * whitespace/signs) is deliberately out -- it let hand-edited or corrupt
+ * caches masquerade as measurements.
+ * Returns 2 = v2 (gbs+stdev filled), 1 = legacy (gbs filled), 0 = garbage. */
+static int coli_ssd_cache_parse(const char *buf, size_t len, double *gbs_out,
+                                unsigned long long *stdev_out){
+    if(!len || len>COLI_SSD_CACHE_MAX || memchr(buf,0,len)) return 0;
+    if(buf[len-1]=='\n') len--;                  /* at most one trailing newline */
+    int v2 = len>=3 && !memcmp(buf,"v2 ",3);
+    const char *p = buf + (v2?3:0);
+    size_t left = len - (v2?3:0);
+    size_t n = coli_ssd_scan_number(p,left);
+    if(!n) return 0;
+    char num[COLI_SSD_CACHE_MAX+1];
+    memcpy(num,p,n); num[n]=0;
+    double gbs=strtod(num,NULL);                 /* shape already vetted above */
+    if(!(gbs>0 && gbs<1000)) return 0;
+    p+=n; left-=n;
+    if(!v2){
+        if(left) return 0;
+        *gbs_out=gbs;
+        return 1;
+    }
+    if(!left || *p!=' ') return 0;
+    p++; left--;
+    size_t d=0;
+    while(d<left && p[d]>='0' && p[d]<='9') d++;
+    if(!d || d!=left || d>20) return 0;
+    char dev[21];
+    memcpy(dev,p,d); dev[d]=0;
+    errno=0;
+    unsigned long long sd=strtoull(dev,NULL,10);
+    if(errno) return 0;                          /* 20 nines overflows u64: garbage */
+    *gbs_out=gbs; *stdev_out=sd;
+    return 2;
+}
+
+/* The single writer of the grammar above: "v2 %.3f %llu\n". %.3f of a value
+ * in (0,1000) is always digits.digits, so what this writes always re-parses
+ * -- the round-trip is pinned by test_ssd_probe.c. */
+static int coli_ssd_cache_format(char *buf, size_t bufsz, double gbs,
+                                 unsigned long long stdev){
+    int n=snprintf(buf,bufsz,"v2 %.3f %llu\n",gbs,stdev);
+    return (n>0 && (size_t)n<bufsz) ? n : -1;
+}
+
+/* Probe steering (#386 fix round): pure, so tests inject residency vectors --
+ * no mincore, no files. vec has one byte per page_sz-sized page, mincore
+ * convention (bit 0 set = resident in RAM). The file is tiled into
+ * non-overlapping COLI_SSD_PROBE_BLK windows; a window qualifies only when
+ * EVERY page in it is non-resident, because one warm page lets the page cache
+ * serve part of a "disk" read (a fully-resident shard measured 22.1 GB/s
+ * through F_NOCACHE and latched the fast-SSD default on unknown hardware).
+ * Emits qualifying window start offsets into tiles[] (caller sizes it at
+ * file_size/BLK+1 entries) and returns the count; *cold_bytes_out gets
+ * count*BLK, the bytes the probe can trust. */
+static size_t coli_ssd_probe_cold_tiles(const unsigned char *vec, size_t npages,
+                                        size_t page_sz, long long *tiles,
+                                        long long *cold_bytes_out){
+    size_t count=0;
+    if(page_sz && page_sz<=COLI_SSD_PROBE_BLK){
+        size_t per=(COLI_SSD_PROBE_BLK+page_sz-1)/page_sz;
+        for(size_t t=0; t+per<=npages; t+=per){
+            size_t i=0;
+            while(i<per && !(vec[t+i]&1)) i++;
+            if(i==per) tiles[count++]=(long long)t*(long long)page_sz;
+        }
+    }
+    if(cold_bytes_out) *cold_bytes_out=(long long)count*COLI_SSD_PROBE_BLK;
+    return count;
+}
+
+/* Contamination veto (#386 fix round): with fewer than COLI_SSD_PROBE_COLD_FLOOR
+ * verified-cold bytes to read, any measurement would be mostly RAM. An
+ * untrustworthy measurement behaves as SLOW: no number, no cache write, the
+ * conservative default holds, and the probe retries on a colder startup. */
+static int coli_ssd_probe_vetoed(long long cold_bytes){
+    return cold_bytes < COLI_SSD_PROBE_COLD_FLOOR;
+}
+
+#ifdef __APPLE__
+/* Path of the LARGEST *.safetensors shard in snap_dir into out, or out[0]=0
+ * if none. Any shard's bandwidth is representative, but the biggest one
+ * offers the most cold 4 MB windows -- a stray small shard picked by readdir
+ * order could starve the probe below the 64 MB floor forever (#386 round 2,
+ * F4) even though a full-size neighbor sits right next to it. */
+static void coli_ssd_probe_pick_shard(const char *snap_dir, char *out, size_t outsz){
+    out[0]=0;
+    DIR *d=opendir(snap_dir);
+    if(!d) return;
+    struct dirent *e;
+    long long best=-1;
+    while((e=readdir(d))){
+        const char *dot=strrchr(e->d_name,'.');
+        if(!dot || strcmp(dot,".safetensors")) continue;
+        char cand[1280];
+        snprintf(cand,sizeof(cand),"%s/%s",snap_dir,e->d_name);
+        struct stat st;
+        if(stat(cand,&st)==0 && (long long)st.st_size>best){
+            best=(long long)st.st_size;
+            snprintf(out,outsz,"%s",cand);
+        }
+    }
+    closedir(d);
+}
+
+/* F_NOCACHE random-read probe on one real shard, steered to verified-cold
+ * ranges. Returns measured GB/s, or -1 if the probe could not run (no shard,
+ * open/map failure, file too small) or was vetoed as contaminated -- callers
+ * treat -1 as "not fast", never as an error to surface; *veto_out gets the
+ * COLI_SSD_VETO_* reason so the caller can say honestly why and skip the
+ * cache write. Veto order: SPARSE (holes would measure as zero-fill) before
+ * SMALL (can never offer the floor) before RESIDENT (cold today, maybe).
+ * The mmap is address space only (nothing is faulted in): it exists so
+ * mincore can fill the residency vector. */
+static double coli_ssd_probe_raw(const char *snap_dir, int *veto_out){
+    if(veto_out) *veto_out=COLI_SSD_VETO_NONE;
+    char path[1280];
+    coli_ssd_probe_pick_shard(snap_dir,path,sizeof(path));
+    if(!path[0]) return -1;
+    int fd=open(path,O_RDONLY);
+    if(fd<0) return -1;
+    fcntl(fd,F_NOCACHE,1);
+    fcntl(fd,F_RDAHEAD,0);                       /* random access, not sequential streaming */
+    struct stat st;
+    if(fstat(fd,&st)!=0 || st.st_size<(off_t)(COLI_SSD_PROBE_BLK*2)){ close(fd); return -1; }
+    if(coli_ssd_probe_underallocated((long long)st.st_blocks*512,(long long)st.st_size)){
+        if(veto_out) *veto_out=COLI_SSD_VETO_SPARSE;
+        close(fd);
+        return -1;
+    }
+    if(((long long)st.st_size/COLI_SSD_PROBE_BLK)*COLI_SSD_PROBE_BLK<COLI_SSD_PROBE_COLD_FLOOR){
+        if(veto_out) *veto_out=COLI_SSD_VETO_SMALL;   /* even fully cold it cannot reach the floor */
+        close(fd);
+        return -1;
+    }
+    size_t page_sz=(size_t)getpagesize();
+    size_t npages=((size_t)st.st_size+page_sz-1)/page_sz;
+    unsigned char *vec=malloc(npages);
+    long long *tiles=malloc(((size_t)st.st_size/COLI_SSD_PROBE_BLK+1)*sizeof *tiles);
+    void *map=(vec&&tiles)?mmap(NULL,(size_t)st.st_size,PROT_READ,MAP_SHARED,fd,0):MAP_FAILED;
+    double gbs=-1;
+    if(map!=MAP_FAILED && mincore(map,(size_t)st.st_size,(char*)vec)==0){
+        long long cold_bytes=0;
+        size_t ntiles=coli_ssd_probe_cold_tiles(vec,npages,page_sz,tiles,&cold_bytes);
+        if(ntiles==0 || coli_ssd_probe_vetoed(cold_bytes)){
+            /* ntiles==0 is implied by the floor today, but the modulo below
+             * must NEVER be reachable with 0 on its own merits (#386 r2, F7) */
+            if(veto_out) *veto_out=COLI_SSD_VETO_RESIDENT;
+        }else{
+            void *buf=NULL;
+            if(posix_memalign(&buf,16384,COLI_SSD_PROBE_BLK)!=0) buf=NULL;
+            if(buf){
+                unsigned seed=0xC0117125u;
+                double t0=now_s(); long long total=0;
+                while(now_s()-t0<COLI_SSD_PROBE_SECS && total<COLI_SSD_PROBE_MAXB){
+                    long long off=tiles[(size_t)rand_r(&seed)%ntiles];
+                    ssize_t got=pread(fd,buf,COLI_SSD_PROBE_BLK,off);
+                    if(got<=0) break;
+                    total+=got;
+                }
+                double dt=now_s()-t0;
+                if(total>0 && dt>0) gbs=(double)total/1e9/dt;
+                free(buf);
+            }
+        }
+    }
+    if(map!=MAP_FAILED) munmap(map,(size_t)st.st_size);
+    free(tiles); free(vec);
+    close(fd);
+    return gbs;
+}
+
+/* Cache the measurement in <snap>/.coli_ssd so every startup after the first
+ * reads a file instead of re-probing. v2 records the volume's identity
+ * ("v2 <gbs> <st_dev>"): a cache is trusted ONLY when it parses under the
+ * strict grammar above AND its st_dev matches the model dir's current device
+ * -- a dir rsync'd to another volume (external drive, RAM disk) carries a
+ * measurement of the WRONG hardware and must re-probe. Legacy bare-number
+ * caches (written before steering existed, so possibly warm-contaminated)
+ * re-probe once and upgrade to v2. A vetoed run writes nothing and says why
+ * on stderr; the probe retries naturally on the next, colder, startup. */
+static double coli_ssd_probe_cached(const char *snap_dir){
+    char cpath[1290];
+    snprintf(cpath,sizeof(cpath),"%s/.coli_ssd",snap_dir);
+    struct stat dst;
+    unsigned long long cur_dev = stat(snap_dir,&dst)==0 ? (unsigned long long)dst.st_dev : 0;
+    FILE *f=fopen(cpath,"rb");                   /* exact bytes: never let a text-mode
+                                                  * layer eat the \r the grammar rejects */
+    if(f){
+        char buf[COLI_SSD_CACHE_MAX+2];
+        size_t n=fread(buf,1,sizeof(buf),f);
+        fclose(f);
+        double cached=0; unsigned long long sdev=0;
+        if(coli_ssd_cache_parse(buf,n,&cached,&sdev)==2 && sdev==cur_dev)
+            return cached;
+        /* v2 from another volume, legacy, or garbage: fall through, re-measure */
+    }
+    int veto=COLI_SSD_VETO_NONE;
+    double gbs=coli_ssd_probe_raw(snap_dir,&veto);
+    if(veto!=COLI_SSD_VETO_NONE){
+        /* one honest line per deferral, naming the condition that actually
+         * fired (#386 r2, F4): "resident" advice (wait for a cold start) is
+         * wrong advice for a partial download or a permanently tiny shard. */
+        const char *why =
+            veto==COLI_SSD_VETO_SPARSE ? "the shard is not fully allocated on disk (partial "
+                                         "download?), holes would measure as RAM-speed zero-fill" :
+            veto==COLI_SSD_VETO_SMALL  ? "the largest shard offers under 64 MB of probe windows, "
+                                         "too small for a trustworthy measurement" :
+                                         "the shard is already page-cache resident (<64 MB cold), "
+                                         "a read now would measure RAM, not the disk";
+        fprintf(stderr,"METAL: storage probe deferred -- %s; keeping the conservative cache "
+                "default, will re-check on a later start\n",why);
+        return -1;
+    }
+    if(gbs<0) return -1;                         /* could not run at all: no shard, open failure */
+    if(!(gbs>0 && gbs<1000)){
+        /* a number the cache grammar itself would refuse (0, >=1000 GB/s,
+         * non-finite) is no more trustworthy for THIS run than for the next
+         * one (#386 r2, F6): treat it as contaminated, not as "fast". */
+        fprintf(stderr,"METAL: storage probe measured an implausible %g GB/s -- ignoring the "
+                "measurement, keeping the conservative cache default\n",gbs);
+        return -1;
+    }
+    char line[COLI_SSD_CACHE_MAX+1];
+    if(coli_ssd_cache_format(line,sizeof(line),gbs,cur_dev)>0){
+        /* mkstemp (unique name, O_EXCL) + rename: the model dir is shared (a
+         * concurrent serve + run pair may both probe a virgin dir) so a torn
+         * write must never survive, and a fixed, predictable temp name could
+         * be pre-planted as a symlink -- mkstemp cannot follow one. Two
+         * racing probers both measure under mutual contention: a LOW reading,
+         * the safe direction (the platform default just stays off). */
+        char tpath[1310];
+        snprintf(tpath,sizeof(tpath),"%s.XXXXXX",cpath);
+        int cache_errno=0;
+        int tfd=mkstemp(tpath);
+        if(tfd<0) cache_errno=errno;
+        else{
+            size_t len=strlen(line);
+            mode_t um=umask(0); umask(um);       /* read it back; umask() has no getter */
+            int ok = write(tfd,line,len)==(ssize_t)len;
+            ok = fchmod(tfd,(mode_t)(0644&~um))==0 && ok;  /* mkstemp forces 0600; honor the umask instead */
+            if(!ok) cache_errno=errno;
+            close(tfd);
+            if(ok && rename(tpath,cpath)!=0){ cache_errno=errno; ok=0; }
+            if(!ok) unlink(tpath);
+        }
+        if(cache_errno)
+            /* the measurement still governs THIS run; only persistence failed
+             * (read-only model dir, quota, ...) -- say so once (#386 r2, F5) */
+            fprintf(stderr,"METAL: could not cache the storage probe in %s (%s) -- "
+                    "will re-measure on every start until it is writable\n",
+                    cpath,strerror(cache_errno));
+    }
+    return gbs;
+}
+#endif /* __APPLE__ */
+#endif /* (COLI_METAL && __APPLE__) || COLI_SSD_PROBE_TEST */
+
+/* Expert-cache-cap precedence (#379, S2): explicit CLI positional > explicit
+ * CAP env > platform default (Metal + darwin + fast SSD) > historic default.
+ * `cli_given` distinguishes a bare invocation (no positional at all -> the
+ * engine's historic 64, byte-identical to the old argc<=1 fallback) from the
+ * coli wrapper's "0 = auto" sentinel (-> historic 8, what coli always forced
+ * before). cap=0 as an explicit request for zero cache slots was undocumented
+ * and unused repo-wide, so repurposing it as the sentinel is safe. Pure
+ * function (no I/O, no globals) so precedence is unit-testable in isolation
+ * from the probe and from argv/getenv. */
+static int coli_resolve_cap(int cli_given, int cli, int env, int platform_fast, int *explicit_out){
+    int is_explicit = (cli_given && cli!=0) || (env!=0);
+    if(explicit_out) *explicit_out=is_explicit;
+    if(cli_given && cli) return cli;
+    if(env) return env;
+    /* CURRENT-STATE CALIBRATION (#379; measured 2026-07, macOS 26.5, M5 Max,
+     * engine base caa49f7): cap 1 encodes that stack's per-buffer residency
+     * cost. Revisit when residency handling changes (the heap/residency-set
+     * work in #379, or MTLTensor-based expert storage): with heap-backed
+     * slabs cap 16 already beats cap 1. The machinery above and below is
+     * durable; only this constant changes. */
+    if(platform_fast) return 1;
+    return cli_given ? 8 : 64;   /* sentinel 0 -> coli's historic 8; bare ./glm -> historic 64 */
+}
+
+/* Una variabile di STATO e' attiva se e' impostata E non vale 0/false/off/no.
+ * Volutamente diverso dai kill-switch, che restano presence-based. */
+static int coli_env_on(const char *name)
+{
+    const char *v = getenv(name);
+    if(!v || !*v) return 0;
+    return !(strcmp(v,"0")==0 || strcmp(v,"false")==0 ||
+             strcmp(v,"off")==0 || strcmp(v,"no")==0);
+}
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -6634,8 +8793,18 @@ int main(int argc, char **argv){
      * re-exec + tuning path (distinct from the internal COLI_OMP_TUNED sentinel).
      *
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
+    /* COLI_OMP_TUNED e COLI_NO_OMP_TUNE sono KILL-SWITCH: presence-based e' voluto
+     * (c/coli lo documenta: "impostarla a qualsiasi valore, anche 0, disattiva").
+     * COLI_CUDA e COLI_METAL invece sono STATO, e uno 0 significa "niente GPU":
+     * testarne la presenza faceva saltare il tuning proprio a chi la GPU non ce
+     * l'ha. Ed e' raggiungibile, non teorico -- `coli` stesso scrive
+     * e["COLI_CUDA"]="0" (c/coli:281 e :360) quando il piano non usa CUDA, quindi
+     * su un host Linux CPU-only un `coli run --auto-tier --gpu none` documentato
+     * perdeva silenziosamente il tuning che un `./colibri` nudo riceve. Grazie a
+     * @fredchu per averlo letto nel sorgente e detto chiaramente di non averlo
+     * misurato (#707). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
-       !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
+       !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
         /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
@@ -6764,13 +8933,18 @@ int main(int argc, char **argv){
     if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
-    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
      * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
      * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
+    /* PILOT_WORKERS: blocking-path pilot threads (SPMC ring). Default 1 = today's
+     * behaviour, byte-identical. >1 raises NVMe queue depth on the non-URING
+     * PILOT_REAL path (the URING path already batches). Clamp [1,16]. */
+    g_pilot_nw = getenv("PILOT_WORKERS")?atoi(getenv("PILOT_WORKERS")):1;
+    if(g_pilot_nw<1) g_pilot_nw=1; if(g_pilot_nw>16) g_pilot_nw=16;
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32
@@ -6808,16 +8982,14 @@ int main(int argc, char **argv){
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
 #endif
     }
-    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* DUAL-SSD: second model copy */
+    if(getenv("COLI_MIR_STRIPE")) g_mir_stripe=atoi(getenv("COLI_MIR_STRIPE"));
+    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* MULTI-SSD: replica model copies */
     if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
     if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
-    if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
-        g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
-        if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
-        else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
-    }
+    corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
+    rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
@@ -6832,7 +9004,11 @@ int main(int argc, char **argv){
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
-    int cap  = argc>1?atoi(argv[1]):64;
+    /* cap itself is resolved below, once g_metal_enabled and the SSD probe (both
+     * needed for the platform default) are known -- see coli_resolve_cap(). */
+    int cap_given = argc>1;
+    int cap_arg = cap_given?atoi(argv[1]):0;
+    int cap_env = getenv("CAP")?atoi(getenv("CAP")):0;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
     int kv_limit=(getenv("SERVE_BATCH")&&atoi(getenv("SERVE_BATCH")))?512:16;
@@ -6848,13 +9024,42 @@ int main(int argc, char **argv){
         else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
-        if(!g_cuda_enabled){ fprintf(stderr,COLI_ACCEL_TAG " requested backend is unavailable\n"); return 2; }
+        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
         /* fmt=6 decodes against quant.h's codebook; publish it to every device so
          * the backend never keeps a second copy that could drift (#452). An older
          * DLL without the symbol leaves this 0 and fmt=6 tensors stay CPU-side. */
         g_cuda_e8_ready=coli_cuda_e8_set_grid(e8_grid);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+#endif
+#ifdef COLI_VULKAN
+    if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
+        char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
+        g_vulkan = coli_vk_init(spv);
+        if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; need libvulkan + "
+                               "the compiled shaders — point COLI_VK_SHADERS at the shader directory "
+                               "or the qmatmul.spv file, or run `make VK=1` to build them)\n", spv); return 2; }
+        /* 320 = sweep optimum on a 16 GB card (256-384 measured flat, 320 best median;
+         * ~6 GB tier + ~8 GB dense leaves headroom for the long-context KV mirror). */
+        g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 320;
+        g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
+        g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
+        fprintf(stderr,"[VK] expert tier active: routed quantized experts on the GPU (budget %d)%s%s\n",
+                g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",
+                g_vk_attn ? " + absorb attention core" : "");
+        /* COLI_VK_DEV2=auto|<index>: bring up a SECOND GPU for tier experts only
+         * (e.g. an RX 580 beside the primary card). The dev2 tier fills with the
+         * next heat-ranked experts after dev0's budget stop, capped by
+         * COLI_VK_EXPERTS2 and its own VRAM budget (COLI_VK_RESERVE2_GB). */
+        { const char *d2 = getenv("COLI_VK_DEV2");
+          if(d2 && *d2){
+              int idx = strcmp(d2,"auto") ? atoi(d2) : -1;
+              if(coli_vk_init_dev2(spv, idx))
+                  g_vk_budget2 = getenv("COLI_VK_EXPERTS2") ? atoi(getenv("COLI_VK_EXPERTS2")) : 512;
+          } }
+    }
+#endif
+#ifdef COLI_CUDA
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
     g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
@@ -6862,13 +9067,51 @@ int main(int argc, char **argv){
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
     g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
+#ifdef COLI_ANS
+    g_cuda_raw_experts=getenv("CUDA_RAW_EXPERTS")?atoi(getenv("CUDA_RAW_EXPERTS")):-1;
+    if(g_cuda_raw_experts>=0&&(!getenv("COLI_ANS_SIDECAR")||!*getenv("COLI_ANS_SIDECAR"))){
+        fprintf(stderr,"COLI_ANS_SIDECAR is required when CUDA_RAW_EXPERTS is set\n");
+        return 1;
+    }
+    if(g_cuda_raw_experts>=0&&g_repin){
+        fprintf(stderr,"REPIN is incompatible with the fixed-order ANS sidecar\n");
+        return 1;
+    }
+#endif
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
-    g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+#ifdef COLI_ANS
+    if(g_cuda_raw_experts>=0) g_repin=0;
+#endif
+    /* CUDA_RELEASE_HOST default: ndev>1 was chosen when the host copy was the
+     * multi-GPU re-upload path. On a SINGLE GPU asked to fill RAM as well
+     * (PIN_GB=all, or a PIN_GB large enough that the two tiers compete), that
+     * default keeps a full host copy of every VRAM-tier expert and the RAM tier
+     * starves: measured on 1x H200 + 235 GB, 9,297 vs 14,951 resident experts and
+     * 1.10 vs 4.18-5.37 tok/s -- a 3.8x decode difference from one default (#686).
+     * The host copy is provably redundant there: releasing it still reloads from
+     * disk if CUDA later fails. So: keep ndev>1 exactly as before, and add the
+     * single-GPU + large-PIN_GB case. An explicit CUDA_RELEASE_HOST always wins. */
+    if(getenv("CUDA_RELEASE_HOST")) g_cuda_release_host=atoi(getenv("CUDA_RELEASE_HOST"));
+    else if(g_cuda_ndev>1)          g_cuda_release_host=1;          /* unchanged */
+    else if(g_cuda_enabled && (g_cuda_expert_gb>0||g_cuda_expert_auto)){
+        const char *pg=getenv("PIN_GB");
+        /* "large PIN_GB" = all, or >= the VRAM tier itself. Under CUDA_EXPERT_GB=auto
+         * the tier is sized to the whole card, so any explicit PIN_GB qualifies. */
+        if(pg&&*pg){
+            if(!strcmp(pg,"all")) g_cuda_release_host=1;
+            else { double p=atof(pg);
+                   if(p>0 && (g_cuda_expert_auto || p>=g_cuda_expert_gb)) g_cuda_release_host=1; }
+        }
+        if(g_cuda_release_host)
+            fprintf(stderr,"[CUDA] single-GPU with a large PIN_GB: releasing host copies of the "
+                           "VRAM tier so the RAM tier can use that memory (#686; "
+                           "CUDA_RELEASE_HOST=0 keeps them)\n");
+    }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,COLI_ACCEL_TAG " mode: routed experts%s%s\n",
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"");
 #else
@@ -6895,6 +9138,24 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+    /* #379 (S2/S3): probe the model volume once Metal's on/off state is known,
+     * cache the result in the model dir, and let it set the cap/CAP_RAISE
+     * defaults -- never an explicit --cap/CAP/CAP_RAISE, per coli_resolve_cap()
+     * above. Silent when the probe ran but storage was slow (defaults unchanged);
+     * one stderr line when the platform default actually engages, one when a
+     * contaminated (page-cache-warm) measurement is vetoed and deferred. */
+    double coli_ssd_gbs = -1;
+#if defined(COLI_METAL) && defined(__APPLE__)
+    if(g_metal_enabled){
+        coli_ssd_gbs = coli_ssd_probe_cached(snap);
+        double ssd_fast_gbs = getenv("COLI_SSD_FAST_GBS")?atof(getenv("COLI_SSD_FAST_GBS")):4.0;
+        g_ssd_fast = (coli_ssd_gbs>=ssd_fast_gbs);
+    }
+#endif
+    int cap_explicit=0;
+    int cap = coli_resolve_cap(cap_given, cap_arg, cap_env, g_ssd_fast, &cap_explicit);
+    if(g_ssd_fast && !cap_explicit)
+        fprintf(stderr,"METAL: fast SSD (%.1f GB/s) — page cache favored, expert cache minimal (cap 1); override with --cap\n", coli_ssd_gbs);
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
@@ -6971,6 +9232,7 @@ int main(int argc, char **argv){
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
         const char *pin=getenv("PIN"); char pauto[2100];
+        int pin_named=strcmp(pin,"auto")!=0;   /* typed by the user, vs auto-discovered */
         if(!strcmp(pin,"auto")){
             /* PIN=auto: la storia VIVA <SNAP>/.coli_usage (appesa a ogni turno) batte il
              * profilo congelato stats.txt — il pin di ogni riavvio riflette il carico reale
@@ -6989,9 +9251,16 @@ int main(int argc, char **argv){
         }
         if(pin){
             const char *pin_gb=getenv("PIN_GB");
-            pin_load(&m,pin,pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0);   /* PIN_GB=all (#80) */
+            pin_load(&m,pin,pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0,pin_named);   /* PIN_GB=all (#80) */
         }
     }
+#if defined(COLI_CUDA) && defined(COLI_ANS)
+    if(getenv("COLI_ANS_PACK")&&atoi(getenv("COLI_ANS_PACK"))){
+        fprintf(stderr,"[ANS] sidecar packing complete; exiting before inference\n");
+        coli_cuda_shutdown();
+        return 0;
+    }
+#endif
     if(getenv("COUPLE")&&*getenv("COUPLE")){    /* coupling-scored cross-layer prefetch (#176) */
         g_couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;
         if(g_couple_k<1)g_couple_k=1; if(g_couple_k>32)g_couple_k=32;
@@ -7014,14 +9283,24 @@ int main(int argc, char **argv){
            * qualche ora di chat) arriva a meta' del budget expert. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
           double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
-          if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
+          if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx);
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
+#ifdef COLI_VULKAN
+    vk_dense_preload(&m);   /* dense claims VRAM first — the tier fill sizes to the remainder */
+    vk_registry_fill(&m);   /* pinned VK expert tier: needs the usage history loaded above */
+#endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
+
+    /* CAUSAL ABLATION: ABLATE_SCORE=<manifest> -> teacher-forced per-expert
+     * ablation sweep with per-target-position final-logit read-out (ABLATE_OUT=
+     * <file>). Precedes SCORE. Optional ROUTE_TRACE=<file> records the
+     * post-ablation router trace. */
+    if(getenv("ABLATE_SCORE")){ run_ablate_score(&m, getenv("ABLATE_SCORE")); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
     if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
@@ -7058,7 +9337,7 @@ int main(int argc, char **argv){
         fprintf(stderr,
           "ERROR: no PROMPT given, so this is oracle self-test mode — but ref_glm.json is the TINY\n"
           "       model's oracle (max token %d) and your model's vocab is %d. Nothing to validate here.\n"
-          "         Engine self-test:  SNAP=./glm_tiny TF=1 ./glm 64 16 16      (expect 32/32)\n"
+          "         Engine self-test:  SNAP=./glm_tiny TF=1 ./glm 64 16 16      (expect ~30-32/32; FP near-ties are toolchain-dependent)\n"
           "         Real generation:   PROMPT=\"Hello\" NGEN=32 SNAP=<model> ./glm 64\n"
           "         or:                python coli chat --model <model>\n"
           "         REF_FORCE=1 to run the comparison anyway (meaningless).\n"

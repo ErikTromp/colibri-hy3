@@ -12,7 +12,6 @@ import mimetypes
 import os
 import select
 import queue
-import re
 import signal
 import socket
 import subprocess
@@ -218,6 +217,7 @@ def content_text(content, param):
 #   <tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>
 # and tool results come back as <|observation|><tool_response>{content}</tool_response>.
 # We render those markers into the prompt and parse them back into OpenAI `tool_calls`.
+import re
 
 BOX_START, BOX_END = "<tool_call>", "</tool_call>"
 TR_OPEN,  TR_CLOSE = "<tool_response>", "</tool_response>"
@@ -230,12 +230,149 @@ _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
 # A closing tag the model started but never finished ("</tool_cal", "</tool"), at end of reply.
 _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z")
 
-# ---- Hy3 tool calling (tencent/Hy3, `:opensource` tokens) ----------------------------------
-# <tool_calls:opensource>
-#   <tool_call:opensource>{name}<tool_sep:opensource><arg_key:opensource>{k}</arg_key:opensource>
-#   <arg_value:opensource>{v}</arg_value:opensource>...</tool_call:opensource>
-# </tool_calls:opensource> ... <tool_responses:opensource><tool_response:opensource>{content}
-# </tool_response:opensource></tool_responses:opensource>
+# De-mangler: opt-in recovery for heavily-quantized models that drop the
+# <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
+_SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
+
+
+def _tool_param_order(tools):
+    """name -> ordered param names (required first) from the request schema, for de-mangling."""
+    out = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        params = ((fn.get("parameters") or {}).get("properties") or {})
+        required = list((fn.get("parameters") or {}).get("required") or [])
+        out[name] = required + [p for p in params if p not in required]
+    return out
+
+
+def _tool_param_types(tools):
+    """name -> {param: declared JSON-schema type}. The model emits every argument as text;
+    without the schema a string-typed value that happens to look numeric ("12345" for an
+    order id, an SKU, a phone number) would be json.loads()'d into an int and the tool would
+    receive the wrong type."""
+    out = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        types = {}
+        for key, spec in props.items():
+            if isinstance(spec, dict):
+                t = spec.get("type")
+                if isinstance(t, list):          # {"type": ["string", "null"]}
+                    t = next((x for x in t if x != "null"), None)
+                types[key] = t
+        out[name] = types
+    return out
+
+
+def _coerce_arg(value, declared):
+    """Decode a raw <arg_value> according to the declared schema type.
+
+    A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
+    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    if declared == "string":
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    if declared in ("integer", "number") and isinstance(parsed, bool):
+        return value                              # `true` is not a number
+    if declared and declared not in ("integer", "number", "boolean", "object", "array"):
+        return value
+    return parsed
+
+
+def _unclosed_tail(reply, tools):
+    """Body of a trailing <tool_call> that was never closed, or None.
+
+    Only returned when the recovery is unambiguous, so ordinary prose that merely mentions
+    "<tool_call>" can never be turned into a call. Both conditions must hold:
+      * the last BOX_START is not followed by a BOX_END (a closed box is the strict parser's job);
+      * the tail carries a complete <arg_key>..</arg_value> pair, OR it is exactly the name of a
+        tool the client declared (the zero-argument case).
+    """
+    start = reply.rfind(BOX_START)
+    if start < 0 or BOX_END in reply[start:]:
+        return None
+    inner = _PARTIAL_END_RE.sub("", reply[start + len(BOX_START):])
+    if _ARG_RE.search(inner):
+        return inner
+    declared = {(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)}
+    return inner if inner.strip() in declared else None
+
+
+def parse_tool_calls(reply, tools=None):
+    """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
+    rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
+    param_order = _tool_param_order(tools)
+    param_types = _tool_param_types(tools)
+    calls, salvaged = [], []
+    # #401: a box the model opened but never closed -- it ran out of budget, or the closing tag
+    # came out mangled ("</tool_cal"). The call itself is often perfectly well-formed, but the
+    # strict regex needs BOTH tags, so the client used to get *zero* tool_calls. Recover the tail,
+    # but only when it is unambiguous (see _unclosed_tail) so prose can never fabricate a call.
+    boxes = [m.group(1) for m in _BOX_RE.finditer(reply)]
+    tail = _unclosed_tail(reply, tools)
+    if tail is not None:
+        boxes.append(tail)
+    for inner in boxes:
+        name_match = _NAME_RE.match(inner)
+        name = name_match.group(1) if name_match else inner.strip()
+        args = {}
+        types = param_types.get(name, {})
+        for arg in _ARG_RE.finditer(inner):
+            key, value = arg.group(1), arg.group(2)
+            args[key] = _coerce_arg(value, types.get(key))
+        if not args and _SALVAGE:
+            rest = inner[name_match.end():] if name_match else ""
+            payload = _TAG_RE.sub("", rest).strip()
+            if payload.startswith("(") and payload.endswith(")"):
+                payload = payload[1:-1].strip()
+            if payload:
+                key = (param_order.get(name) or ["input"])[0]
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+                args = {key: payload}
+                salvaged.append(name)
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
+        # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
+        # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
+        # EN: #401 field diagnosis: tools were declared and the model attempted the syntax,
+        # EN: but the strict parse matched nothing (typically quantization-mangled output).
+        sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
+                         "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
+        sys.stderr.flush()
+    text = _BOX_RE.sub("", reply)
+    if tail is not None:                       # drop the recovered tail from the visible content
+        text = text[:text.rindex(BOX_START)]
+    if ARCH == "inkling":
+        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
+    if THINK_CLOSE in text:
+        text = text.split(THINK_CLOSE, 1)[1]
+    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    if calls:
+        dm, rec = len(salvaged), (1 if tail is not None else 0)
+        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d unclosed-recovered, "
+                         "%d de-mangled [%s]%s\n"
+                         % (len(calls), max(0, len(calls) - dm - rec), rec, dm,
+                            "CLEAN" if dm == 0 and rec == 0 else "RECOVERED",
+                            (" -> " + ", ".join(salvaged)) if dm else ""))
+        sys.stderr.flush()
+    return text.strip(), calls
+
 
 HY3_TOOLCALLS_OPEN,  HY3_TOOLCALLS_CLOSE  = "<tool_calls:opensource>",  "</tool_calls:opensource>"
 HY3_TOOLCALL_OPEN,   HY3_TOOLCALL_CLOSE   = "<tool_call:opensource>",   "</tool_call:opensource>"
@@ -476,6 +613,130 @@ def split_reasoning_hy3(text, enable_thinking):
     return reasoning, rest, False
 
 
+def hy3_effort(enable_thinking, reasoning_effort):
+    if not enable_thinking:
+        return "reasoning_effort:no_think"
+    if reasoning_effort in ("high", "xhigh"):
+        return "reasoning_effort:high"
+    if reasoning_effort == "max":
+        return "reasoning_effort:max"
+    if reasoning_effort in ("low", "minimal"):
+        return "reasoning_effort:low"
+    if reasoning_effort == "medium":
+        return "reasoning_effort:medium"
+    return "reasoning_effort:high"
+
+
+def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                    tool_choice=None):
+    """Render the official Hunyuan Hy3 chat template (tencent/Hy3, `:opensource` tokens),
+    including the <tool_calls:opensource> tool-declaration/tool-call/tool-response format."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    has_user = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "user":
+            has_user = True
+        elif role not in ("system", "developer", "assistant", "tool"):
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    if not has_user:
+        raise APIError(400, "Hy3 chat requires at least one user message.", "messages")
+
+    tools, forced = _resolve_tool_choice(tools, tool_choice)
+    system_prompt = "\n\n".join(content_text(m.get("content"), f"messages.{i}.content")
+                                for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
+    effort = hy3_effort(enable_thinking, reasoning_effort)     # e.g. "reasoning_effort:high"
+    if not tools:
+        # Insert a delimiter before the reasoning-mode marker so it never fuses with the
+        # last system/developer message (and multiple system messages stay separated).
+        system_prompt = (system_prompt + "\n\n" if system_prompt else "") + HY3_REASONING_MODE + effort
+
+    parts = [HY3_BOS, system_prompt]
+
+    if tools:
+        parts.append(("\n\n" if system_prompt else "") +
+                     "# Tools\n\nYou may call one or more functions to assist with the user "
+                     "query.\n\nYou are provided with function signatures within <tools></tools> "
+                     "XML tags:\n<tools>\n")
+        clean_tools = []
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean_tools.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
+        parts.append("\n".join(json.dumps(t, ensure_ascii=False) for t in clean_tools))
+        parts.append("\n</tools>\n\n"
+                     "For function call returns, you should first print " + HY3_TOOLCALLS_OPEN + "\n"
+                     "For each function call, you should return object like:\n"
+                     + HY3_TOOLCALL_OPEN + "{function-name}" + HY3_TOOLSEP + "\n"
+                     + HY3_ARGKEY_OPEN + "{arg-key-1}" + HY3_ARGKEY_CLOSE + "\n"
+                     + HY3_ARGVALUE_OPEN + "{arg-value-1}" + HY3_ARGVALUE_CLOSE + "\n"
+                     + HY3_ARGKEY_OPEN + "{arg-key-2}" + HY3_ARGKEY_CLOSE + "\n"
+                     + HY3_ARGVALUE_OPEN + "{arg-value-2}" + HY3_ARGVALUE_CLOSE + "\n"
+                     "...\n" + HY3_TOOLCALL_CLOSE + "\n"
+                     "At the end of function call returns, you should print "
+                     + HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort)
+        if forced:
+            parts.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
+
+    prev_tool = False
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role in ("system", "developer"):
+            continue                                  # already folded into system_prompt above
+        if role == "user":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            if prev_tool:
+                parts.append(HY3_TOOLRESPS_CLOSE)
+            parts.append(HY3_USER + text)
+            prev_tool = False
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            if prev_tool:
+                parts.append(HY3_TOOLRESPS_CLOSE)
+            parts.append(HY3_ASSISTANT)
+            calls = message.get("tool_calls")
+            if calls:
+                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text)
+                parts.append(HY3_TOOLCALLS_OPEN + "\n")
+                for tc in calls:
+                    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                    parts.append(HY3_TOOLCALL_OPEN + (fn.get("name") or "") + HY3_TOOLSEP + "\n")
+                    for key, value in (args or {}).items():
+                        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                        parts.append(HY3_ARGKEY_OPEN + key + HY3_ARGKEY_CLOSE + "\n"
+                                     + HY3_ARGVALUE_OPEN + value + HY3_ARGVALUE_CLOSE + "\n")
+                    parts.append(HY3_TOOLCALL_CLOSE + "\n")
+                # Match the declared tool-call format: the model is told to end its tool calls
+                # with </tool_calls:opensource> followed by the reasoning-mode marker, then EOS.
+                parts.append(HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort + HY3_EOS)
+            else:
+                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text + HY3_EOS)
+            prev_tool = False
+        elif role == "tool":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            if not prev_tool:
+                parts.append(HY3_TOOLRESPS_OPEN + "\n")
+            parts.append(HY3_TOOLRESP_OPEN + "\n" + text + "\n" + HY3_TOOLRESP_CLOSE + "\n")
+            prev_tool = True
+    if prev_tool:
+        parts.append(HY3_TOOLRESPS_CLOSE)
+    parts.append(HY3_ASSISTANT + (HY3_THINK_OPEN if enable_thinking
+                                  else HY3_THINK_OPEN + HY3_THINK_CLOSE))
+    return "".join(parts)
+
+
 ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -712,140 +973,268 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
-def hy3_effort(enable_thinking, reasoning_effort):
-    if not enable_thinking:
-        return "reasoning_effort:no_think"
-    if reasoning_effort in ("high", "xhigh"):
-        return "reasoning_effort:high"
-    if reasoning_effort == "max":
-        return "reasoning_effort:max"
-    if reasoning_effort in ("low", "minimal"):
-        return "reasoning_effort:low"
-    if reasoning_effort == "medium":
-        return "reasoning_effort:medium"
-    return "reasoning_effort:high"
+ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" | "hy3" (auto-detected)
+
+INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
 
-def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                    tool_choice=None):
-    """Render the official Hunyuan Hy3 chat template (tencent/Hy3, `:opensource` tokens),
-    including the <tool_calls:opensource> tool-declaration/tool-call/tool-response format."""
+class InklingStreamSplit:
+    """Strips Inkling's content markers from the visible stream and withholds
+    <|content_thinking|> sections from `content` (they are reasoning, not
+    answer). Buffers partial markers across chunk boundaries so a marker split
+    between two DATA frames never leaks."""
+
+    def __init__(self, on_content, on_reasoning=None):
+        self.on_content = on_content
+        self.on_reasoning = on_reasoning
+        self.mode = "content"
+        self.buf = ""
+
+    def feed(self, piece):
+        self.buf += piece
+        while True:
+            hits = [(i, m) for i, m in ((self.buf.find(INK_THINK), INK_THINK),
+                                        (self.buf.find(INK_TEXT), INK_TEXT)) if i >= 0]
+            if not hits:
+                hold = self._tail_hold()
+                out = self.buf[:len(self.buf) - hold] if hold else self.buf
+                self.buf = self.buf[len(self.buf) - hold:] if hold else ""
+                self._emit(out)
+                return
+            i, m = min(hits)
+            self._emit(self.buf[:i])
+            self.mode = "reasoning" if m == INK_THINK else "content"
+            self.buf = self.buf[i + len(m):]
+
+    def _tail_hold(self):
+        for k in range(min(len(self.buf), 24), 0, -1):
+            if INK_THINK.startswith(self.buf[-k:]) or INK_TEXT.startswith(self.buf[-k:]):
+                return k
+        return 0
+
+    def _emit(self, text):
+        if not text:
+            return
+        text = _INK_MARKER.sub("", text)
+        if not text:
+            return
+        if self.mode == "content":
+            self.on_content(text)
+        elif self.on_reasoning:
+            self.on_reasoning(text)
+
+    def close(self):
+        self._emit(self.buf)
+        self.buf = ""
+
+
+import re as _re
+_INK_MARKER = _re.compile(r"<\|(?:content_\w+|end_message|message_\w+|audio_end|unused_\d+)\|>")
+
+def strip_inkling_markers(text):
+    """Remove <|content_thinking|>…<|content_text|> sections, then any stray
+    control markers (end_message, role/content tokens) the model emits."""
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        _, _, after = rest.partition(INK_TEXT)
+        text = pre + after
+    return _INK_MARKER.sub("", text)
+
+
+def split_inkling(text):
+    """Split raw Inkling output into (content, reasoning). Thinking blocks
+    (<|content_thinking|>…<|content_text|>) become reasoning — including an
+    UNTERMINATED trailing block (budget ran out mid-thought), which partitions
+    to everything after the opener — so a think-only generation surfaces its
+    reasoning instead of collapsing to an empty answer."""
+    reasoning = []
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        think, _, after = rest.partition(INK_TEXT)
+        reasoning.append(think)
+        text = pre + after
+    return _INK_MARKER.sub("", text), _INK_MARKER.sub("", "".join(reasoning))
+
+
+def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                     tool_choice=None):
+    """Validated multi-turn K3 payload for the C engine.
+
+    K3's rank-BPE makes ordinary-text segment boundaries part of the tokenizer
+    contract. This private length-framed payload preserves roles, UTF-8 bytes,
+    and message boundaries; kimi_k3.c constructs the native XTML tokens.
+    """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    has_user = False
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the Kimi K3 engine yet.",
+                       "tools", "unsupported_parameter")
+    parts = ["K3CHAT1\n"]
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role == "user":
-            has_user = True
-        elif role not in ("system", "developer", "assistant", "tool"):
-            raise APIError(400, f"Unsupported message role: {role!r}.",
-                           f"messages.{index}.role", "unsupported_role")
-    if not has_user:
-        raise APIError(400, "Hy3 chat requires at least one user message.", "messages")
-
-    tools, forced = _resolve_tool_choice(tools, tool_choice)
-    system_prompt = "\n\n".join(content_text(m.get("content"), f"messages.{i}.content")
-                                for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
-    effort = hy3_effort(enable_thinking, reasoning_effort)     # e.g. "reasoning_effort:high"
-    if not tools:
-        # Insert a delimiter before the reasoning-mode marker so it never fuses with the
-        # last system/developer message (and multiple system messages stay separated).
-        system_prompt = (system_prompt + "\n\n" if system_prompt else "") + HY3_REASONING_MODE + effort
-
-    parts = [HY3_BOS, system_prompt]
-
-    if tools:
-        parts.append(("\n\n" if system_prompt else "") +
-                     "# Tools\n\nYou may call one or more functions to assist with the user "
-                     "query.\n\nYou are provided with function signatures within <tools></tools> "
-                     "XML tags:\n<tools>\n")
-        clean_tools = []
-        for tool in tools:
-            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
-            clean_tools.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
-        parts.append("\n".join(json.dumps(t, ensure_ascii=False) for t in clean_tools))
-        parts.append("\n</tools>\n\n"
-                     "For function call returns, you should first print " + HY3_TOOLCALLS_OPEN + "\n"
-                     "For each function call, you should return object like:\n"
-                     + HY3_TOOLCALL_OPEN + "{function-name}" + HY3_TOOLSEP + "\n"
-                     + HY3_ARGKEY_OPEN + "{arg-key-1}" + HY3_ARGKEY_CLOSE + "\n"
-                     + HY3_ARGVALUE_OPEN + "{arg-value-1}" + HY3_ARGVALUE_CLOSE + "\n"
-                     + HY3_ARGKEY_OPEN + "{arg-key-2}" + HY3_ARGKEY_CLOSE + "\n"
-                     + HY3_ARGVALUE_OPEN + "{arg-value-2}" + HY3_ARGVALUE_CLOSE + "\n"
-                     "...\n" + HY3_TOOLCALL_CLOSE + "\n"
-                     "At the end of function call returns, you should print "
-                     + HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort)
-        if forced:
-            parts.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
-        elif tool_choice == "required":
-            parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
-
-    prev_tool = False
-    for index, message in enumerate(messages):
-        role = message.get("role")
-        if role in ("system", "developer"):
-            continue                                  # already folded into system_prompt above
-        if role == "user":
-            text = content_text(message.get("content"), f"messages.{index}.content")
-            if prev_tool:
-                parts.append(HY3_TOOLRESPS_CLOSE)
-            parts.append(HY3_USER + text)
-            prev_tool = False
-        elif role == "assistant":
-            raw = message.get("content")
-            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-            if prev_tool:
-                parts.append(HY3_TOOLRESPS_CLOSE)
-            parts.append(HY3_ASSISTANT)
-            calls = message.get("tool_calls")
-            if calls:
-                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text)
-                parts.append(HY3_TOOLCALLS_OPEN + "\n")
-                for tc in calls:
-                    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
-                    args = fn.get("arguments", "{}")
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except (json.JSONDecodeError, TypeError):
-                            args = {}
-                    parts.append(HY3_TOOLCALL_OPEN + (fn.get("name") or "") + HY3_TOOLSEP + "\n")
-                    for key, value in (args or {}).items():
-                        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                        parts.append(HY3_ARGKEY_OPEN + key + HY3_ARGKEY_CLOSE + "\n"
-                                     + HY3_ARGVALUE_OPEN + value + HY3_ARGVALUE_CLOSE + "\n")
-                    parts.append(HY3_TOOLCALL_CLOSE + "\n")
-                # Match the declared tool-call format: the model is told to end its tool calls
-                # with </tool_calls:opensource> followed by the reasoning-mode marker, then EOS.
-                parts.append(HY3_TOOLCALLS_CLOSE + HY3_REASONING_MODE + effort + HY3_EOS)
-            else:
-                parts.append(HY3_THINK_OPEN + HY3_THINK_CLOSE + text + HY3_EOS)
-            prev_tool = False
-        elif role == "tool":
-            text = content_text(message.get("content"), f"messages.{index}.content")
-            if not prev_tool:
-                parts.append(HY3_TOOLRESPS_OPEN + "\n")
-            parts.append(HY3_TOOLRESP_OPEN + "\n" + text + "\n" + HY3_TOOLRESP_CLOSE + "\n")
-            prev_tool = True
-    if prev_tool:
-        parts.append(HY3_TOOLRESPS_CLOSE)
-    parts.append(HY3_ASSISTANT + (HY3_THINK_OPEN if enable_thinking
-                                  else HY3_THINK_OPEN + HY3_THINK_CLOSE))
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        reasoning = message.get("reasoning_content") if role == "assistant" else None
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise APIError(400, "`reasoning_content` must be a string.",
+                           f"messages.{index}.reasoning_content")
+        if role == "assistant" and enable_thinking:
+            reasoning = reasoning or ""
+            parts.append(f"A {len(reasoning.encode('utf-8'))} {len(text.encode('utf-8'))}\n"
+                         f"{reasoning or ''}{text}")
+        else:
+            parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
+    parts.append(f"G {1 if enable_thinking else 0}\n")
     return "".join(parts)
 
 
-def model_family(model_dir):
-    try:
-        cfg = json.loads(Path(model_dir).joinpath("config.json").read_text(encoding="utf-8"))
-        return cfg.get("model_type", "glm")
-    except (OSError, json.JSONDecodeError, TypeError):
-        return "glm"
+def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                        tool_choice=None):
+    """Text-only subset of Inkling's chat_template.jinja: role tokens with
+    <|content_text|> parts and <|end_message|> terminators, an assistant
+    <|content_model_end_sampling|> after each prior model turn, the
+    thinking-effort hint appended after the messages (the template's fallback
+    branch), then <|message_model|> as the generation prompt."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Inkling engine yet.",
+                       "tools", "unsupported_parameter")
+    role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
+                  "developer": "<|message_system|>", "assistant": "<|message_model|>",
+                  "tool": "<|message_tool|>"}
+    # Thinking effort — template default is 0.9, but at single-machine decode
+    # speeds unrequested reasoning burns the whole token budget before the answer
+    # starts, so we default it OFF unless the client asks.
+    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
+                  "high": 0.9, "max": 0.99}
+    if reasoning_effort in effort_map:
+        eff = effort_map[reasoning_effort]
+    else:
+        eff = 0.9 if enable_thinking else 0.0
+    effort_str = ("<|message_system|><|content_text|>Thinking effort level: "
+                  f"{0 if eff == 0.0 else eff}<|end_message|>")
+
+    prompt = []
+    effort_emitted = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        rtok = role_token.get(role)
+        if rtok is None:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        # the template emits the effort hint inline, right before the first
+        # non-system message — not at the end. Position matters: it changes the
+        # exact token sequence the model was trained on.
+        if not effort_emitted and role not in ("system", "developer"):
+            prompt.append(effort_str)
+            effort_emitted = True
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
+        if role == "assistant":
+            prompt.append("<|content_model_end_sampling|>")
+    if not effort_emitted:                       # all-system edge case: fallback
+        prompt.append(effort_str)
+    prompt.append("<|message_model|>")           # add_generation_prompt
+    # Thinking off: prefill the content channel. Without this the model can still
+    # sample <|content_thinking|> as its first token (the effort hint is only a
+    # soft signal), open a reasoning block, and burn the whole token budget before
+    # reaching <|content_text|> — which the splitter then strips to an empty
+    # answer. Ending the prompt at <|message_model|><|content_text|> forces content
+    # mode; it is exactly the sequence every non-thinking turn is trained on.
+    if eff == 0.0:
+        prompt.append("<|content_text|>")
+    return "".join(prompt)
 
 
-def default_model_id(model_dir):
-    return "hy3-colibri" if model_family(model_dir) == "hy_v3" else "glm-5.2-colibri"
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                tool_choice=None):
+    """Render the text-only subset of the official GLM-5.2 chat template."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    prompt = ["[gMASK]<sop>"]
+    if enable_thinking:
+        effort = "High" if reasoning_effort == "high" else "Max"
+        prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    if tools:
+        # AUTHORITATIVE GLM-5.2 tool-declaration block (byte-matches chat_template.jinja): the
+        # `# Tools` + <tools></tools> XML structure is what the model was trained on. A made-up
+        # preamble makes it hallucinate other frameworks' syntax (e.g. `end_action`).
+        prompt.append("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the "
+                      "user query.\n\nYou are provided with function signatures within <tools></tools> "
+                      "XML tags:\n<tools>\n")
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+            prompt.append(json.dumps(clean, ensure_ascii=False) + "\n")
+        prompt.append("</tools>\n\nFor each function call, output the function name and arguments "
+                      "within the following XML format:\n<tool_call>{function-name}"
+                      "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+                      "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
+        if forced:
+            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
+    prev_tool = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role in ("system", "developer"):
+            prompt.append(f"<|system|>{content_text(message.get('content'), f'messages.{index}.content')}")
+        elif role == "user":
+            prompt.append(f"<|user|>{content_text(message.get('content'), f'messages.{index}.content')}")
+        elif role == "assistant":
+            # content may be null when the message is purely tool_calls
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            reasoning = message.get("reasoning_content")
+            if reasoning is None:
+                reasoning = ""
+            elif not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            prompt.append(f"<|assistant|><think>{reasoning}</think>{text.strip()}")
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                prompt.append(BOX_START + (fn.get("name") or ""))
+                for key, value in (args or {}).items():
+                    prompt.append(f"<arg_key>{key}</arg_key><arg_value>"
+                                  + (value if isinstance(value, str)
+                                     else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
+                prompt.append(BOX_END)
+        elif role == "tool":
+            if not prev_tool:                       # one <|observation|> per consecutive tool run
+                prompt.append("<|observation|>")
+            prompt.append(TR_OPEN + content_text(message.get("content"), f"messages.{index}.content") + TR_CLOSE)
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+        prev_tool = (role == "tool")
+    prompt.append("<|assistant|><think>" if enable_thinking else
+                  "<|assistant|><think></think>")
+    return "".join(prompt)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -955,7 +1344,7 @@ def anthropic_to_openai(body):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role not in ("user", "assistant"):
-            raise APIError(400, f"Unsupported message role: {role!r}. Anthropic messages are "
+            raise APIError(400, f"Input message role {role!r} is not supported. Anthropic messages are "
                            "`user` or `assistant`; a system prompt goes in the top-level `system`.",
                            f"messages.{index}.role", "unsupported_role")
         content = message.get("content")
@@ -1358,28 +1747,76 @@ def read_engine_turn(stream, sentinel, on_bytes):
         "rss_gb": float(fields[4]),
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
-        "decode_tokens_per_second": float(fields[7]) if len(fields) > 7 else None,
     }
 
 
+def model_arch(model):
+    """The model's engine family from its config.json model_type -- the same
+    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
+    (including an unreadable config) is glm."""
+    try:
+        with open(Path(model) / "config.json", encoding="utf-8") as fh:
+            model_type = (json.load(fh).get("model_type") or "").lower()
+    except (OSError, ValueError, TypeError):
+        return "glm"
+    if model_type == "hy_v3" or "hy_v3" in model_type:
+        return "hy3"
+    if "inkling" in model_type:
+        return "inkling"
+    if "kimi" in model_type:
+        return "kimi"
+    return "glm"
+
+
+def cap_for_arch(arch, cap):
+    """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
+
+    An absent cap (None) means different things across today's engines --
+    platform-auto in colibri.c (coli_resolve_cap resolves the 0 sentinel
+    Metal/darwin/SSD-aware), RAM-auto in inkling.c (cap <= 0 fits the expert
+    LRU to available RAM), while the coli wrapper historically forced 8 on
+    every engine. This shim INTERNALIZES that external inconsistency at the
+    one funnel every engine launch passes through: with no explicit cap, a
+    glm-arch model's engine receives the 0 sentinel to resolve platform-aware
+    and a non-glm arch receives the legacy 8. An EXPLICIT cap passes through
+    verbatim to any engine -- including an explicit 0, which for inkling means
+    upstream's RAM-auto (people who ask for upstream semantics get them).
+    Keyed on the MODEL's arch (config.json model_type), not the engine
+    binary's file name: COLI_ENGINE users package the glm engine under
+    arbitrary names (glm52, colibri-1.2, ...), and basename keying silently
+    disabled the platform default for exactly them.
+
+    MOOTING TRIGGER: upstream unifies cap-sentinel semantics across engines
+    -> this shim must be removed and re-derived."""
+    if cap is not None:
+        return cap
+    return 0 if arch == "glm" else 8
+
+
+def argv_for_arch(arch, cap):
+    cap = cap_for_arch(arch, cap)
+    if arch == "hy3":
+        return [str(cap), "4", "8"]
+    return [str(cap)]
+
+
 class Engine:
-    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1, family=None):
+    # cap=None = "not explicitly set": a glm-arch model's engine resolves the
+    # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
+    # coli_resolve_cap, #379), non-glm arches get the legacy 8, via
+    # cap_for_arch above. Same convention as the --cap flags in coli and
+    # main() below, so programmatic callers that never pass cap get the same
+    # auto behavior as the CLI; an explicit int (0 included) is verbatim.
+    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1, arch=None):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        fam = family or model_family(model)
-        if fam == "hy_v3":
+        fam = arch or model_arch(model)
+        if fam == "hy3":
             child_env.setdefault("IDOT", "0")
-            argv = [str(executable), str(cap), "4", "8"]
-        else:
-            argv = [str(executable), str(cap)]
-        # hy3.c has no run_serve_mux/step_decode_batch (those symbols live only in glm.c) --
-        # it silently ignores SERVE_BATCH and always runs the old single-sequence run_serve(),
-        # which speaks \x02PROMPT/END, not SUBMIT/DATA/DONE. Fall back to that protocol for Hy3
-        # so the SUBMIT header text isn't mistaken for a literal chat message.
-        self.protocol = "single" if fam == "hy_v3" else "mux"
+        argv = [str(executable)] + argv_for_arch(fam, cap)
+        self.protocol = "single" if fam == "hy3" else "mux"
         self.process = subprocess.Popen(
-            argv, env=child_env, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, bufsize=0,
+            argv, env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
@@ -1388,16 +1825,13 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
-        # run_serve() handles one line of the wire protocol at a time (no request ids to
-        # disambiguate interleaved replies), so single-protocol requests must be fully
-        # serialized -- this lock is unused by the mux protocol.
         self.serialize_lock = threading.Lock()
         self.tiers = None
         self.hwinfo = None
         self.emap = None
         self.hits = None
-        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
-        self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
+        self.hits_seq = 0
+        self.profile = collections.deque(maxlen=PROFILE_TURNS)
         self.profile_seq = 0
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = None
@@ -1417,7 +1851,6 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
-            "decode_tokens_per_second": float(fields[7]) if len(fields) > 7 else None,
         }
 
     def _fail_pending(self, error):
@@ -1679,11 +2112,10 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1, family="glm", allowed_hosts=()):
+                 kv_slots=1, allowed_hosts=()):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
-        self.model_family = family
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
@@ -2007,18 +2439,17 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH == "inkling":
-            # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
+        if grammar is not None and ARCH in ("inkling", "kimi", "hy3"):
+            # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
-            raise APIError(400, "`response_format` grammars are not supported by the Inkling "
+            raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
                                 "engine yet.", "response_format", "unsupported_parameter")
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
-        hy3 = chat and self.server.model_family == "hy_v3"
-        hy3_thinking = hy3 and enable_thinking  # Hy3-only: Stage-1 reasoning splitter engages
-        box_start = HY3_TOOLCALLS_OPEN if hy3 else BOX_START
+        hy3 = chat and ARCH == "hy3"
+        hy3_thinking = hy3 and enable_thinking
         parse_calls = parse_tool_calls_hy3 if hy3 else parse_tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -2059,10 +2490,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
-                elif chat:
-                    # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
-                    # reasoning to reasoning_content instead of dumping it (or the raw </think>)
-                    # into the visible answer / tool-call parser.
+                elif chat and not hy3:
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if hy3_thinking:
@@ -2175,8 +2603,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
             splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
                         if ARCH == "inkling" else None)
-            glm_think = chat and ARCH != "inkling" and not hy3
-
+            glm_think = chat and ARCH not in ("inkling", "hy3")
+            box_start = HY3_TOOLCALLS_OPEN if hy3 else BOX_START
             rs = None
             reasoning_raw = []
             if hy3_thinking:
@@ -2184,7 +2612,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 THINK_HOLD = len(HY3_THINK_CLOSE) - 1
 
             def wrap_stage1(stage2):
-                """Hy3 Stage-1 reasoning split: hand post-marker bytes to stage2."""
                 if not rs:
                     return stage2
                 def _fn(chunk):
@@ -2209,6 +2636,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 return _fn
 
             def start_stream(_accept_info=None):
+                # #597 item 6: commit the streaming 200 (and start the keepalive) exactly once,
+                # only after the engine ACCEPTs the prompt. Idempotent: generate() also calls this
+                # on the first DATA/DONE so an older engine with no ACCEPT frame still streams.
                 nonlocal connected
                 if stream_started[0]:
                     return
@@ -2217,6 +2647,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Accel-Buffering", "no")
+                # An SSE body has neither Content-Length nor chunked framing, so end-of-message
+                # IS the close -- HTTP/1.1 requires us to say so, or the client waits for a
+                # length that never comes and then tries to reuse a socket we are about to drop.
+                # Set close_connection HERE, not after the last event: if generation raises once
+                # the 200 is out, the connection must still not be offered for reuse (#597 item 3).
                 self.send_header("Connection", "close")
                 self.close_connection = True
                 self.send_header("x-request-id", request_id)
@@ -2230,7 +2665,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
-
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -2254,6 +2688,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
+                # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
+                # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
                                              initial_thinking=enable_thinking)
                          if glm_think else None)
@@ -2366,13 +2802,11 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        if self.server.model_family == "hy_v3":
-            prompt = render_chat_hy3(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                                     tool_choice)
-        else:
-            renderer = render_chat_inkling if ARCH == "inkling" else render_chat
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice)
+        renderer = (render_chat_hy3 if ARCH == "hy3" else
+                    render_chat_inkling if ARCH == "inkling" else
+                    render_chat_kimi if ARCH == "kimi" else render_chat)
+        prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                          tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking)
 
@@ -2624,11 +3058,11 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
-        self.generation(body, prompt, request_id, False, enable_thinking=False)
+        self.generation(body, prompt, request_id, False)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
+          cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
     if engine is None:
         engine = default_engine()
@@ -2642,6 +3076,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
+    if ARCH in ("inkling", "kimi", "hy3") and kv_slots != 1:
+        raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
         # a compute-heavy API to the network. Refuse unless explicitly overridden.
@@ -2653,15 +3089,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
                   "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
             sys.exit(1)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    family = model_family(model)
-    # Bind before starting the engine. A stale/occupied port must fail in
+    # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots, family, allowed_hosts=allowed_hosts)
+                       max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        runtime = Engine(engine, model, cap, max_tokens, env, kv_slots, family)
+        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,arch=ARCH)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -2678,7 +3113,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "hy3"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2686,7 +3121,10 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    parser.add_argument("--cap", type=int, default=8)
+    # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and issue
+    # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
+    # explicit value, 0 included, reaches the engine verbatim.
+    parser.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
@@ -2701,17 +3139,12 @@ def main():
     global ARCH
     ARCH = args.arch
     if ARCH == "auto":
-        fam = model_family(args.model)
-        if fam == "hy_v3":
-            ARCH = "glm"
-        elif "inkling" in fam:
-            ARCH = "inkling"
-        else:
-            ARCH = "glm"
-    model_id = args.model_id or default_model_id(args.model)
-    if model_id == "glm-5.2-colibri" and ARCH == "inkling":
-        model_id = "inkling-colibri"
-    serve(args.model, args.host, args.port, model_id, args.api_key,
+        ARCH = model_arch(args.model)
+    if args.model_id is None:
+        args.model_id = ("hy3-colibri" if ARCH == "hy3" else
+                         "inkling-colibri" if ARCH == "inkling" else
+                         "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
+    serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
           allowed_hosts=args.allowed_host)

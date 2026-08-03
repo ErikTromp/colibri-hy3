@@ -1,0 +1,140 @@
+#version 450
+// Quantized mat-vec/mat-mat mirroring colibri's CUDA quant_matmul:
+//   y[s,o] = ( sum_i x[s,i] * dequant(W[o,i]) ) * scale[o]
+// fmt: 1=int8, 2=int4 (packed 2/byte, nibble-8), 5=int3-g64 (per 64-input group:
+// 24 bytes = 16B low plane [2 bits/val] + 8B high plane [1 bit/val], values v+4 in
+// [-4,3], ONE f32 scale PER GROUP — scale[] holds O*ceil(I/64) entries and the
+// per-row multiply at the end does not apply). Weights are a byte buffer exposed
+// as uint32 words; bytes/nibbles/planes are extracted manually.
+//
+// Optimized decode (S=1) GEMV, techniques adapted from llama.cpp's mul_mat_vec
+// (MIT) to colibri's per-row int4/int8 layout:
+//   - x[s,:] loaded ONCE into shared memory, reused across every output row in
+//     the workgroup (x lives in host-visible scratch, so this avoids re-reading
+//     it over the BAR for each row);
+//   - one SUBGROUP per output row: its lanes stride the row's weight words with
+//     full coalescing, then a single subgroupAdd replaces the barrier-heavy
+//     shared-memory tree reduction;
+//   - grid-stride over rows so a fixed, occupancy-friendly workgroup count
+//     covers any O and any subgroup width (RADV wave32/64).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row o at o*rowWords
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64
+    int S, I, O;
+    int rowWords;   // uint32 words per weight row
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+} p;
+
+// Max hidden dim across GLM expert matmuls is 6144 (24 KB LDS); down-proj uses 2048.
+// Rows longer than the staging array (o_proj: I = H*vh = 16384) skip shared staging
+// and read x straight from the storage buffer — an unstaged read is coalesced across
+// the subgroup and still correct, while an unchecked stage would write past xsh.
+shared float xsh[6144];
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+// fmt=7 MXFP4 (Kimi K3 experts): e2m1 nibble, bit3 = sign, LOW nibble = even
+// column (same packing order as i4). Scales arrive as f32 (host pre-expands
+// the ue8m0 exponents), one per 32-input group.
+float mx4(uint word, int lane) {
+    uint n = (word >> (uint(lane) * 4u)) & 0xfu;
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
+
+void main() {
+    int s   = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+
+    // Stage x[s,:] into shared once; all rows this workgroup computes reuse it.
+    bool staged = p.I <= 6144;
+    if (staged) for (int i = tid; i < p.I; i += nth) xsh[i] = x[s * p.I + i];
+    barrier();
+    int xoff = s * p.I;
+
+    int sg      = int(gl_SubgroupID);
+    int lane    = int(gl_SubgroupInvocationID);
+    int sgsize  = int(gl_SubgroupSize);
+    int nsg     = nth / sgsize;                       // subgroups (= rows) per workgroup
+    int stride  = int(gl_NumWorkGroups.x) * nsg;      // grid-stride over output rows
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rowBase = uint(o) * uint(p.rowWords);
+        float sum = 0.0;
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += xsh[i] * i8(pk, k); }
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
+            }
+        } else if (p.fmt == 5) { // int3-g64: lanes stride the 16-value LOW-PLANE words;
+            // all 16 values of one low word share a group, so its scale multiplies the
+            // 16-wide partial directly and the per-row scale at the end must NOT run.
+            int ng = (p.I + 63) >> 6;
+            uint sb = uint(o) * uint(ng);
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int g = m >> 2, mw = m & 3;                   // group, low-word within group
+                uint blo = w[rowBase + uint(g) * 6u + uint(mw)];
+                uint bhi = w[rowBase + uint(g) * 6u + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16;                       // this word's bits in the high plane
+                int i0 = (g << 6) + (mw << 4);
+                float a = 0.0;
+                for (int k = 0; k < 16; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                        a += (staged ? xsh[i] : x[xoff + i]) * float(int(u) - 4);
+                    }
+                }
+                sum += a * scale[sb + uint(g)];
+            }
+        } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 (#298 semantics) or MXFP4:
+            // nibble decode, one scale per gs inputs — gs % 8 == 0 (host-gated), so a
+            // packed word never straddles a group and its scale multiplies the 8-wide
+            // partial. Per-row scale must NOT run.
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float a = 0.0;
+                if (p.fmt == 4) {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * i4(pk, k); }
+                } else {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * mx4(pk, k); }
+                }
+                sum += a * scale[sb + uint(i0 / p.gs)];
+            }
+        } else { // int4
+            int words = (p.I + 7) / 8;
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) sum += xsh[i] * i4(pk, k); }
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i4(pk, k); }
+            }
+        }
+        float tot = subgroupAdd(sum);
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7) ? tot : tot * scale[o];
+    }
+}

@@ -24,6 +24,15 @@
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+/* rocWMMA requires matrix cores (MFMA: gfx908+, WMMA: gfx11xx); on other
+ * targets (gfx906, gfx101x, gfx103x) its headers static_assert. The Makefile
+ * passes -DCOLI_HIP_NO_WMMA for those archs: the WMMA kernel bodies stay
+ * compiled out (__CUDA_ARCH__ undefined fails the >= 700 guard) and the host
+ * dispatch sites fall back via COLI_GPU_HAS_WMMA=0, same as pre-Volta CUDA.
+ * The flag must be set for BOTH hipcc passes (host + device) — an arch-macro
+ * check here would let the host dispatch kernels whose bodies were compiled
+ * out, silently computing nothing. */
+#ifndef COLI_HIP_NO_WMMA
 #if __has_include(<rocwmma/rocwmma.hpp>)
 #include <rocwmma/rocwmma.hpp>
 #define COLI_GPU_HAS_WMMA        1
@@ -32,7 +41,14 @@
 namespace nvcuda { namespace wmma = ::rocwmma; }
 #define __syncwarp()            __syncthreads()
 #else
-#error "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev) to build with HIP."
+/* WMMA-capable arch but no headers: stop loudly rather than silently build
+ * a binary with the tensor-core kernels disabled. */
+#error "rocWMMA headers not found. Install rocwmma-dev (or rocm-hip-runtime-dev), or build for a non-WMMA arch (see NO_WMMA_ARCHS in the Makefile)."
+#endif
+#else
+/* Arch has no matrix cores: rocWMMA is not needed and not included. */
+#define COLI_GPU_HAS_WMMA        0
+#define __syncwarp()            __syncthreads()
 #endif
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess

@@ -143,6 +143,90 @@ def memory_available():
     return 0
 
 
+# Strict .coli_ssd grammar -- the byte-for-byte mirror of colibri.c's
+# coli_ssd_cache_parse() (keep the two in lockstep; test_resource_plan.py and
+# test_ssd_probe.c chew the same vector file, tests/fixtures/ssd_cache_vectors.txt):
+#   v2:     b"v2 <gbs> <st_dev>"   single spaces, at most one trailing \n
+#   legacy: b"<gbs>"               the pre-fix format, never trusted
+# where <gbs> = digits["."digits] with 0 < gbs < 1000 and <st_dev> = 1..20
+# digits fitting unsigned 64-bit; total length <= 64 bytes, no NULs, nothing
+# else. float() permissiveness ("inf", "nan", "1e99", whitespace, signs) is
+# deliberately out: it let corrupt caches surface as measurements, and "inf"
+# reached doctor's JSON as the invalid literal Infinity.
+_SSD_CACHE_V2 = re.compile(rb"\Av2 (\d+(?:\.\d+)?) (\d{1,20})\n?\Z")
+_SSD_CACHE_LEGACY = re.compile(rb"\A(\d+(?:\.\d+)?)\n?\Z")
+
+
+def parse_ssd_cache(data):
+    """Classify raw .coli_ssd bytes under the strict grammar above. Returns
+    ("v2", gbs, st_dev), ("legacy", gbs, None), or (None, None, None) for
+    garbage. Classification only -- trust (the st_dev match) is the caller's."""
+    if not data or len(data) > 64 or b"\x00" in data:
+        return (None, None, None)
+    match = _SSD_CACHE_V2.match(data)
+    if match:
+        gbs, dev = float(match.group(1)), int(match.group(2))
+        if 0 < gbs < 1000 and dev <= 0xFFFFFFFFFFFFFFFF:
+            return ("v2", gbs, dev)
+        return (None, None, None)
+    match = _SSD_CACHE_LEGACY.match(data)
+    if match:
+        gbs = float(match.group(1))
+        if 0 < gbs < 1000:
+            return ("legacy", gbs, None)
+    return (None, None, None)
+
+
+def ssd_probe_state(model_dir):
+    """Classify the cached F_NOCACHE storage probe the C engine writes to
+    <model>/.coli_ssd on its first Metal+darwin startup (colibri.c
+    coli_ssd_probe_cached, issue #379). Read-only: never re-measures, never
+    guesses -- mirrors S4's "read-and-display only" contract for `coli
+    doctor`/`coli plan`. Returns (state, gbs):
+      ("ok", gbs)        v2 cache recorded on THIS volume -- the one case the
+                         engine itself would trust
+      ("legacy", None)   pre-v2 bare number; the engine re-probes + upgrades
+      ("foreign", None)  v2 from another volume (st_dev mismatch); re-probed
+      ("garbage", None)  a file exists but fails the strict grammar
+      ("absent", None)   no cache file at all
+    The distinctions matter for wording (#386 r2, F10): "no cached probe yet"
+    is a lie when a file exists. The read is bounded to 65 bytes (F13): the
+    strict grammar caps a well-formed cache at 64, so byte 65 alone already
+    convicts -- no reason to slurp an arbitrarily large impostor file."""
+    try:
+        with open(Path(model_dir) / ".coli_ssd", "rb") as fh:
+            data = fh.read(65)
+    except OSError:
+        return ("absent", None)
+    kind, gbs, dev = parse_ssd_cache(data)
+    if kind == "v2":
+        try:
+            if dev == os.stat(model_dir).st_dev:
+                return ("ok", gbs)
+        except OSError:
+            pass
+        return ("foreign", None)
+    if kind == "legacy":
+        return ("legacy", None)
+    return ("garbage", None)
+
+
+def read_ssd_probe(model_dir):
+    """The measured GB/s as a float when the engine itself would trust the
+    cache (ssd_probe_state "ok"), else None."""
+    return ssd_probe_state(model_dir)[1]
+
+
+# What doctor/plan say for a cache that exists but is not trusted (#386 r2,
+# F10): each state names what will actually happen, never "no cached probe
+# yet" while a file sits right there.
+SSD_PROBE_PENDING = {
+    "legacy": "legacy cache pending engine upgrade; re-measured on the next Metal+darwin start",
+    "foreign": "cache from another volume; the engine will re-probe here",
+    "garbage": "unreadable cache; the engine will re-probe",
+}
+
+
 def discover_gpus():
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
@@ -568,6 +652,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
 
     tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
                       plan_has_metal=False)
+    probe_state, probe_gbs = ssd_probe_state(info["path"])
 
     return {
         "version": 2,
@@ -598,6 +683,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
         ],
         "warnings": warnings,
+        # #379: read-only surfacing of the cached Metal-cache storage probe, if
+        # the engine has already measured this model dir. gbs is None unless
+        # the engine itself would trust the cache; the state says WHY (#386 r2,
+        # F10) -- never re-measured or guessed here.
+        "ssd_probe_gbs": probe_gbs,
+        "ssd_probe_state": probe_state,
     }
 
 
@@ -668,6 +759,10 @@ def format_plan(plan):
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
+    if plan.get("ssd_probe_gbs") is not None:
+        lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
+    elif plan.get("ssd_probe_state") in SSD_PROBE_PENDING:
+        lines.append(f"ssd    {SSD_PROBE_PENDING[plan['ssd_probe_state']]}")
     lines.append(f"limit  {plan['expected_bottleneck']}")
     hit = plan.get("projected_hit_rate", 0)
     lines.append(f"hit    {hit:.0%} projected expert residency")

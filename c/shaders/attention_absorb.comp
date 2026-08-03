@@ -1,0 +1,176 @@
+#version 450
+// MLA weight-absorption attention core (decode), the VK equivalent of
+// coli_cuda_attention_absorb / glm.c's CPU absorb loop. One workgroup per
+// (query row s = WorkGroupID.y, head h = WorkGroupID.x); the whole core for
+// one head runs in a single dispatch:
+//   qabs[i]  = sum_d q_nope[d] * dequant(Wkv_b[h*(Q+V)+d])[i]        (absorbed query)
+//   score_t  = (qabs . L_t + q_rope . R_t) * scale     t in [st0, T-S+s]  (causal)
+//   p        = softmax(score)
+//   clat[i]  = sum_t p_t * L_t[i]                                    (latent context)
+//   ctx[v]   = clat . dequant(Wkv_b[h*(Q+V)+Q+v])                    (value rows)
+// L/R are the PERSISTENT device-side latent/rope caches (rows appended by the
+// host each token, absolute position indexing). Queries arrive already roped;
+// cache rows already normed+roped (host writes them that way).
+// fmt: 1=int8, 2=int4 (nibble-8), 5=int3-g64 (24B/64-group two-plane packing, ONE
+// f32 scale per group: wsc[] holds rows*ceil(K/64) entries; for the row-scale
+// formats the scale folds into qsc[] once, for fmt=5 it is applied per (row,group)
+// inside the passes). Limits: Q<=256, R<=64, K<=512 (shared arrays).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QB { float q[]; };      // [S,H,Q+R] roped
+layout(std430, binding = 1) readonly  buffer WB { uint  w[]; };      // kv_b [H*(Q+V), K] quant
+layout(std430, binding = 2) readonly  buffer SB { float wsc[]; };    // kv_b row scales
+layout(std430, binding = 3) readonly  buffer LB { float lc[]; };     // latent cache [max_t, K]
+layout(std430, binding = 4) readonly  buffer RB { float rc[]; };     // rope cache [max_t, R]
+layout(std430, binding = 5) buffer SC           { float sc[]; };     // scores [S,H,cap] scratch
+layout(std430, binding = 6) writeonly buffer CB { float ctx[]; };    // [S,H,V] out
+
+layout(push_constant) uniform P {
+    int fmt;        // 1=int8, 2=int4
+    int S, H, Q, R, V, K;   // Q=qk_nope, R=qk_rope, V=v_head, K=kv_lora
+    int st0, T;     // attend rows [st0, T-S+s]; T = absolute rows incl. final query
+    int rowWords;   // uint32 words per kv_b row (K-dim)
+    int cap;        // score scratch stride per (s,h) = T-st0
+    float scale;    // attention scale
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+} p;
+
+shared float qsc[256];    // q_nope pre-multiplied by its row scale
+shared float qr[64];      // q_rope
+shared float qabs[512];   // absorbed query in latent space
+shared float clat[512];   // latent context
+shared float red[256];    // reduction scratch
+
+float i8(uint x, int l) { int b = int((x >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
+float i4(uint x, int l) { return float(int((x >> (uint(l) * 4u)) & 0xfu) - 8); }
+// int3-g64: raw integer value in [-4,3] of element i of weight row `row` (scale separate)
+float i3v(int row, int i) {
+    int g = i >> 6, j = i & 63;
+    uint blo = w[row * p.rowWords + g * 6 + (j >> 4)];
+    uint bhi = w[row * p.rowWords + g * 6 + 4 + (j >> 5)];
+    uint u = ((blo >> uint((j & 15) * 2)) & 3u) | (((bhi >> uint(j & 31)) & 1u) << 2);
+    return float(int(u) - 4);
+}
+
+void main() {
+    int h   = int(gl_WorkGroupID.x);
+    int s   = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int sg     = int(gl_SubgroupID);
+    int nsg    = nth / sgsize;
+
+    int nt    = (p.T - p.S + s + 1) - p.st0;              // causal window for query s
+    int rbase = h * (p.Q + p.V);                          // head's row block in kv_b
+    int qoff  = (s * p.H + h) * (p.Q + p.R);
+    int scoff = (s * p.H + h) * p.cap;
+
+    // Row-scale formats fold each kv_b row's scale into the query element once (the
+    // scale factors out of the i-sum). fmt=5 scales vary along i (per 64-group), so
+    // qsc[] stays UNSCALED and the (row,group) scale applies inside pass 1.
+    for (int d = tid; d < p.Q; d += nth) qsc[d] = (p.fmt == 5 || p.fmt == 4) ? q[qoff + d] : q[qoff + d] * wsc[rbase + d];
+    for (int d = tid; d < p.R; d += nth) qr[d] = q[qoff + p.Q + d];
+    barrier();
+
+    /* 1) absorbed query: qabs = Wnope^T qsc — thread-parallel over latent dim i */
+    int ng = (p.K + 63) >> 6;                       // int3-g64 groups per kv_b row
+    for (int i = tid; i < p.K; i += nth) {
+        float acc = 0.0;
+        if (p.fmt == 1) {
+            int wi = i >> 2, l = i & 3;
+            for (int d = 0; d < p.Q; d++) acc += qsc[d] * i8(w[(rbase + d) * p.rowWords + wi], l);
+        } else if (p.fmt == 5) {
+            int gi = i >> 6;                        // this thread's i sits in ONE group per row
+            for (int d = 0; d < p.Q; d++)
+                acc += qsc[d] * i3v(rbase + d, i) * wsc[(rbase + d) * ng + gi];
+        } else if (p.fmt == 4) {                    // grouped int4: nibble + per-group scale
+            int wi = i >> 3, l = i & 7, gi = i / p.gs, ng4 = (p.K + p.gs - 1) / p.gs;
+            for (int d = 0; d < p.Q; d++)
+                acc += qsc[d] * i4(w[(rbase + d) * p.rowWords + wi], l) * wsc[(rbase + d) * ng4 + gi];
+        } else {
+            int wi = i >> 3, l = i & 7;
+            for (int d = 0; d < p.Q; d++) acc += qsc[d] * i4(w[(rbase + d) * p.rowWords + wi], l);
+        }
+        qabs[i] = acc;
+    }
+    barrier();
+
+    /* 2) scores: one subgroup per cached token, lanes split the K+R dot */
+    float lmax = -3.0e38;
+    for (int j = sg; j < nt; j += nsg) {
+        int t = p.st0 + j;
+        float a = 0.0;
+        for (int i = lane; i < p.K; i += sgsize) a += qabs[i] * lc[t * p.K + i];
+        for (int d = lane; d < p.R; d += sgsize) a += qr[d] * rc[t * p.R + d];
+        float tot = subgroupAdd(a) * p.scale;
+        if (lane == 0) { sc[scoff + j] = tot; lmax = max(lmax, tot); }
+    }
+    red[tid] = lmax; barrier();
+    for (int o = nth / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = max(red[tid], red[tid + o]); barrier(); }
+    float wmax = red[0]; barrier();
+
+    /* 3) softmax: exp in place + workgroup sum */
+    float lsum = 0.0;
+    for (int j = tid; j < nt; j += nth) { float e = exp(sc[scoff + j] - wmax); sc[scoff + j] = e; lsum += e; }
+    red[tid] = lsum; barrier();
+    for (int o = nth / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+    float inv = 1.0 / red[0]; barrier();
+
+    /* 4) latent context: clat = sum_t p_t L_t — thread-parallel over i (coalesced rows) */
+    for (int i = tid; i < p.K; i += nth) {
+        float acc = 0.0;
+        for (int j = 0; j < nt; j++) acc += sc[scoff + j] * lc[(p.st0 + j) * p.K + i];
+        clat[i] = acc * inv;
+    }
+    barrier();
+
+    /* 5) value rows: ctx[v] = dequant(row rbase+Q+v) . clat — one subgroup per row */
+    for (int v = sg; v < p.V; v += nsg) {
+        int row = rbase + p.Q + v;
+        uint rb = uint(row) * uint(p.rowWords);
+        float acc = 0.0;
+        if (p.fmt == 1) {
+            int words = (p.K + 3) / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.K) acc += clat[i] * i8(pk, k); }
+            }
+        } else if (p.fmt == 5) {   // lanes stride 16-value low-plane words, group scale per partial
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int g = m >> 2, mw = m & 3;
+                uint blo = w[rb + uint(g) * 6u + uint(mw)];
+                uint bhi = w[rb + uint(g) * 6u + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16;
+                int i0 = (g << 6) + (mw << 4);
+                float a = 0.0;
+                for (int k = 0; k < 16; k++) {
+                    int i = i0 + k;
+                    if (i < p.K) {
+                        uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                        a += clat[i] * float(int(u) - 4);
+                    }
+                }
+                acc += a * wsc[row * ng + g];
+            }
+        } else if (p.fmt == 4) {   // grouped int4: per-word group scale (gs%8==0, host-gated)
+            int words = (p.K + 7) / 8, ng4 = (p.K + p.gs - 1) / p.gs;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 8;
+                float a = 0.0;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.K) a += clat[i] * i4(pk, k); }
+                acc += a * wsc[row * ng4 + uint(i0 / p.gs)];
+            }
+        } else {
+            int words = (p.K + 7) / 8;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.K) acc += clat[i] * i4(pk, k); }
+            }
+        }
+        float tot = subgroupAdd(acc);
+        if (lane == 0) ctx[(s * p.H + h) * p.V + v] = (p.fmt == 5 || p.fmt == 4) ? tot : tot * wsc[row];
+    }
+}

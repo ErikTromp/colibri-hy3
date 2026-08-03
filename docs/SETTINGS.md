@@ -22,6 +22,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `info` | Print model / build info. |
 | `plan` | Show the computed RAM/VRAM placement plan (`--json` for machine-readable). |
 | `doctor` | Environment/health check (`--json` report, `--deep` strict preflight). |
+| `tune` | Measure and save the fastest quality-preserving execution profile for this machine/model. |
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
@@ -35,7 +36,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--model` | `$COLI_MODEL` or built-in path | `SNAP` | Model snapshot directory. |
 | `--ram` | `0` (auto ≈ 88% free) | `RAM_GB` | RAM budget in GB for the expert working set. |
 | `--ctx` | `0` (auto) | `CTX` | Context length. |
-| `--cap` | `8` | `<cap>` argv | Expert-cache cap (starting point; see `CAP_RAISE`). |
+| `--cap` | `0` (auto) | `<cap>` argv | Expert-cache cap (starting point; see `CAP_RAISE`). `0` lets the engine pick: `8` historically, `1` on Metal + macOS when the model volume measures fast (F_NOCACHE probe ≥ `COLI_SSD_FAST_GBS`, cached in `<model>/.coli_ssd` — #379). An explicit value always wins. |
 | `--ngen` | `1024` | `NGEN` | Max tokens to generate. |
 | `--temp` | none (`0`=greedy; engine default 1.0) | `TEMP` | Sampling temperature. |
 | `--topp` | `0` | `TOPP` | Top-p filter. |
@@ -45,6 +46,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--gpu` | `None` | `COLI_GPU(S)` | `auto`, `none`, or a device list like `0,1`. |
 | `--vram` | `0` (auto) | CUDA plan | Total VRAM budget in GB. |
 | `--auto-tier` | off | resource plan | Automatically apply the RAM/VRAM placement plan. |
+| `--no-tune-profile` | off | profile loader | Ignore a saved measured profile. |
 
 ### Subcommand-specific flags
 
@@ -57,6 +59,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id reported by the API. |
 | `--api-key` | `$COLI_API_KEY` | Require this bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
+| `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Seconds a request may wait. |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | Independent KV conversation slots (→ `KV_SLOTS`). |
@@ -73,6 +76,10 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
 **`plan` / `doctor`**: `--json`.
+
+**`tune`**: `--prompt <text>`, `--tokens 16`, `--repeats 2`,
+`--timeout 900`, `--min-gain 0.03`. The command uses fixed-token replay and
+only tests quality-preserving execution scheduling.
 
 **`doctor`**: `--deep` strictly checks every safetensors header and tensor
 layout, filename-declared shard completeness, required core tensors, an
@@ -94,7 +101,8 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
-| `--cap` | `8` | Expert-cache cap. |
+| `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
+| `--cap` | `0` (auto) | Expert-cache cap; `0` = engine default (`8`, or `1` on Metal + macOS + fast model volume — #379). |
 | `--max-tokens` | `1024` | Default max completion tokens. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |

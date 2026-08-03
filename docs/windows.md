@@ -121,7 +121,7 @@ make colibri.exe ARCH=native                       # banner prints "idot: avx-vn
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
-SNAP=./glm_tiny TF=1 ./colibri.exe 64 16 16        # expect "32/32 positions"
+SNAP=./glm_tiny TF=1 ./colibri.exe 64 16 16        # expect "~30-32/32 positions"
 
 # Run with real model:
 SNAP=D:\glm52_i4 ./colibri.exe 64 4 16            # batch inference

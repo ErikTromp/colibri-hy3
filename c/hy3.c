@@ -2094,6 +2094,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
 }
 
 static void run_serve(Model *m, const char *snap){
+    coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");

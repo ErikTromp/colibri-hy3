@@ -36,7 +36,7 @@ cycle will heat cheaper drives. Monitor drive temperature and health.
 ## Test your machine, in order
 
 ```bash
-cd c && ./setup.sh                 # build + architecture self-test (expects 32/32)
+cd c && ./setup.sh                 # build + architecture self-test (expects ~30-32/32)
 
 # 1) measure YOUR disk the way the engine uses it (parallel 19 MB random reads):
 gcc -O2 -fopenmp iobench.c -o iobench

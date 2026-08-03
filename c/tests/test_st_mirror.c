@@ -1,6 +1,6 @@
-/* Dual-SSD mirror (st_mirror_init & friends): a second read-only model copy is
+/* Multi-SSD mirror (st_mirror_add & friends): read-only model copies are
  * accepted only when byte-identical in size and safetensors header, reads on
- * either replica return the same bytes, and divergent/missing copies degrade
+ * any replica return the same bytes, and divergent/missing copies degrade
  * to the primary instead of being trusted. Fixture dirs are created in the
  * current working directory and removed on exit. */
 #include <stdint.h>
@@ -12,9 +12,12 @@
 #ifdef _WIN32
 #include <direct.h>
 #define MKDIR(p) _mkdir(p)
+#define RMDIR(p) _rmdir(p)
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #define MKDIR(p) mkdir(p, 0777)
+#define RMDIR(p) rmdir(p)
 #endif
 
 #define CHECK(condition) do { \
@@ -29,6 +32,7 @@
 #define DIR_C "tmp_mirror_c"   /* same size, divergent header */
 #define DIR_D "tmp_mirror_d"   /* different size */
 #define DIR_E "tmp_mirror_e"   /* empty (missing file) */
+#define DIR_F "tmp_mirror_f"   /* second identical copy (multi-SSD) */
 
 /* one-tensor safetensors file; flip lets us corrupt one header byte and
  * pad lets us grow the payload, both without changing anything else */
@@ -51,23 +55,24 @@ static int write_model(const char *dir, int flip, int pad) {
 }
 
 static void cleanup(void) {
-    const char *dirs[] = {DIR_A, DIR_B, DIR_C, DIR_D, DIR_E};
-    for (int i = 0; i < 5; i++) {
+    const char *dirs[] = {DIR_A, DIR_B, DIR_C, DIR_D, DIR_E, DIR_F};
+    for (int i = 0; i < 6; i++) {
         char path[256];
         snprintf(path, sizeof(path), "%s/model.safetensors", dirs[i]);
         remove(path);
-        remove(dirs[i]);
+        RMDIR(dirs[i]);   /* remove() deletes only files on Windows: stale dirs made every 2nd run fail */
     }
 }
 
 int main(void) {
     cleanup();
     CHECK(MKDIR(DIR_A) == 0 && MKDIR(DIR_B) == 0 && MKDIR(DIR_C) == 0 &&
-          MKDIR(DIR_D) == 0 && MKDIR(DIR_E) == 0);
+          MKDIR(DIR_D) == 0 && MKDIR(DIR_E) == 0 && MKDIR(DIR_F) == 0);
     CHECK(write_model(DIR_A, 0, 0) == 0);
     CHECK(write_model(DIR_B, 0, 0) == 0);
     CHECK(write_model(DIR_C, 1, 0) == 0);
     CHECK(write_model(DIR_D, 0, 64) == 0);
+    CHECK(write_model(DIR_F, 0, 0) == 0);
 
     shards S;
     st_init(&S, DIR_A);
@@ -105,6 +110,29 @@ int main(void) {
 
     /* unknown fd never maps to a replica */
     CHECK(st_fd_rep(&S, 987654, 1) == -1);
+
+    /* ---- multi-SSD: two identical copies become replicas 1 and 2 ---- */
+    st_mirror_reset(&S);
+    CHECK(st_mirror_add(&S, DIR_B) == 1);
+    CHECK(st_mirror_add(&S, DIR_F) == 1);
+    CHECK(S.nrep == 2);
+    int f1 = st_fd_rep(&S, t->fd, 1), f2 = st_fd_rep(&S, t->fd, 2);
+    CHECK(f1 >= 0 && f2 >= 0 && f1 != f2 && f1 != t->fd && f2 != t->fd);
+    float c2[8];
+    CHECK(pread(f2, c2, t->nbytes, t->off) == t->nbytes);
+    CHECK(memcmp(a, c2, sizeof(a)) == 0);
+    st_prefetch_rep(&S, "t0", 2);   /* smoke: WILLNEED on the second mirror */
+
+    /* a divergent dir claims no replica slot; existing replicas survive */
+    CHECK(st_mirror_add(&S, DIR_C) == 0);
+    CHECK(S.nrep == 2);
+    CHECK(st_fd_rep(&S, t->fd, 1) == f1 && st_fd_rep(&S, t->fd, 2) == f2);
+    CHECK(st_fd_rep(&S, t->fd, 3) == -1);
+
+    /* reset drops every replica */
+    st_mirror_reset(&S);
+    CHECK(S.nrep == 0);
+    CHECK(st_fd_rep(&S, t->fd, 1) == -1);
 
     cleanup();
     puts("safetensors mirror tests: ok");

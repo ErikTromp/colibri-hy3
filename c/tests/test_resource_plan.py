@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -15,7 +16,10 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    parse_ssd_cache,
     physical_cpu_count,
+    read_ssd_probe,
+    ssd_probe_state,
 )
 
 
@@ -71,6 +75,116 @@ class ResourcePlanTest(unittest.TestCase):
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
+
+    # #379: read_ssd_probe reads the cached F_NOCACHE measurement colibri.c writes to
+    # <model>/.coli_ssd on its first Metal+darwin startup. This is the read-only
+    # Python-side half of the probe contract (S4) -- never re-measures, never
+    # guesses, so every case here is pure file parsing. Trust mirrors the
+    # engine: only a v2 cache recorded on THIS volume (matching st_dev) counts.
+    def _write_v2_cache(self, gbs="14.322", dev=None):
+        if dev is None:
+            dev = os.stat(self.model).st_dev
+        # byte-exact: text mode would CRLF-translate on Windows and the strict
+        # reader would (correctly) reject the fixture as garbage
+        (self.model / ".coli_ssd").write_bytes(f"v2 {gbs} {dev}\n".encode("ascii"))
+
+    def test_ssd_probe_missing_file_returns_none(self):
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_reads_cached_v2_value(self):
+        self._write_v2_cache("14.322")
+        self.assertEqual(read_ssd_probe(self.model), 14.322)
+
+    def test_ssd_probe_foreign_volume_v2_returns_none(self):
+        # A model dir rsync'd to another drive carries the OLD volume's
+        # measurement; the engine re-probes it, so doctor/plan must not show it.
+        self._write_v2_cache("14.322", dev=os.stat(self.model).st_dev + 1)
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_legacy_bare_number_returns_none(self):
+        # Pre-v2 caches were written before cold-range steering existed, so the
+        # value may be page-cache contamination; the engine re-probes and
+        # upgrades, and until then there is no number worth surfacing.
+        (self.model / ".coli_ssd").write_bytes(b"14.322\n")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_unparsable_file_returns_none(self):
+        (self.model / ".coli_ssd").write_bytes(b"not-a-number\n")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_empty_file_returns_none(self):
+        (self.model / ".coli_ssd").write_bytes(b"")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_grammar_matches_c_reader_vectors(self):
+        # THE parity pin (#386 fix round): parse_ssd_cache() must accept exactly
+        # the grammar colibri.c's coli_ssd_cache_parse() accepts. Both suites
+        # consume the same vector file; edit it and both sides re-judge.
+        vectors = Path(__file__).parent / "fixtures" / "ssd_cache_vectors.txt"
+        unescape = {"n": b"\n", "r": b"\r", "t": b"\t", "0": b"\x00",
+                    "s": b" ", "\\": b"\\"}
+        checked = 0
+        for raw in vectors.read_text(encoding="utf-8").splitlines():
+            if not raw or raw.startswith("#"):
+                continue
+            fields = raw.split("\t")
+            payload = b""
+            escaped = fields[-1] if len(fields) > 1 else ""
+            i = 0
+            while i < len(escaped):
+                if escaped[i] == "\\" and i + 1 < len(escaped):
+                    self.assertIn(escaped[i + 1], unescape, f"bad escape in: {raw!r}")
+                    payload += unescape[escaped[i + 1]]
+                    i += 2
+                else:
+                    payload += escaped[i].encode("utf-8")
+                    i += 1
+            kind, gbs, dev = parse_ssd_cache(payload)
+            if fields[0] == "garbage":
+                self.assertEqual((kind, gbs, dev), (None, None, None),
+                                 f"garbage accepted: {payload!r} -> {(kind, gbs, dev)}")
+            elif fields[0] == "legacy":
+                self.assertEqual((kind, gbs, dev), ("legacy", float(fields[1]), None),
+                                 f"legacy misread: {payload!r}")
+            elif fields[0] == "v2":
+                self.assertEqual((kind, gbs, dev), ("v2", float(fields[1]), int(fields[2])),
+                                 f"v2 misread: {payload!r}")
+            else:
+                self.fail(f"unknown vector kind: {fields[0]}")
+            checked += 1
+        self.assertGreaterEqual(checked, 40, "vector file suspiciously short")
+
+    def test_ssd_probe_state_classifies_every_case(self):
+        # #386 r2, F10: doctor/plan wording keys off these states -- a cache
+        # that exists but is not trusted must never read "no cached probe yet".
+        self.assertEqual(ssd_probe_state(self.model), ("absent", None))
+        self._write_v2_cache("14.322")
+        self.assertEqual(ssd_probe_state(self.model), ("ok", 14.322))
+        self._write_v2_cache("14.322", dev=os.stat(self.model).st_dev + 1)
+        self.assertEqual(ssd_probe_state(self.model), ("foreign", None))
+        (self.model / ".coli_ssd").write_bytes(b"14.322\n")
+        self.assertEqual(ssd_probe_state(self.model), ("legacy", None))
+        (self.model / ".coli_ssd").write_bytes(b"inf\n")
+        self.assertEqual(ssd_probe_state(self.model), ("garbage", None))
+
+    def test_ssd_probe_surfaces_in_plan_and_format(self):
+        self._write_v2_cache("14.3")
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertEqual(plan["ssd_probe_gbs"], 14.3)
+        self.assertEqual(plan["ssd_probe_state"], "ok")
+        self.assertIn("14.3 GB/s", format_plan(plan))
+
+    def test_ssd_probe_pending_states_surface_in_format(self):
+        (self.model / ".coli_ssd").write_bytes(b"14.3\n")   # legacy
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertIsNone(plan["ssd_probe_gbs"])
+        self.assertEqual(plan["ssd_probe_state"], "legacy")
+        self.assertIn("legacy cache pending engine upgrade", format_plan(plan))
+
+    def test_ssd_probe_absent_from_plan_and_format_when_not_cached(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertIsNone(plan["ssd_probe_gbs"])
+        self.assertNotIn("F_NOCACHE", format_plan(plan))
 
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,
